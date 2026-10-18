@@ -7,6 +7,7 @@
 //!   Local changes are still snapshotted and uploaded.
 //! - When the emulator exits, a cycle applies whatever waited.
 //! - The remote is polled on a back-off timer, and right away when the emulator starts.
+//! - On shutdown, a final cycle runs unless an emulator is running.
 
 use super::process::ProcessProbe;
 use super::profile::Profile;
@@ -46,6 +47,8 @@ pub enum Trigger {
     Changed,
     Started,
     Exited,
+    /// The watcher is stopping (never pending; see [`Daemon::shutdown`]).
+    Shutdown,
 }
 
 impl fmt::Display for Trigger {
@@ -56,6 +59,7 @@ impl fmt::Display for Trigger {
             Trigger::Changed => "card changed",
             Trigger::Started => "emulator started",
             Trigger::Exited => "emulator exited",
+            Trigger::Shutdown => "final sync",
         })
     }
 }
@@ -220,6 +224,21 @@ impl<P: ProcessProbe> Daemon<P> {
         self.pending = None;
         self.last_change = None;
         Some(self.cycle(trigger, now))
+    }
+
+    /// The watcher is stopping: runs a final cycle, so writes still settling and remote
+    /// changes waiting for the emulator to exit aren't left for the next start. Skipped while
+    /// an emulator runs, since its card may be halfway through a write; its saves were
+    /// uploaded as they settled, and the next start picks up the rest.
+    pub fn shutdown(&mut self, now: Instant) -> Option<Cycle> {
+        self.probe_processes();
+        if self.running.iter().any(|&r| r) {
+            log::info!("{} is running: no final sync", self.running_names());
+            return None;
+        }
+        self.pending = None;
+        self.last_change = None;
+        Some(self.cycle(Trigger::Shutdown, now))
     }
 
     fn probe_processes(&mut self) {
@@ -659,6 +678,36 @@ mod tests {
         t += d.poll_interval();
         d.tick(t).expect("poll");
         assert_eq!(d.poll_interval().as_secs(), 60);
+    }
+
+    #[test]
+    fn shutdown_syncs_unless_the_emulator_runs() {
+        let w = World::new();
+        let t0 = Instant::now();
+        let (mut d, probe, card_a) = w.daemon(b"v1", t0);
+        let (mut b, card_b) = w.other(b"v1");
+
+        // A write that hasn't settled yet is uploaded by the final sync.
+        std::fs::write(&card_a, b"v2 from a").unwrap();
+        d.on_event(&card_a, t0 + s(5.0));
+        let c = d.shutdown(t0 + s(5.5)).expect("final sync");
+        assert_eq!(c.trigger, Trigger::Shutdown);
+        assert!(!c.failed);
+        b.sync().unwrap();
+        assert_eq!(std::fs::read(&card_b).unwrap(), b"v2 from a");
+
+        // A remote change waiting for the emulator is applied once it has exited.
+        probe.set(&[EMU]);
+        d.tick(t0 + s(10.0)).expect("cycle on start");
+        std::fs::write(&card_b, b"v3 from b").unwrap();
+        b.sync().unwrap();
+        assert_eq!(d.tick(t0 + s(41.0)).expect("poll").held_back, 1);
+        assert!(d.shutdown(t0 + s(42.0)).is_none(), "no final sync while the emulator runs");
+        assert_eq!(std::fs::read(&card_a).unwrap(), b"v2 from a");
+        probe.set(&[]);
+        let c = d.shutdown(t0 + s(43.0)).expect("final sync");
+        assert_eq!(c.applied, 1);
+        assert_eq!(std::fs::read(&card_a).unwrap(), b"v3 from b");
     }
 
     #[test]

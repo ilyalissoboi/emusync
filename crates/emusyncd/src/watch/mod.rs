@@ -1,5 +1,6 @@
 //! `emusync watch`: sidecar mode for emulators that can't be modified (DESIGN §6.4).
 
+pub mod control;
 mod daemon;
 mod process;
 mod profile;
@@ -11,10 +12,13 @@ use emusync_core::{ConflictPolicy, Engine};
 use notify::{EventKind, RecursiveMode, Watcher};
 use profile::Profile;
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-#[derive(Args)]
+#[derive(Args, Clone)]
 pub struct WatchArgs {
     /// Emulator profile: a built-in id (pcsx2) or a .json profile file. Repeat for several
     /// emulators.
@@ -36,9 +40,82 @@ pub struct WatchArgs {
     /// Longest interval between polls of the remote.
     #[arg(long, default_value_t = 900, value_name = "SECS")]
     poll_max_secs: u64,
+    /// Read environment variables (KEY=VALUE lines), such as AWS_ACCESS_KEY_ID and
+    /// AWS_SECRET_ACCESS_KEY, from this file at startup.
+    #[arg(long, value_name = "FILE")]
+    pub env_file: Option<PathBuf>,
 }
 
-pub fn run(mut engine: Engine, args: &WatchArgs) -> AnyResult<()> {
+impl WatchArgs {
+    /// The options as command-line arguments, defaults left out and paths made absolute, to
+    /// start the same watcher from a service definition.
+    pub fn to_args(&self) -> AnyResult<Vec<String>> {
+        let defaults = WatchArgs::default_values();
+        let mut args = Vec::new();
+        if self.profiles != defaults.profiles {
+            for p in &self.profiles {
+                // A built-in id stays as is; a profile file is made absolute.
+                let path = Path::new(p);
+                let p = if path.is_file() { std::path::absolute(path)?.display().to_string() } else { p.clone() };
+                args.extend(["--profile".to_string(), p]);
+            }
+        }
+        if !matches!(self.policy, Policy::Newest) {
+            args.extend(["--policy".to_string(), "ask".to_string()]);
+        }
+        if self.no_discover {
+            args.push("--no-discover".to_string());
+        }
+        for (flag, value, default) in [
+            ("--debounce-ms", self.debounce_ms, defaults.debounce_ms),
+            ("--poll-min-secs", self.poll_min_secs, defaults.poll_min_secs),
+            ("--poll-max-secs", self.poll_max_secs, defaults.poll_max_secs),
+        ] {
+            if value != default {
+                args.extend([flag.to_string(), value.to_string()]);
+            }
+        }
+        if let Some(f) = &self.env_file {
+            if !f.is_file() {
+                return Err(format!("{} is not a file", f.display()).into());
+            }
+            args.extend(["--env-file".to_string(), std::path::absolute(f)?.display().to_string()]);
+        }
+        Ok(args)
+    }
+
+    fn default_values() -> Self {
+        #[derive(clap::Parser)]
+        struct P {
+            #[command(flatten)]
+            w: WatchArgs,
+        }
+        <P as clap::Parser>::parse_from(["watch"]).w
+    }
+}
+
+/// Runs the watcher until Ctrl+C, SIGTERM or `emusync service stop`, then does a final sync
+/// unless an emulator is running.
+pub fn run(mut engine: Engine, args: &WatchArgs, data_dir: &Path) -> AnyResult<()> {
+    if let Some(pid) = control::running_pid(data_dir) {
+        return Err(format!(
+            "a watcher is already running on {} (pid {pid}); stop it with `emusync service stop`",
+            data_dir.display()
+        )
+        .into());
+    }
+    let _pid_file = control::PidFile::create(data_dir)?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let flag = stop.clone();
+    // A second Ctrl+C doesn't wait for the final sync. Card writes are atomic either way.
+    if let Err(e) = ctrlc::set_handler(move || {
+        if flag.swap(true, Ordering::SeqCst) {
+            std::process::exit(130);
+        }
+    }) {
+        log::debug!("no signal handler ({e}); stop with `emusync service stop`");
+    }
+
     let profiles = args.profiles.iter().map(|p| Profile::load(p)).collect::<Result<Vec<_>, _>>()?;
     engine.set_policy(match args.policy {
         Policy::Ask => ConflictPolicy::Ask,
@@ -67,6 +144,14 @@ pub fn run(mut engine: Engine, args: &WatchArgs) -> AnyResult<()> {
     let mut daemon =
         Daemon::new(engine, profiles, process::SystemProbe::new(), timing, !args.no_discover, Instant::now());
     loop {
+        if stop.load(Ordering::SeqCst) || control::stop_requested(data_dir) {
+            log::info!("stopping");
+            if let Some(c) = daemon.shutdown(Instant::now()) {
+                log::debug!("{} cycle done{}", c.trigger, if c.failed { " (failed)" } else { "" });
+            }
+            log::info!("stopped");
+            return Ok(());
+        }
         if let Some(c) = daemon.tick(Instant::now()) {
             log::debug!("{} cycle done{}", c.trigger, if c.failed { " (failed)" } else { "" });
         }

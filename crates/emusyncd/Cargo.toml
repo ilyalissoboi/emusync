@@ -7,9 +7,17 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[lib]
+path = "src/lib.rs"
+
 [[bin]]
 name = "emusync"
 path = "src/main.rs"
+
+# Windows: no console window, for the logon task (`emusync service install`).
+[[bin]]
+name = "emusyncw"
+path = "src/bin/emusyncw.rs"
 
 [dependencies]
 blake3.workspace = true
@@ -17,6 +25,7 @@ emusync-core.workspace = true
 emusync-formats.workspace = true
 emusync-remote.workspace = true
 clap.workspace = true
+ctrlc.workspace = true
 dirs.workspace = true
 log.workspace = true
 notify.workspace = true

@@ -223,3 +223,16 @@ fn s3_sync_between_two_data_dirs() {
     ok(&phone_data, &["sync"]);
     assert_eq!(std::fs::read(&phone_card).unwrap(), image);
 }
+
+#[test]
+fn service_needs_a_remote_and_reports_status() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let (success, out) = emusync(&data, &["service", "install", "--no-start"]);
+    assert!(!success && out.contains("no remote configured"), "{out}");
+    let out = ok(&data, &["service", "status"]);
+    assert!(out.contains("watcher: not running"), "{out}");
+    assert!(out.contains(&format!("{}", data.join("logs").join("watch.log").display())), "{out}");
+    let out = ok(&data, &["service", "stop"]);
+    assert!(out.contains("not running"), "{out}");
+}
