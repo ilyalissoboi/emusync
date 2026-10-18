@@ -2,6 +2,7 @@
 //! the emulator keeps its memory cards. Profiles are JSON, so an emulator is added by writing
 //! a file, not code. Built-in profiles live in `crates/emusyncd/profiles/`.
 
+use emusync_core::fsutil;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
@@ -18,6 +19,10 @@ struct ProfileFile {
     name: String,
     /// Card files with these extensions (no dot, any case) belong to this emulator.
     card_extensions: Vec<String>,
+    /// Directories holding a file of this name are folder cards of this emulator, whatever
+    /// their extension (PCSX2: `_pcsx2_superblock`).
+    #[serde(default)]
+    folder_card_marker: Option<String>,
     #[serde(default)]
     windows: OsSection,
     #[serde(default)]
@@ -47,6 +52,7 @@ pub struct Profile {
     pub id: String,
     pub name: String,
     pub card_extensions: Vec<String>,
+    pub folder_card_marker: Option<String>,
     pub processes: Vec<String>,
     pub card_dirs: Vec<PathBuf>,
     pub lock_files: Vec<PathBuf>,
@@ -131,6 +137,7 @@ impl Profile {
             lock_files,
             processes,
             card_extensions: f.card_extensions.iter().map(|e| e.trim_start_matches('.').to_ascii_lowercase()).collect(),
+            folder_card_marker: f.folder_card_marker.filter(|m| !m.trim().is_empty()),
             id: f.id,
             name: f.name,
         })
@@ -151,11 +158,22 @@ impl Profile {
         Err(format!("unknown profile {arg:?} (built in: {}; or pass a .json profile file)", ids.join(", ")))
     }
 
-    /// Whether a card file belongs to this emulator (by extension).
+    /// Whether a card belongs to this emulator: a file or directory with one of its extensions,
+    /// or a directory holding its folder card marker. emusync's own scratch paths never do.
     pub fn claims(&self, path: &Path) -> bool {
-        path.extension()
+        if fsutil::is_scratch(path) {
+            return false;
+        }
+        let by_extension = path
+            .extension()
             .map(|e| e.to_string_lossy().to_ascii_lowercase())
-            .is_some_and(|e| self.card_extensions.contains(&e))
+            .is_some_and(|e| self.card_extensions.contains(&e));
+        by_extension || self.is_folder_card(path)
+    }
+
+    /// Whether `path` is a directory holding this emulator's folder card marker.
+    fn is_folder_card(&self, path: &Path) -> bool {
+        self.folder_card_marker.as_ref().is_some_and(|m| path.join(m).is_file())
     }
 
     /// Whether `process` (a running process's name or executable file name) is this emulator.
@@ -171,14 +189,20 @@ impl Profile {
         })
     }
 
-    /// Card files in the default folders, sorted.
+    /// Cards in the default folders, sorted: files with the profile's extensions, and folder
+    /// cards.
     pub fn discover(&self) -> Vec<PathBuf> {
         let mut found = Vec::new();
         for dir in &self.card_dirs {
             let Ok(entries) = std::fs::read_dir(dir) else { continue };
             for e in entries.flatten() {
                 let p = e.path();
-                if self.claims(&p) && e.file_type().is_ok_and(|t| t.is_file()) {
+                let card = match e.file_type() {
+                    Ok(t) if t.is_dir() => self.is_folder_card(&p),
+                    Ok(t) if t.is_file() => self.claims(&p),
+                    _ => false,
+                };
+                if card && !fsutil::is_scratch(&p) {
                     found.push(p);
                 }
             }
@@ -227,6 +251,34 @@ mod tests {
         assert_eq!(linux.card_dirs[0], PathBuf::from("/home/u/.config/PCSX2/memcards"));
         assert!(linux.claims(Path::new("/x/Mcd001.PS2")));
         assert!(!linux.claims(Path::new("/x/Mcd001.ps2.emusync-tmp")));
+    }
+
+    #[test]
+    fn pcsx2_discovers_and_claims_folder_cards() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut p = Profile::parse(BUILT_IN[0].1, Os::current(), &folders()).unwrap();
+        p.card_dirs = vec![dir.path().to_path_buf()];
+        let folder = |name: &str, marker: bool| {
+            let d = dir.path().join(name);
+            std::fs::create_dir(&d).unwrap();
+            if marker {
+                std::fs::write(d.join("_pcsx2_superblock"), b"").unwrap();
+            }
+            d
+        };
+        std::fs::write(dir.path().join("Mcd001.ps2"), b"card").unwrap();
+        let plain = folder("Mcd002", true);
+        let with_ext = folder("Mcd003.ps2", true);
+        let not_a_card = folder("Mcd004.ps2", false);
+        folder("Saves", false);
+        let scratch = folder("Mcd002.emusync-tmp", true);
+        folder("Mcd003.ps2.emusync-old", true);
+        let names: Vec<String> =
+            p.discover().iter().map(|f| f.file_name().unwrap().to_string_lossy().into_owned()).collect();
+        assert_eq!(names, ["Mcd001.ps2", "Mcd002", "Mcd003.ps2"]);
+        assert!(p.claims(&plain) && p.claims(&with_ext));
+        assert!(!p.claims(&scratch));
+        assert!(!p.discover().contains(&not_a_card));
     }
 
     #[test]
