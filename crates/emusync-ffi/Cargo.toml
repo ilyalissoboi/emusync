@@ -1,0 +1,12 @@
+[package]
+name = "emusync-ffi"
+description = "C ABI for emusync (see include/emusync.h)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "emusync"
+crate-type = ["rlib", "staticlib"]

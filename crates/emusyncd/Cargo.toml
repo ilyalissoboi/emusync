@@ -1,0 +1,21 @@
+[package]
+name = "emusyncd"
+description = "emusync sidecar and the `emusync` command-line tool"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "emusync"
+path = "src/main.rs"
+
+[dependencies]
+emusync-core.workspace = true
+emusync-remote.workspace = true
+clap.workspace = true
+log.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
