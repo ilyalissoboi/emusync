@@ -25,9 +25,12 @@ pub fn split(data: &[u8]) -> Vec<&[u8]> {
 }
 
 /// Remote key of a blob: `blobs/<hh>/<hex>`.
+///
+/// Ids from remote logs are validated by [`crate::model::is_hash_id`] on ingest; a malformed id
+/// still yields a key (one that won't exist) rather than a panic.
 pub fn blob_key(id: &str) -> String {
     let hex = id.strip_prefix("b3:").unwrap_or(id);
-    format!("blobs/{}/{hex}", &hex[..2])
+    format!("blobs/{}/{hex}", hex.get(..2).unwrap_or("00"))
 }
 
 /// Encodes a chunk for storage: one format byte, then the bytes, zstd-compressed (level 3)

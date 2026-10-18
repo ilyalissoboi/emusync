@@ -153,6 +153,15 @@ fn segment_key(device: &str, seq: u64) -> String {
     format!("devices/{device}/log/{seq:016x}.ndjson")
 }
 
+/// Sequence number of a log segment key (`…/log/<seq:016x>.ndjson`).
+fn segment_seq(key: &str) -> Option<u64> {
+    let name = key.rsplit('/').next()?.strip_suffix(".ndjson")?;
+    if name.len() != 16 {
+        return None;
+    }
+    u64::from_str_radix(name, 16).ok()
+}
+
 fn default_device_name() -> String {
     ["COMPUTERNAME", "HOSTNAME"]
         .iter()
@@ -222,7 +231,19 @@ impl Engine {
     /// Registers a remote (DESIGN §6.2 setup): validates access with a LIST, probes
     /// conditional-write support once, and creates `repo.json` if the repository is new.
     /// Blocks on the network.
+    ///
+    /// A data directory belongs to one repository: its cursors, known blobs and drained outbox
+    /// describe that repository only. Adding a different remote is refused; use a new data
+    /// directory for it. Re-adding the same remote is allowed.
     pub fn add_remote(&mut self, remote: Arc<dyn Remote>) -> Result<bool> {
+        if let Some(existing) = self.store.meta("remote")? {
+            if existing != remote.describe() {
+                return Err(Error::InvalidArg(format!(
+                    "this data directory is already bound to {existing}; use a new data directory for {}",
+                    remote.describe()
+                )));
+            }
+        }
         remote.list_dirs("devices/")?;
         let cond = probe_conditional_writes(&*remote)?;
         match remote.get("repo.json")? {
@@ -838,7 +859,8 @@ impl Engine {
     fn pull(&self, remote: &dyn Remote, report: &mut SyncReport) -> Result<()> {
         let me = self.device_id()?;
         for dev in remote.list_dirs("devices/")? {
-            if dev == me {
+            // Device ids end up in keys and the DB: accept only UUID-shaped names.
+            if dev == me || uuid::Uuid::parse_str(&dev).is_err() {
                 continue;
             }
             if self.store.device_name(&dev)?.is_none() {
@@ -852,11 +874,21 @@ impl Engine {
                 }
             }
             let cursor = self.store.cursor(&dev)?;
+            // Segments are numbered contiguously from 1. With delayed or out-of-order listing a
+            // later segment can show up before an earlier one; stop at the gap rather than move
+            // the cursor past a segment we haven't read.
+            let mut expected = match &cursor {
+                Some(c) => segment_seq(c).map_or(1, |s| s + 1),
+                None => 1,
+            };
             for key in remote.list(&format!("devices/{dev}/log/"), cursor.as_deref())? {
-                if !key.ends_with(".ndjson") {
-                    continue;
+                let Some(seq) = segment_seq(&key) else { continue };
+                if seq != expected {
+                    log::info!("{key}: waiting for segment {expected:016x} of {dev} to become visible");
+                    break;
                 }
                 let Some(body) = remote.get(&key)? else { break };
+                expected += 1;
                 self.store.tx(|| {
                     for line in body.split(|b| *b == b'\n').filter(|l| !l.iter().all(u8::is_ascii_whitespace)) {
                         match parse_record(line) {

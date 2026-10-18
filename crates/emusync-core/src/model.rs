@@ -128,7 +128,21 @@ pub fn parse_record(line: &[u8]) -> Result<Option<LogRecord>, RecordError> {
             return Err(RecordError::BadId { claimed, actual });
         }
     }
-    serde_json::from_value(value).map(Some).map_err(|e| RecordError::Malformed(e.to_string()))
+    let rec: LogRecord = serde_json::from_value(value).map_err(|e| RecordError::Malformed(e.to_string()))?;
+    if let LogRecord::Version(v) = &rec {
+        // Ids become remote keys and local file names; anything but a canonical hash is corrupt.
+        let mut ids = std::iter::once(&v.content).chain(&v.chunks).chain(&v.parents);
+        if let Some(bad) = ids.find(|id| !is_hash_id(id)) {
+            return Err(RecordError::Malformed(format!("invalid hash id {bad:?}")));
+        }
+    }
+    Ok(Some(rec))
+}
+
+/// Whether `id` is a canonical content address: `b3:` + 64 lowercase hex digits.
+pub fn is_hash_id(id: &str) -> bool {
+    id.strip_prefix("b3:")
+        .is_some_and(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
 }
 
 /// JSON with object keys sorted and no insignificant whitespace.
@@ -207,6 +221,18 @@ mod tests {
         assert_eq!(parse_record(line.as_bytes()).unwrap(), Some(LogRecord::Version(v)));
         let tampered = line.replace(r#""size":1"#, r#""size":2"#);
         assert!(matches!(parse_record(tampered.as_bytes()), Err(RecordError::BadId { .. })));
+    }
+
+    #[test]
+    fn non_canonical_hash_ids_are_rejected() {
+        let upper = format!("b3:{}", "A".repeat(64));
+        for bad in ["b3:", "b3:\u{e9}", "b3:../../etc", upper.as_str()] {
+            let mut v = sample();
+            v.chunks = vec![bad.to_string()];
+            let line = LogRecord::Version(v.seal()).to_line();
+            assert!(matches!(parse_record(line.as_bytes()), Err(RecordError::Malformed(_))), "{bad}");
+        }
+        assert!(is_hash_id(&content_id(b"x")));
     }
 
     #[test]
