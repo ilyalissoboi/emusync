@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+  s3-moto:
+    name: S3 tests (moto)
+    runs-on: ubuntu-latest
+    env:
+      MOTO_ENDPOINT: http://127.0.0.1:5056
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install moto
+        run: pip install "moto[server]" boto3
+      # No HTTP readiness probe here: it would use up one of the 3 unauthenticated calls.
+      # moto_setup.py waits for the port itself.
+      - name: Start moto
+        run: INITIAL_NO_AUTH_ACTION_COUNT=3 nohup moto_server -p 5056 > moto.log 2>&1 &
+      - name: Create IAM user, access key and bucket
+        run: |
+          python .github/scripts/moto_setup.py "$MOTO_ENDPOINT" emusync-test > creds.env
+          while IFS='=' read -r _ value; do echo "::add-mask::$value"; done < creds.env
+          cat creds.env >> "$GITHUB_ENV"
+          rm creds.env
+      - name: cargo test (gated S3 tests enabled)
+        env:
+          EMUSYNC_S3_TEST_URI: s3://emusync-test/ci?endpoint=http://127.0.0.1:5056&path_style=1
+        run: |
+          set -o pipefail
+          cargo test --workspace -- --nocapture 2>&1 | tee test.log
+          if grep -q "skipped: EMUSYNC_S3_TEST_URI" test.log; then
+            echo "::error::gated S3 tests were skipped"
+            exit 1
+          fi
+      - name: moto log
+        if: failure()
+        run: cat moto.log
