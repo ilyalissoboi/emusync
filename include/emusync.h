@@ -155,28 +155,50 @@ ES_API void      es_client_destroy(es_client* c, uint32_t timeout_ms);
 /* Remotes                                                                                    */
 /* ------------------------------------------------------------------------------------------ */
 
-/* Supplies a bearer/OAuth token for `remote_uri`. Called from a library thread. Write a
-   NUL-terminated token into `out` and return 0, or return ES_E_AUTH if the user must sign in
-   (the library then emits ES_EV_AUTH_REQUIRED). */
-typedef struct es_token_provider {
-    void* user;
-    int (*get_token)(void* user, const char* remote_uri, char* out, size_t out_cap);
-} es_token_provider;
+typedef enum es_credential_kind {
+    ES_CRED_NONE = 0,           /* backend needs no credentials (e.g. public MinIO in tests) */
+    ES_CRED_S3,                 /* access key + secret, optionally STS session token + expiry */
+    ES_CRED_BEARER              /* OAuth bearer token (later backends) */
+} es_credential_kind;
 
-/* remote_uri examples:
-     "folder:///Users/me/Syncthing/emusync"   "webdav://nas.local/dav/emusync"
-     "s3://bucket/prefix?region=eu-west-1"    "dropbox:/Apps/emusync"
-     "gdrive:appDataFolder"                   "onedrive:/emusync"
-     "https://sync.example.com"               (reference server)
-   `token_provider` may be NULL for backends that need none. */
-ES_API es_status es_remote_add(es_client* c, const char* remote_uri, const es_token_provider* token_provider);
+/* Filled by the host's credential provider. Fixed buffers so no ownership crosses the ABI.
+   The library copies the values and wipes the struct after use; it never persists them. */
+typedef struct es_credentials {
+    uint32_t           struct_size;
+    es_credential_kind kind;
+    char               access_key_id[128];
+    char               secret_access_key[128];
+    char               session_token[4096];    /* STS temporary credentials only; else "" */
+    int64_t            expires_unix_ms;        /* 0 = static keys; else refreshed before expiry */
+    char               bearer_token[4096];     /* ES_CRED_BEARER only */
+} es_credentials;
+
+/* Supplies credentials for `remote_uri`. Called from a library thread: at es_remote_add, before
+   temporary credentials expire, and after the remote rejects them (403). Fill `out` (its
+   struct_size is pre-set by the library) and return 0, or return ES_E_AUTH if the user must
+   enter or renew credentials (the library then emits ES_EV_AUTH_REQUIRED). */
+typedef struct es_credential_provider {
+    void* user;
+    int (*get)(void* user, const char* remote_uri, es_credentials* out);
+} es_credential_provider;
+
+/* remote_uri, v1 (S3 and S3-compatible):
+     "s3://my-saves/emusync/v1?region=eu-west-1"
+     "s3://my-saves/emusync/v1?endpoint=https://<account>.r2.cloudflarestorage.com&region=auto"
+     "s3://saves/emusync/v1?endpoint=http://nas.local:9000&path_style=1"
+   Reserved for later backends: "webdav://…", "dropbox:…", "gdrive:…", "onedrive:…",
+   "folder://…", "https://…" (reference server). Returns ES_E_INVALID_ARG for unsupported schemes.
+   Validates access with one LIST and probes conditional-write support; blocks up to 10 s and
+   returns ES_OFFLINE if the endpoint is unreachable (the remote is still added). */
+ES_API es_status es_remote_add(es_client* c, const char* remote_uri, const es_credential_provider* creds);
 
 /* E2E encryption. Create: initialises a new encrypted repo. Unlock: derives the key on a new device.
    Blocks (Argon2id, ~0.5 s). The derived key is stored in the OS keystore by platform bindings. */
 ES_API es_status es_repo_create_encrypted(es_client* c, const char* passphrase);
 ES_API es_status es_repo_unlock(es_client* c, const char* passphrase);
 
-/* OAuth PKCE helpers (optional). begin writes an authorization URL for the host to open. */
+/* OAuth PKCE helpers for later backends (not used by S3). begin writes an authorization URL
+   for the host to open. Return ES_E_INVALID_ARG until such a backend exists. */
 ES_API es_status es_oauth_begin(es_client* c, const char* provider, const char* redirect_uri, char* out_url, size_t cap);
 ES_API es_status es_oauth_complete(es_client* c, const char* provider, const char* redirect_with_code);
 
@@ -184,11 +206,14 @@ ES_API es_status es_oauth_complete(es_client* c, const char* provider, const cha
 /* Containers (memory cards, SRAM files, save folders)                                         */
 /* ------------------------------------------------------------------------------------------ */
 
+/* A container is the local file/folder holding a logical card (DESIGN §2). The default layout
+   is one image file per card (PCSX2/ARMSX2 Mcd001.ps2, Mcd002.ps2), registered as shared
+   containers with `card` left NULL. Logical cards with the same name are the same card on
+   every device. */
+
 enum es_container_flags {
-    ES_CF_DEFAULT_PLACEMENT = 1u << 0,  /* new units for this platform land here (DESIGN §5.4) */
-    ES_CF_MIRROR_ALL        = 1u << 1,  /* receive every unit of the platform during idle sync */
-    ES_CF_READ_ONLY         = 1u << 2,  /* upload from, never write to */
-    ES_CF_NO_UPLOAD         = 1u << 3   /* receive only */
+    ES_CF_READ_ONLY = 1u << 0,  /* upload from, never write to */
+    ES_CF_NO_UPLOAD = 1u << 1   /* receive only */
 };
 
 typedef struct es_container_desc {
@@ -197,15 +222,34 @@ typedef struct es_container_desc {
                                  "sram", "dir", "raw"; NULL = auto-detect */
     const char* location;     /* native path or VFS URI */
     const char* platform;     /* "ps2", "ps1", "gc", ... ; NULL = inferred from format */
-    const char* title_scope;  /* NULL = shared card; else title key for a per-game container */
+    const char* card;         /* logical card name, e.g. "Mcd001". NULL = the file or folder stem.
+                                 Set it when stems differ between emulators, and always for
+                                 per-game containers (normally the shared card of their slot). */
+    const char* title_scope;  /* NULL = shared container (holds every unit of the card);
+                                 else a title key: a per-game container holding only that title */
     uint32_t    flags;        /* es_container_flags */
 } es_container_desc;
 
-#define ES_CONTAINER_DESC_INIT { sizeof(es_container_desc), NULL, NULL, NULL, NULL, 0u }
+#define ES_CONTAINER_DESC_INIT { sizeof(es_container_desc), NULL, NULL, NULL, NULL, NULL, 0u }
 
-/* Idempotent: re-adding the same location returns the existing id. Does not block on I/O. */
+/* Idempotent: re-adding the same location returns the existing id. Does not block on I/O.
+   Returns ES_E_INVALID_ARG if title_scope is set without card. Publishes the logical card to
+   the repository (in unit mode where an adapter exists, else whole-file) unless it already
+   exists, in which case the repository's mode is adopted. */
 ES_API es_status es_container_add(es_client* c, const es_container_desc* d, es_container_id* out);
 ES_API es_status es_container_remove(es_client* c, es_container_id id);
+
+/* Logical card sync mode, shared by every device (DESIGN §2.1). */
+typedef enum es_card_mode {
+    ES_CARD_UNITS = 0,          /* per-save sync inside the card (default when an adapter exists) */
+    ES_CARD_WHOLE_FILE          /* card image is one opaque unit: byte-identical mirrors */
+} es_card_mode;
+
+/* card_id is "<platform>:<card>", e.g. "ps2:Mcd001". set_mode takes a final snapshot in the
+   old mode, publishes the change, and returns ES_PENDING; ES_E_BUSY while a session has the
+   card open; ES_E_INVALID_ARG for ES_CARD_UNITS on a format without an adapter. */
+ES_API es_status es_card_get_mode(es_client* c, const char* card_id, es_card_mode* out);
+ES_API es_status es_card_set_mode(es_client* c, const char* card_id, es_card_mode mode);
 
 /* Emulator wrote to the container. Cheap; arms a debounce timer, then a quiescent snapshot. */
 ES_API void      es_container_touched(es_client* c, es_container_id id);
@@ -341,7 +385,9 @@ typedef enum es_event_type {
     ES_EV_PROGRESS,              /* bytes_done / bytes_total */
     ES_EV_UNIT_UPLOADED,
     ES_EV_UNIT_APPLIED,          /* remote version written into a local container */
-    ES_EV_APPLY_BLOCKED,         /* status: ES_E_NO_SPACE / ES_E_BUSY / ES_E_FORMAT */
+    ES_EV_APPLY_BLOCKED,         /* status: ES_E_NO_SPACE (card full) / ES_E_NOT_FOUND (no local
+                                    container for this logical card) / ES_E_BUSY / ES_E_FORMAT */
+    ES_EV_CARD_MODE_CHANGED,     /* another device switched a card's mode; message = card_id */
     ES_EV_CONFLICT,              /* conflict_id set; call es_conflict_get */
     ES_EV_LEASE_CHANGED,         /* another device started/stopped a title (device_name) */
     ES_EV_HANDOFF_REQUESTED,     /* another device wants this title: flush and end session */
