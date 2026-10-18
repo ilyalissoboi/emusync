@@ -54,6 +54,7 @@ checking turned on:
 pip install "moto[server]"
 INITIAL_NO_AUTH_ACTION_COUNT=3 moto_server -p 5056 &
 # create an IAM user + access key and the bucket "emusync-test" (the first 3 calls are unauthenticated)
+eval "$(python .github/scripts/moto_setup.py | sed 's/^/export /')"
 EMUSYNC_S3_TEST_URI="s3://emusync-test/ci?endpoint=http://127.0.0.1:5056&path_style=1" cargo test
 ```
 
@@ -62,4 +63,13 @@ randomized partition simulation.
 
 ## License
 
-MIT OR Apache-2.0.
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or <http://www.apache.org/licenses/LICENSE-2.0>)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or <http://opensource.org/licenses/MIT>)
+
+at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion
+in this work by you, as defined in the Apache-2.0 license, shall be dual licensed as above,
+without any additional terms or conditions.
