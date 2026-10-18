@@ -1,5 +1,5 @@
 //! CLI tests. The S3 round trip is gated behind `EMUSYNC_S3_TEST_URI` (plus `AWS_ACCESS_KEY_ID`
-//! / `AWS_SECRET_ACCESS_KEY`), e.g. a local MinIO:
+//! / `AWS_SECRET_ACCESS_KEY`), e.g. a local moto server or MinIO:
 //! `EMUSYNC_S3_TEST_URI="s3://emusync-test/ci?endpoint=http://127.0.0.1:9000&path_style=1"`.
 
 use std::path::Path;

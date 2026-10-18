@@ -45,11 +45,16 @@ cargo test
 ```
 
 The S3 conformance suite and the CLI round trip run against a real endpoint when
-`EMUSYNC_S3_TEST_URI` is set, for example with a local MinIO:
+`EMUSYNC_S3_TEST_URI` and `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` are set. Any
+S3-compatible server works. Community MinIO builds are no longer distributed, so locally
+the easiest option is [moto](https://github.com/getmoto/moto)'s server, with signature
+checking turned on:
 
 ```sh
-EMUSYNC_S3_TEST_URI="s3://emusync-test/ci?endpoint=http://127.0.0.1:9000&path_style=1" \
-AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin cargo test
+pip install "moto[server]"
+INITIAL_NO_AUTH_ACTION_COUNT=3 moto_server -p 5056 &
+# create an IAM user + access key and the bucket "emusync-test" (the first 3 calls are unauthenticated)
+EMUSYNC_S3_TEST_URI="s3://emusync-test/ci?endpoint=http://127.0.0.1:5056&path_style=1" cargo test
 ```
 
 `EMUSYNC_SIM_SEEDS=200 cargo test --release -p emusync-core --test sim` runs a longer
