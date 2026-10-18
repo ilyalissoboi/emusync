@@ -1,21 +1,28 @@
 //! The sync engine (DESIGN §6): local snapshots, push, pull, reconciliation and apply.
 //!
-//! M0 syncs logical cards in whole-file mode: each card is one unit (`ps2:Mcd001:@card`)
-//! whose content is the card image, synced through the `raw` adapter.
+//! A logical card syncs in one of two modes (DESIGN §2.1):
+//! - **unit mode**: every save on the card is its own unit (`ps2:Mcd001:BASLUS-20062GTA3`),
+//!   extracted and rebuilt by the card's format adapter, so saves of different games merge;
+//! - **whole-file mode**: the card image is the only unit (`ps2:Mcd001:@card`).
 
 use crate::chunk;
 use crate::error::{Error, Result};
 use crate::fsutil;
 use crate::hlc::Hlc;
-use crate::model::{content_id, parse_record, whole_file_unit, CardMode, CardRecord, LogRecord, VersionRecord};
+use crate::model::{
+    content_id, parse_record, split_unit, unit_id, whole_file_unit, CardMode, CardRecord, LogRecord, VersionRecord,
+};
 use crate::store::{ContainerRow, LocalUnit, Store, StoredVersion, CF_READ_ONLY};
-use emusync_formats::{self as formats, ApplyOp, Canonical, ContainerFormat, UnitRef, WHOLE_FILE_UNIT};
+use emusync_formats::{self as formats, ApplyOp, Canonical, ContainerFormat, FormatError};
 use emusync_remote::{create_only, probe_conditional_writes, PutOutcome, Remote, RemoteError};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+/// Local content hash of a unit that is not on the card (deleted, or not placed yet).
+const ABSENT: &str = "absent";
 
 /// What to do when a unit has more than one tip (DESIGN §6.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -54,7 +61,7 @@ impl Default for EngineOptions {
 #[derive(Debug, Clone, Default)]
 pub struct ContainerDesc {
     pub location: PathBuf,
-    /// Adapter id; `None` = `raw`.
+    /// Adapter id; `None` = detected from the file (see [`formats::detect`]).
     pub format: Option<String>,
     /// `None` = inferred from the file extension.
     pub platform: Option<String>,
@@ -104,10 +111,48 @@ pub struct CardStatus {
     pub mode: CardMode,
     pub container_id: Option<i64>,
     pub location: Option<String>,
+    /// The card's units: every save in unit mode, the single `@card` unit in whole-file mode.
+    pub units: Vec<UnitStatus>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UnitStatus {
+    pub unit: String,
+    /// Name inside the card (`BASLUS-20062GTA3`, or `@card`).
+    pub name: String,
+    pub titles: Vec<String>,
+    /// Whether the unit is on this device's card.
+    pub present: bool,
+    /// The version this device's card holds (or last held, if the unit was deleted here).
     pub local_version: Option<String>,
     pub tips: Vec<String>,
+    /// Every tip is a deletion.
+    pub deleted: bool,
     pub conflict: Option<i64>,
     pub inbox: Option<String>,
+}
+
+impl UnitStatus {
+    /// One-word state for display.
+    pub fn state(&self) -> &'static str {
+        if self.conflict.is_some() {
+            "conflict"
+        } else if self.inbox.is_some() {
+            "waiting"
+        } else if self.deleted && !self.present {
+            "deleted"
+        } else if self.local_version.is_none() {
+            if self.present {
+                "not synced yet"
+            } else {
+                "not on this device"
+            }
+        } else if self.tips.len() == 1 && self.local_version.as_ref() == self.tips.first() {
+            "in sync"
+        } else {
+            "behind"
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -288,24 +333,41 @@ impl Engine {
     // Containers and cards
     // ------------------------------------------------------------------------------------------
 
-    /// Registers a container for a logical card. Idempotent per location. Publishes the card
-    /// (in whole-file mode, the only mode M0 adapters support) unless the repository already
-    /// knows it.
+    /// Registers a container for a logical card. Idempotent per location; re-adding a known
+    /// location updates its format if detection now finds a better adapter (a card registered
+    /// as `raw` by M0 becomes `ps2.card`). Publishes the card (in unit mode when the format has
+    /// an adapter, else whole-file mode) unless the repository already knows it, in which case
+    /// the repository's mode is adopted.
     pub fn add_container(&mut self, desc: ContainerDesc) -> Result<i64> {
         let location = std::path::absolute(&desc.location)?;
         let loc = location.to_string_lossy().into_owned();
-        let containers = self.store.containers()?;
-        if let Some(c) = containers.iter().find(|c| c.location == loc) {
-            return Ok(c.id);
-        }
-        let format = desc.format.as_deref().unwrap_or("raw");
-        let fmt = formats::by_id(format).ok_or_else(|| {
-            Error::InvalidArg(format!("format {format:?} is not available in this build (M0 ships only \"raw\")"))
-        })?;
         let file_name = location
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .ok_or_else(|| Error::InvalidArg(format!("{loc} has no file name")))?;
+        let format = match &desc.format {
+            Some(f) => f.clone(),
+            None => match fs::read(&location) {
+                Ok(image) => formats::detect(&file_name, &image).id().to_string(),
+                Err(_) if formats::infer_platform(&file_name) == "ps2" => "ps2.card".into(),
+                Err(_) => "raw".into(),
+            },
+        };
+        let fmt = formats::by_id(&format)
+            .ok_or_else(|| Error::InvalidArg(format!("format {format:?} is not available in this build")))?;
+        let containers = self.store.containers()?;
+        if let Some(c) = containers.iter().find(|c| c.location == loc) {
+            if c.format != format {
+                if self.card_mode(&c.card_id)? == CardMode::Units && !fmt.supports_units() {
+                    return Err(Error::InvalidArg(format!(
+                        "card {} syncs per save, which format {format:?} can't do",
+                        c.card_id
+                    )));
+                }
+                self.store.set_container_format(c.id, &format)?;
+            }
+            return Ok(c.id);
+        }
         let platform = desc.platform.clone().unwrap_or_else(|| formats::infer_platform(&file_name).to_string());
         let name = match &desc.card {
             Some(n) => n.clone(),
@@ -334,14 +396,52 @@ impl Engine {
                 Some(_) => {}
                 None => {
                     let mode = if fmt.supports_units() { CardMode::Units } else { CardMode::WholeFile };
-                    let hlc = self.tick()?;
-                    self.store.set_card(&card_id, mode, hlc)?;
-                    let rec = LogRecord::Card(CardRecord { card: card_id.clone(), mode, hlc });
-                    self.store.outbox_push(&rec.to_line())?;
+                    self.publish_card(&card_id, mode)?;
                 }
             }
-            self.store.insert_container(&loc, format, &card_id, flags)
+            self.store.insert_container(&loc, &format, &card_id, flags)
         })
+    }
+
+    fn publish_card(&self, card_id: &str, mode: CardMode) -> Result<()> {
+        let hlc = self.tick()?;
+        self.store.set_card(card_id, mode, hlc)?;
+        let rec = LogRecord::Card(CardRecord { card: card_id.to_string(), mode, hlc });
+        self.store.outbox_push(&rec.to_line())
+    }
+
+    /// Switches a logical card between unit and whole-file mode for every device (DESIGN
+    /// §2.1). Local changes are first captured in the old mode, so the switch loses nothing.
+    /// Run [`Engine::sync`] to publish it.
+    pub fn set_card_mode(&mut self, card: &str, mode: CardMode) -> Result<()> {
+        let card_id = self.resolve_card(card)?;
+        if self.card_mode(&card_id)? == mode {
+            return Ok(());
+        }
+        let containers: Vec<ContainerRow> =
+            self.store.containers()?.into_iter().filter(|c| c.card_id == card_id).collect();
+        if mode == CardMode::Units {
+            for c in &containers {
+                if !self.format_of(c)?.supports_units() {
+                    return Err(Error::InvalidArg(format!(
+                        "{} is not in a format emusync can split into saves ({})",
+                        c.location, c.format
+                    )));
+                }
+            }
+        }
+        if containers.iter().any(|c| self.busy.contains(&c.id)) {
+            return Err(Error::InvalidArg(format!("card {card_id} is in use")));
+        }
+        let mut report = SyncReport::default();
+        for c in &containers {
+            self.scan(c, &mut report)?;
+        }
+        self.store.tx(|| self.publish_card(&card_id, mode))
+    }
+
+    fn card_mode(&self, card_id: &str) -> Result<CardMode> {
+        Ok(self.store.card(card_id)?.map_or(CardMode::WholeFile, |(m, _)| m))
     }
 
     pub fn remove_container(&mut self, id: i64) -> Result<()> {
@@ -362,27 +462,77 @@ impl Engine {
         self.store.containers()
     }
 
+    /// Units of a card: the `@card` unit in whole-file mode; in unit mode, every save known
+    /// from the repository or from this device's container.
+    fn units_of_card(&self, card_id: &str, mode: CardMode, container: Option<i64>) -> Result<Vec<String>> {
+        let card_unit = whole_file_unit(card_id);
+        if mode == CardMode::WholeFile {
+            return Ok(vec![card_unit]);
+        }
+        let prefix = format!("{card_id}:");
+        let mut set: BTreeSet<String> = self.store.units_with_prefix(&prefix)?.into_iter().collect();
+        if let Some(id) = container {
+            for (u, _) in self.store.local_units_of(id)? {
+                if u.starts_with(&prefix) {
+                    set.insert(u);
+                }
+            }
+        }
+        set.remove(&card_unit);
+        Ok(set.into_iter().collect())
+    }
+
     pub fn cards(&self) -> Result<Vec<CardStatus>> {
         let containers = self.store.containers()?;
         let conflicts = self.store.open_conflicts()?;
         let inbox = self.store.inbox()?;
         let mut out = Vec::new();
         for (card_id, mode) in self.store.cards()? {
-            let unit = whole_file_unit(&card_id);
             let c = containers.iter().find(|c| c.card_id == card_id);
-            let lu = match c {
-                Some(c) => self.store.local_unit(&unit, c.id)?,
-                None => None,
+            // What the card file holds right now, so saves that haven't synced yet show up too.
+            let on_card: Option<HashMap<String, Vec<String>>> = match (c, mode) {
+                (Some(c), CardMode::Units) => self.format_of(c).ok().and_then(|fmt| {
+                    let image = fs::read(&c.location).ok()?;
+                    let units = fmt.extract_all(&image).ok()?;
+                    Some(units.into_iter().map(|u| (unit_id(&card_id, &u.name), fmt.titles(&u.name))).collect())
+                }),
+                _ => None,
             };
+            let mut all: BTreeSet<String> = self.units_of_card(&card_id, mode, c.map(|c| c.id))?.into_iter().collect();
+            all.extend(on_card.iter().flat_map(|m| m.keys().cloned()));
+            let mut units = Vec::new();
+            for unit in all {
+                let lu = match c {
+                    Some(c) => self.store.local_unit(&unit, c.id)?,
+                    None => None,
+                };
+                let tips = self.tips(&unit)?;
+                let present = match &on_card {
+                    Some(m) => m.contains_key(&unit),
+                    None => lu.as_ref().is_some_and(|l| l.content_hash != ABSENT),
+                };
+                let titles = match tips.last() {
+                    Some(t) => t.rec.titles.clone(),
+                    None => on_card.as_ref().and_then(|m| m.get(&unit).cloned()).unwrap_or_default(),
+                };
+                units.push(UnitStatus {
+                    name: split_unit(&unit).map(|(_, n)| n.to_string()).unwrap_or_default(),
+                    titles,
+                    present,
+                    local_version: lu.and_then(|l| l.base),
+                    deleted: !tips.is_empty() && tips.iter().all(|t| t.rec.tombstone),
+                    tips: tips.into_iter().map(|t| t.rec.id).collect(),
+                    conflict: conflicts.iter().find(|x| x.unit_id == unit).map(|x| x.id),
+                    inbox: inbox.iter().find(|i| i.0 == unit).map(|i| i.3.clone()),
+                    unit,
+                });
+            }
             out.push(CardStatus {
                 card_id,
                 mode,
                 container_id: c.map(|c| c.id),
                 location: c.map(|c| c.location.clone()),
-                local_version: lu.and_then(|l| l.base),
-                tips: self.tips(&unit)?.into_iter().map(|t| t.rec.id).collect(),
-                conflict: conflicts.iter().find(|x| x.unit_id == unit).map(|x| x.id),
-                inbox: inbox.iter().find(|i| i.0 == unit).map(|i| i.3.clone()),
+                units,
             });
         }
         Ok(out)
@@ -411,11 +561,17 @@ impl Engine {
             }
         }
         let containers = self.store.containers()?;
+        let mut scanned = HashMap::new();
         for c in &containers {
-            self.scan(c, &mut report)?;
+            if let Some(image_hash) = self.scan(c, &mut report)? {
+                scanned.insert(c.id, image_hash);
+            }
         }
         for c in &containers {
-            self.reconcile(c, online, &mut report)?;
+            // A container that couldn't be read or validated is never written to.
+            if let Some(image_hash) = scanned.get(&c.id) {
+                self.reconcile(c, image_hash, online, &mut report)?;
+            }
         }
         if online {
             if let Some(r) = &remote {
@@ -441,71 +597,146 @@ impl Engine {
     /// Whether this build can sync the card in the repository's mode.
     fn card_syncable(&self, c: &ContainerRow) -> Result<bool> {
         let fmt = self.format_of(c)?;
-        Ok(!matches!(self.store.card(&c.card_id)?, Some((CardMode::Units, _)) if !fmt.supports_units()))
+        Ok(!(self.card_mode(&c.card_id)? == CardMode::Units && !fmt.supports_units()))
     }
 
-    /// Quiescent snapshot of one container: if its content changed since the base version,
-    /// record a new local version (parent = base) and queue it in the outbox.
-    fn scan(&self, c: &ContainerRow, report: &mut SyncReport) -> Result<()> {
-        let unit = whole_file_unit(&c.card_id);
+    /// Quiescent snapshot of one container: every unit whose content changed since its base
+    /// becomes a new local version (parent = base), queued in the outbox. Returns the hash of
+    /// the image that was scanned, or `None` if the container can't be synced right now.
+    fn scan(&self, c: &ContainerRow, report: &mut SyncReport) -> Result<Option<String>> {
+        let card_unit = whole_file_unit(&c.card_id);
         if !self.card_syncable(c)? {
             report.blocked.push(Blocked {
-                unit,
-                reason: "card is in unit mode in the repository; this build supports whole-file mode only".into(),
+                unit: card_unit,
+                reason: format!("card syncs per save, which this build can't do for format {:?}", c.format),
             });
-            return Ok(());
+            return Ok(None);
         }
         let path = Path::new(&c.location);
         let image = match fs::read(path) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                report.blocked.push(Blocked { unit, reason: format!("{} does not exist", c.location) });
-                return Ok(());
+                report.blocked.push(Blocked { unit: card_unit, reason: format!("{} does not exist", c.location) });
+                return Ok(None);
             }
             Err(e) => return Err(e.into()),
         };
         let fmt = self.format_of(c)?;
         if let Err(e) = fmt.validate(&image) {
             // A container that fails validation is never synced, so corruption doesn't spread.
-            report.blocked.push(Blocked { unit, reason: e.to_string() });
+            report.blocked.push(Blocked { unit: card_unit, reason: e.to_string() });
+            return Ok(None);
+        }
+        match self.card_mode(&c.card_id)? {
+            CardMode::WholeFile => {
+                let mut meta = BTreeMap::new();
+                if let Some(name) = path.file_name() {
+                    meta.insert("file".to_string(), name.to_string_lossy().into_owned());
+                }
+                if let Ok(modified) = fs::metadata(path).and_then(|m| m.modified()) {
+                    if let Ok(d) = modified.duration_since(std::time::UNIX_EPOCH) {
+                        let s = Hlc { ms: d.as_millis() as i64, counter: 0 }.to_string();
+                        meta.insert("mtime".to_string(), s.split('/').next().unwrap_or_default().to_string());
+                    }
+                }
+                self.snapshot_unit(c, &card_unit, &image, meta, vec![], report)?;
+            }
+            CardMode::Units => {
+                let units = match fmt.extract_all(&image) {
+                    Ok(u) => u,
+                    Err(e) => {
+                        report.blocked.push(Blocked { unit: card_unit, reason: e.to_string() });
+                        return Ok(None);
+                    }
+                };
+                let mut present = HashSet::new();
+                for canon in units {
+                    let unit = unit_id(&c.card_id, &canon.name);
+                    let titles = fmt.titles(&canon.name);
+                    self.snapshot_unit(c, &unit, &canon.bytes, canon.meta, titles, report)?;
+                    present.insert(unit);
+                }
+                self.scan_deletions(c, &present, report)?;
+            }
+        }
+        Ok(Some(content_id(&image)))
+    }
+
+    /// Saves that were on the card at the last sync and are gone now. Normally each becomes a
+    /// deletion (tombstone) that syncs to other devices. If every save vanished at once (two or
+    /// more), the card was most likely replaced or reformatted: the saves are restored from
+    /// the cloud instead of being deleted everywhere.
+    fn scan_deletions(&self, c: &ContainerRow, present: &HashSet<String>, report: &mut SyncReport) -> Result<()> {
+        let prefix = format!("{}:", c.card_id);
+        let card_unit = whole_file_unit(&c.card_id);
+        let gone: Vec<(String, LocalUnit)> = self
+            .store
+            .local_units_of(c.id)?
+            .into_iter()
+            .filter(|(u, lu)| {
+                u.starts_with(&prefix) && *u != card_unit && lu.content_hash != ABSENT && !present.contains(u)
+            })
+            .collect();
+        if present.is_empty() && gone.len() >= 2 {
+            report.warnings.push(format!(
+                "every save on {} disappeared (new or reformatted card?); restoring them from the cloud \
+                 instead of deleting them everywhere",
+                c.location
+            ));
+            for (u, lu) in gone {
+                self.store.set_local_unit(&u, c.id, ABSENT, lu.base.as_deref())?;
+            }
             return Ok(());
         }
-        let canon = fmt.extract(&image, &UnitRef { name: WHOLE_FILE_UNIT.into() })?;
-        let hash = content_id(&canon.bytes);
-        let lu = self.store.local_unit(&unit, c.id)?;
+        for (u, lu) in gone {
+            match lu.base {
+                Some(base) => {
+                    let rec = self.new_tombstone(&u, base)?;
+                    self.store.set_local_unit(&u, c.id, ABSENT, Some(&rec.id))?;
+                    report.new_local_versions += 1;
+                }
+                // Never synced: nothing to delete elsewhere.
+                None => self.store.delete_local_unit(&u, c.id)?,
+            }
+        }
+        Ok(())
+    }
+
+    /// Records the local content of one unit: a new version if it changed since its base.
+    fn snapshot_unit(
+        &self,
+        c: &ContainerRow,
+        unit: &str,
+        bytes: &[u8],
+        meta: BTreeMap<String, String>,
+        titles: Vec<String>,
+        report: &mut SyncReport,
+    ) -> Result<()> {
+        let hash = content_id(bytes);
+        let lu = self.store.local_unit(unit, c.id)?;
         if let Some(LocalUnit { content_hash, base: Some(_) }) = &lu {
             if *content_hash == hash {
                 return Ok(());
             }
         }
         // Same bytes reached independently: adopt the tip as base, no new version.
-        if let Some(t) = self.tips(&unit)?.into_iter().find(|t| t.rec.content == hash) {
-            self.store.set_local_unit(&unit, c.id, &hash, Some(&t.rec.id))?;
+        if let Some(t) = self.tips(unit)?.into_iter().find(|t| !t.rec.tombstone && t.rec.content == hash) {
+            self.store.set_local_unit(unit, c.id, &hash, Some(&t.rec.id))?;
             return Ok(());
         }
         // First sync of a container holding an older version (a stale copy of the card): adopt
         // that version, so reconciliation fast-forwards it instead of raising a conflict.
         if lu.as_ref().and_then(|l| l.base.as_ref()).is_none() {
-            let mut known = self.store.versions_of(&unit)?;
+            let mut known = self.store.versions_of(unit)?;
             known.sort_by(|a, b| (b.rec.hlc, &b.rec.id).cmp(&(a.rec.hlc, &a.rec.id)));
-            if let Some(v) = known.into_iter().find(|v| v.rec.content == hash) {
-                self.store.set_local_unit(&unit, c.id, &hash, Some(&v.rec.id))?;
+            if let Some(v) = known.into_iter().find(|v| !v.rec.tombstone && v.rec.content == hash) {
+                self.store.set_local_unit(unit, c.id, &hash, Some(&v.rec.id))?;
                 return Ok(());
             }
         }
         let parents: Vec<String> = lu.and_then(|l| l.base).into_iter().collect();
-        let mut meta = BTreeMap::new();
-        if let Some(name) = path.file_name() {
-            meta.insert("file".to_string(), name.to_string_lossy().into_owned());
-        }
-        if let Ok(modified) = fs::metadata(path).and_then(|m| m.modified()) {
-            if let Ok(d) = modified.duration_since(std::time::UNIX_EPOCH) {
-                let s = Hlc { ms: d.as_millis() as i64, counter: 0 }.to_string();
-                meta.insert("mtime".to_string(), s.split('/').next().unwrap_or_default().to_string());
-            }
-        }
-        let rec = self.new_version(&unit, parents, &canon.bytes, meta)?;
-        self.store.set_local_unit(&unit, c.id, &hash, Some(&rec.id))?;
+        let rec = self.new_version(unit, parents, bytes, meta, titles)?;
+        self.store.set_local_unit(unit, c.id, &hash, Some(&rec.id))?;
         report.new_local_versions += 1;
         Ok(())
     }
@@ -517,6 +748,7 @@ impl Engine {
         parents: Vec<String>,
         content: &[u8],
         meta: BTreeMap<String, String>,
+        titles: Vec<String>,
     ) -> Result<VersionRecord> {
         let mut chunks = Vec::new();
         for piece in chunk::split(content) {
@@ -536,8 +768,29 @@ impl Engine {
             meta,
             hlc: self.tick()?,
             playtime_ms: 0,
-            titles: vec![],
+            titles,
             tombstone: false,
+        }
+        .seal();
+        self.publish_version(&rec)?;
+        Ok(rec)
+    }
+
+    /// Records the deletion of a unit as a version (DESIGN §4): its history stays restorable.
+    fn new_tombstone(&self, unit: &str, base: String) -> Result<VersionRecord> {
+        let titles = self.store.version(&base)?.map(|v| v.rec.titles).unwrap_or_default();
+        let rec = VersionRecord {
+            unit: unit.to_string(),
+            id: String::new(),
+            parents: vec![base],
+            content: content_id(b""),
+            chunks: vec![],
+            size: 0,
+            meta: BTreeMap::new(),
+            hlc: self.tick()?,
+            playtime_ms: 0,
+            titles,
+            tombstone: true,
         }
         .seal();
         self.publish_version(&rec)?;
@@ -564,46 +817,72 @@ impl Engine {
         Ok(tips)
     }
 
-    /// Reconciliation table (DESIGN §6.3) for one container. Local changes were already turned
-    /// into versions by [`Self::scan`], so divergence shows up as more than one tip.
-    fn reconcile(&self, c: &ContainerRow, online: bool, report: &mut SyncReport) -> Result<()> {
-        let unit = whole_file_unit(&c.card_id);
-        if !self.card_syncable(c)? {
+    /// Reconciliation table (DESIGN §6.3) for every unit of one container, then one apply for
+    /// all the changes. Local changes were already turned into versions by [`Self::scan`], so
+    /// divergence shows up as more than one tip.
+    fn reconcile(&self, c: &ContainerRow, image_hash: &str, online: bool, report: &mut SyncReport) -> Result<()> {
+        let mode = self.card_mode(&c.card_id)?;
+        let mut pending = Vec::new();
+        for unit in self.units_of_card(&c.card_id, mode, Some(c.id))? {
+            let lu = self.store.local_unit(&unit, c.id)?;
+            if mode == CardMode::WholeFile && lu.as_ref().and_then(|l| l.base.as_ref()).is_none() {
+                continue;
+            }
+            let tips = self.tips(&unit)?;
+            let Some(target) = self.decide(c, &unit, &tips, lu.as_ref(), report)? else { continue };
+            self.store.close_conflicts(&unit)?;
+            let local = lu.as_ref().map_or(ABSENT, |l| l.content_hash.as_str());
+            let wanted = if target.rec.tombstone { ABSENT } else { target.rec.content.as_str() };
+            if local == wanted {
+                if lu.as_ref().and_then(|l| l.base.as_deref()) != Some(target.rec.id.as_str()) {
+                    self.store.set_local_unit(&unit, c.id, wanted, Some(&target.rec.id))?;
+                }
+                self.store.inbox_remove(&unit, c.id)?;
+                continue;
+            }
+            pending.push((unit, target));
+        }
+        if pending.is_empty() {
             return Ok(());
         }
-        let Some(lu) = self.store.local_unit(&unit, c.id)? else { return Ok(()) };
-        let Some(base) = lu.base.clone() else { return Ok(()) };
-        let tips = self.tips(&unit)?;
-        let target = match tips.len() {
-            0 => return Ok(()),
+        self.apply(c, mode, image_hash, pending, online, report)
+    }
+
+    /// The version a unit should hold, or `None` while an `ask` conflict is open.
+    fn decide(
+        &self,
+        c: &ContainerRow,
+        unit: &str,
+        tips: &[StoredVersion],
+        lu: Option<&LocalUnit>,
+        report: &mut SyncReport,
+    ) -> Result<Option<StoredVersion>> {
+        Ok(Some(match tips.len() {
+            0 => return Ok(None),
             // Nothing to do, or a fast-forward: the single tip descends from every version.
             1 => tips[0].clone(),
             _ => {
-                let contents: HashSet<&str> = tips.iter().map(|t| t.rec.content.as_str()).collect();
+                let contents: HashSet<(&str, bool)> =
+                    tips.iter().map(|t| (t.rec.content.as_str(), t.rec.tombstone)).collect();
                 if contents.len() == 1 {
                     // Divergent histories with identical bytes: collapse them, no decision needed.
-                    self.auto_merge(&unit, &tips, tips.last().unwrap())?
+                    self.auto_merge(unit, tips, tips.last().unwrap())?
                 } else {
                     match self.opts.policy {
                         ConflictPolicy::Ask => {
                             let ids: Vec<String> = tips.iter().map(|t| t.rec.id.clone()).collect();
-                            let id = self.store.upsert_conflict(&unit, c.id, &base, &ids)?;
+                            let local = lu.and_then(|l| l.base.clone()).unwrap_or_default();
+                            let id = self.store.upsert_conflict(unit, c.id, &local, &ids)?;
                             if !report.conflicts.contains(&id) {
                                 report.conflicts.push(id);
                             }
-                            return Ok(());
+                            return Ok(None);
                         }
-                        ConflictPolicy::Newest => self.auto_merge(&unit, &tips, newest(&tips))?,
+                        ConflictPolicy::Newest => self.auto_merge(unit, tips, newest(tips))?,
                     }
                 }
             }
-        };
-        self.store.close_conflicts(&unit)?;
-        if target.rec.id == base {
-            self.store.inbox_remove(&unit, c.id)?;
-            return Ok(());
-        }
-        self.apply(c, &unit, &lu, &target, online, report)
+        }))
     }
 
     /// Deterministic merge of `tips` choosing `winner`'s content. Every device computing the
@@ -639,66 +918,192 @@ impl Engine {
         Ok(())
     }
 
-    /// Writes `target` into the container (DESIGN §5 apply steps).
+    /// Writes the `pending` target versions into the container in one rebuild (DESIGN §5
+    /// apply steps). Units that can't be applied (content unavailable, card full, malformed)
+    /// wait in the inbox; the rest are still applied.
     fn apply(
         &self,
         c: &ContainerRow,
-        unit: &str,
-        lu: &LocalUnit,
-        target: &StoredVersion,
+        mode: CardMode,
+        image_hash: &str,
+        mut pending: Vec<(String, StoredVersion)>,
         online: bool,
         report: &mut SyncReport,
     ) -> Result<()> {
-        let t = &target.rec;
-        if lu.content_hash == t.content {
-            self.store.set_local_unit(unit, c.id, &t.content, Some(&t.id))?;
-            self.store.inbox_remove(unit, c.id)?;
+        if c.flags & CF_READ_ONLY != 0 || self.busy.contains(&c.id) {
+            let reason = if c.flags & CF_READ_ONLY != 0 { "container is read-only" } else { "container is in use" };
+            for (unit, t) in &pending {
+                self.block(c, unit, &t.rec.id, reason.into(), report)?;
+            }
             return Ok(());
         }
-        if c.flags & CF_READ_ONLY != 0 {
-            return self.block(c, unit, &t.id, "container is read-only".into(), report);
-        }
-        if self.busy.contains(&c.id) {
-            return self.block(c, unit, &t.id, "container is in use".into(), report);
-        }
-        let content = match self.assemble(t, online) {
-            Ok(b) => b,
-            Err(e) => return self.block(c, unit, &t.id, format!("content not available: {e}"), report),
-        };
         let path = Path::new(&c.location);
-        // 1. Read and validate the current container. It must still be what we scanned.
+        // 1. Read the current container. It must still be what we scanned (and validated).
         let current = fs::read(path)?;
-        if content_id(&current) != lu.content_hash {
-            report.blocked.push(Blocked {
-                unit: unit.to_string(),
-                reason: "container changed during sync; it will be snapshotted next cycle".into(),
-            });
+        if content_id(&current) != image_hash {
+            for (unit, _) in &pending {
+                report.blocked.push(Blocked {
+                    unit: unit.clone(),
+                    reason: "container changed during sync; it will be snapshotted next cycle".into(),
+                });
+            }
             return Ok(());
         }
         let fmt = self.format_of(c)?;
-        // 2. Build the new image.
-        let canon = Canonical { name: WHOLE_FILE_UNIT.into(), bytes: content, meta: BTreeMap::new() };
-        let image = match fmt.apply(&current, &[ApplyOp::Put(canon)]) {
-            Ok(i) => i,
-            Err(e) => return self.block(c, unit, &t.id, e.to_string(), report),
-        };
-        // 3. Re-parse and verify.
-        fmt.validate(&image)?;
-        let check = fmt.extract(&image, &UnitRef { name: WHOLE_FILE_UNIT.into() })?;
-        if content_id(&check.bytes) != t.content {
-            return Err(Error::Integrity(format!("rebuilt {} does not match version {}", c.location, t.id)));
+        // Deletions first, so they free space for what comes next.
+        pending.sort_by_key(|(_, t)| !t.rec.tombstone);
+        let mut ready = Vec::new();
+        for (unit, t) in pending {
+            if t.rec.tombstone {
+                ready.push((unit, t, None));
+                continue;
+            }
+            match self.assemble(&t.rec, online) {
+                Ok(b) => ready.push((unit, t, Some(b))),
+                Err(e) => self.block(c, &unit, &t.rec.id, format!("content not available: {e}"), report)?,
+            }
         }
+        if ready.is_empty() {
+            return Ok(());
+        }
+        // 2. Build the new image.
+        let (image, applied) = match mode {
+            CardMode::WholeFile => {
+                let (unit, t, content) = ready.pop().expect("whole-file mode has one unit");
+                let content = content.unwrap_or_default();
+                if let Err(e) = fmt.validate(&content) {
+                    return self.block(c, &unit, &t.rec.id, format!("the synced card image is not valid: {e}"), report);
+                }
+                (content, vec![(unit, t)])
+            }
+            CardMode::Units => self.build_units(c, fmt, &current, ready, report)?,
+        };
+        if applied.is_empty() {
+            return Ok(());
+        }
+        // 3. Re-parse and verify every unit, touched or not.
+        self.verify(c, fmt, mode, &image, &applied)?;
         // 4. Keep what we are about to overwrite.
-        self.snapshot(unit, c.id, &current, lu.base.as_deref())?;
+        match mode {
+            CardMode::WholeFile => {
+                let (unit, _) = &applied[0];
+                let base = self.store.local_unit(unit, c.id)?.and_then(|l| l.base);
+                self.snapshot(unit, c.id, &current, base.as_deref())?;
+            }
+            CardMode::Units => {
+                let before: HashMap<String, Vec<u8>> =
+                    fmt.extract_all(&current)?.into_iter().map(|u| (unit_id(&c.card_id, &u.name), u.bytes)).collect();
+                for (unit, _) in &applied {
+                    if let Some(bytes) = before.get(unit) {
+                        let base = self.store.local_unit(unit, c.id)?.and_then(|l| l.base);
+                        self.snapshot(unit, c.id, bytes, base.as_deref())?;
+                    }
+                }
+            }
+        }
         // 5. Temp file, fsync, atomic replace.
         if let Err(e) = fsutil::atomic_replace(path, &image) {
-            return self.block(c, unit, &t.id, format!("cannot replace {}: {e}", c.location), report);
+            for (unit, t) in &applied {
+                self.block(c, unit, &t.rec.id, format!("cannot replace {}: {e}", c.location), report)?;
+            }
+            return Ok(());
         }
         self.store.tx(|| {
-            self.store.set_local_unit(unit, c.id, &t.content, Some(&t.id))?;
-            self.store.inbox_remove(unit, c.id)
+            for (unit, t) in &applied {
+                let wanted = if t.rec.tombstone { ABSENT } else { t.rec.content.as_str() };
+                self.store.set_local_unit(unit, c.id, wanted, Some(&t.rec.id))?;
+                self.store.inbox_remove(unit, c.id)?;
+            }
+            Ok(())
         })?;
-        report.applied.push(Applied { unit: unit.to_string(), version: t.id.clone(), location: c.location.clone() });
+        for (unit, t) in applied {
+            report.applied.push(Applied { unit, version: t.rec.id, location: c.location.clone() });
+        }
+        Ok(())
+    }
+
+    /// Unit mode: applies every change in one rebuild, or, if that fails (card full, or a
+    /// malformed save from the remote), one change at a time, holding back the ones that fail.
+    #[allow(clippy::type_complexity)]
+    fn build_units(
+        &self,
+        c: &ContainerRow,
+        fmt: &dyn ContainerFormat,
+        current: &[u8],
+        ready: Vec<(String, StoredVersion, Option<Vec<u8>>)>,
+        report: &mut SyncReport,
+    ) -> Result<(Vec<u8>, Vec<(String, StoredVersion)>)> {
+        let ops: Vec<ApplyOp> = ready
+            .iter()
+            .map(|(unit, t, content)| {
+                let name = split_unit(unit).map(|(_, n)| n).unwrap_or_default().to_string();
+                match content {
+                    None => ApplyOp::Delete(name),
+                    Some(bytes) => ApplyOp::Put(Canonical { name, bytes: bytes.clone(), meta: t.rec.meta.clone() }),
+                }
+            })
+            .collect();
+        if let Ok(image) = fmt.apply(current, &ops) {
+            return Ok((image, ready.into_iter().map(|(u, t, _)| (u, t)).collect()));
+        }
+        let mut image = current.to_vec();
+        let mut applied = Vec::new();
+        for ((unit, t, _), op) in ready.into_iter().zip(ops) {
+            match fmt.apply(&image, std::slice::from_ref(&op)) {
+                Ok(next) => {
+                    image = next;
+                    applied.push((unit, t));
+                }
+                Err(FormatError::NoSpace) => {
+                    self.block(c, &unit, &t.rec.id, "not enough free space on the card".into(), report)?
+                }
+                Err(e) => self.block(c, &unit, &t.rec.id, format!("cannot write this save: {e}"), report)?,
+            }
+        }
+        Ok((image, applied))
+    }
+
+    /// Checks a rebuilt image before it replaces the original: it validates, and holds exactly
+    /// the expected content for every unit, both those just applied and those left alone.
+    fn verify(
+        &self,
+        c: &ContainerRow,
+        fmt: &dyn ContainerFormat,
+        mode: CardMode,
+        image: &[u8],
+        applied: &[(String, StoredVersion)],
+    ) -> Result<()> {
+        fmt.validate(image).map_err(|e| Error::Integrity(format!("rebuilt {} does not validate: {e}", c.location)))?;
+        let ok = match mode {
+            CardMode::WholeFile => content_id(image) == applied[0].1.rec.content,
+            CardMode::Units => {
+                let prefix = format!("{}:", c.card_id);
+                let card_unit = whole_file_unit(&c.card_id);
+                let mut expected: BTreeMap<String, String> = self
+                    .store
+                    .local_units_of(c.id)?
+                    .into_iter()
+                    .filter(|(u, lu)| u.starts_with(&prefix) && *u != card_unit && lu.content_hash != ABSENT)
+                    .map(|(u, lu)| (u, lu.content_hash))
+                    .collect();
+                for (unit, t) in applied {
+                    if t.rec.tombstone {
+                        expected.remove(unit);
+                    } else {
+                        expected.insert(unit.clone(), t.rec.content.clone());
+                    }
+                }
+                let got: BTreeMap<String, String> = fmt
+                    .extract_all(image)?
+                    .into_iter()
+                    .map(|u| (unit_id(&c.card_id, &u.name), content_id(&u.bytes)))
+                    .collect();
+                got == expected
+            }
+        };
+        if !ok {
+            return Err(Error::Integrity(format!("rebuilt {} does not hold exactly the expected content", c.location)));
+        }
         Ok(())
     }
 
@@ -1026,26 +1431,54 @@ impl Engine {
     // History, restore, conflicts
     // ------------------------------------------------------------------------------------------
 
-    /// Accepts a unit id (`ps2:Mcd001:@card`), a card id (`ps2:Mcd001`) or a card name
-    /// (`Mcd001`) and returns the unit id.
-    pub fn resolve_unit(&self, arg: &str) -> Result<String> {
-        if arg.ends_with(&format!(":{WHOLE_FILE_UNIT}")) {
+    /// Accepts a card id (`ps2:Mcd001`) or card name (`Mcd001`) and returns the card id.
+    pub fn resolve_card(&self, arg: &str) -> Result<String> {
+        let cards = self.store.cards()?;
+        if cards.iter().any(|(id, _)| id == arg) {
             return Ok(arg.to_string());
         }
-        if arg.contains(':') {
-            return Ok(whole_file_unit(arg));
-        }
-        let matches: Vec<String> = self
-            .store
-            .cards()?
-            .into_iter()
-            .map(|(id, _)| id)
-            .filter(|id| id.split_once(':').map(|(_, n)| n) == Some(arg))
-            .collect();
+        let matches: Vec<String> =
+            cards.into_iter().map(|(id, _)| id).filter(|id| id.split_once(':').map(|(_, n)| n) == Some(arg)).collect();
         match matches.as_slice() {
-            [one] => Ok(whole_file_unit(one)),
+            [one] => Ok(one.clone()),
             [] => Err(Error::NotFound(format!("no card named {arg:?}"))),
             many => Err(Error::InvalidArg(format!("{arg:?} is ambiguous: {}", many.join(", ")))),
+        }
+    }
+
+    /// Accepts a unit id (`ps2:Mcd001:BASLUS-20062GTA3`, `ps2:Mcd001:@card`), the name of a
+    /// save (`BASLUS-20062GTA3`), or, for a card in whole-file mode, the card (`Mcd001`,
+    /// `ps2:Mcd001`). Returns the unit id.
+    pub fn resolve_unit(&self, arg: &str) -> Result<String> {
+        if split_unit(arg).is_some() {
+            return Ok(arg.to_string());
+        }
+        if let Ok(card_id) = self.resolve_card(arg) {
+            return match self.card_mode(&card_id)? {
+                CardMode::WholeFile => Ok(whole_file_unit(&card_id)),
+                CardMode::Units => {
+                    let saves = self.units_of_card(&card_id, CardMode::Units, None)?;
+                    let names: Vec<&str> = saves.iter().filter_map(|u| split_unit(u).map(|(_, n)| n)).take(5).collect();
+                    Err(Error::InvalidArg(format!(
+                        "card {card_id} syncs each save separately; name a save{}",
+                        if names.is_empty() { String::new() } else { format!(", e.g. {}", names.join(", ")) }
+                    )))
+                }
+            };
+        }
+        let mut matches = Vec::new();
+        for (card_id, mode) in self.store.cards()? {
+            if mode == CardMode::Units {
+                let unit = unit_id(&card_id, arg);
+                if !self.store.versions_of(&unit)?.is_empty() {
+                    matches.push(unit);
+                }
+            }
+        }
+        match matches.as_slice() {
+            [one] => Ok(one.clone()),
+            [] => Err(Error::NotFound(format!("no card or save named {arg:?}"))),
+            many => Err(Error::InvalidArg(format!("{arg:?} is on several cards: {}", many.join(", ")))),
         }
     }
 
@@ -1060,13 +1493,17 @@ impl Engine {
         Ok(HistoryEntry { is_tip: tips.contains(&v.id), is_local: local.contains(&v.id), version: v, device })
     }
 
+    /// Containers holding the card a unit belongs to.
+    fn containers_of_unit(&self, unit: &str) -> Result<Vec<ContainerRow>> {
+        let card = split_unit(unit).map(|(c, _)| c).unwrap_or_default();
+        Ok(self.store.containers()?.into_iter().filter(|c| c.card_id == card).collect())
+    }
+
     fn local_bases(&self, unit: &str) -> Result<HashSet<String>> {
         let mut out = HashSet::new();
-        for c in self.store.containers()? {
-            if whole_file_unit(&c.card_id) == unit {
-                if let Some(LocalUnit { base: Some(b), .. }) = self.store.local_unit(unit, c.id)? {
-                    out.insert(b);
-                }
+        for c in self.containers_of_unit(unit)? {
+            if let Some(LocalUnit { base: Some(b), .. }) = self.store.local_unit(unit, c.id)? {
+                out.insert(b);
             }
         }
         Ok(out)
@@ -1098,10 +1535,8 @@ impl Engine {
 
     fn scan_unit(&self, unit: &str) -> Result<()> {
         let mut report = SyncReport::default();
-        for c in self.store.containers()? {
-            if whole_file_unit(&c.card_id) == unit {
-                self.scan(&c, &mut report)?;
-            }
+        for c in self.containers_of_unit(unit)? {
+            self.scan(&c, &mut report)?;
         }
         Ok(())
     }

@@ -4,13 +4,15 @@
 //! file system. The core reads the container, hands the bytes to an adapter, and writes the
 //! result back with its own atomic-replace logic.
 //!
-//! M0 ships only the [`raw`] adapter, which treats a whole file as one opaque unit and
-//! implements whole-file mode for memory cards (DESIGN §2.1).
+//! - [`raw`]: a whole file as one opaque unit; the fallback for formats without an adapter.
+//! - [`ps2`] (`ps2.card`): PS2 memory card images, one unit per save directory.
 
 use std::collections::BTreeMap;
 
+pub mod ps2;
 pub mod raw;
 
+pub use ps2::Ps2Card;
 pub use raw::Raw;
 
 /// Name of the single unit of a container in whole-file mode (`ps2:Mcd001:@card`).
@@ -76,6 +78,14 @@ pub trait ContainerFormat: Send + Sync {
     fn list(&self, image: &[u8]) -> Result<Vec<UnitRef>>;
     /// Extracts one unit in canonical form.
     fn extract(&self, image: &[u8], unit: &UnitRef) -> Result<Canonical>;
+    /// Extracts every unit, in container order. Adapters override this to parse only once.
+    fn extract_all(&self, image: &[u8]) -> Result<Vec<Canonical>> {
+        self.list(image)?.iter().map(|u| self.extract(image, u)).collect()
+    }
+    /// Title keys (`ps2:SLUS-20062`) a unit belongs to, from its name. Empty if unknown.
+    fn titles(&self, _unit_name: &str) -> Vec<String> {
+        Vec::new()
+    }
     /// Builds a new image with `ops` applied. The input image is validated first.
     fn apply(&self, image: &[u8], ops: &[ApplyOp]) -> Result<Vec<u8>>;
 }
@@ -84,8 +94,21 @@ pub trait ContainerFormat: Send + Sync {
 pub fn by_id(id: &str) -> Option<&'static dyn ContainerFormat> {
     match id {
         "raw" => Some(&Raw),
+        "ps2.card" => Some(&Ps2Card),
         _ => None,
     }
+}
+
+/// Picks the adapter for a card file: one whose format is recognised in the image, or whose
+/// platform's standard card size the file has (a card the emulator created but nobody has
+/// formatted yet). Everything else is `raw`.
+pub fn detect(file_name: &str, image: &[u8]) -> &'static dyn ContainerFormat {
+    if Ps2Card.probe(image) == Confidence::Certain
+        || (infer_platform(file_name) == "ps2" && Ps2Card.probe(image) == Confidence::Maybe)
+    {
+        return &Ps2Card;
+    }
+    &Raw
 }
 
 /// Infers the platform from a card file's extension, for logical card ids (`ps2:Mcd001`).
@@ -109,5 +132,14 @@ mod tests {
         assert_eq!(infer_platform("Mcd001.ps2"), "ps2");
         assert_eq!(infer_platform("epsxe000.MCR"), "ps1");
         assert_eq!(infer_platform("noext"), "file");
+    }
+
+    #[test]
+    fn detection() {
+        let card = ps2::blank_card(8192, true, [0; 8]);
+        assert_eq!(detect("anything.bin", &card).id(), "ps2.card");
+        assert_eq!(detect("Mcd001.ps2", &vec![0xFF; card.len()]).id(), "ps2.card");
+        assert_eq!(detect("Mcd001.ps2", b"not a card").id(), "raw");
+        assert_eq!(detect("save.srm", &vec![0xFF; card.len()]).id(), "raw");
     }
 }

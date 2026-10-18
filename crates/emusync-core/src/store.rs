@@ -208,6 +208,11 @@ impl Store {
         Ok(())
     }
 
+    pub fn set_container_format(&self, id: i64, format: &str) -> Result<()> {
+        self.conn.execute("UPDATE containers SET format = ?2 WHERE id = ?1", params![id, format])?;
+        Ok(())
+    }
+
     pub fn containers(&self) -> Result<Vec<ContainerRow>> {
         let mut st = self.conn.prepare("SELECT id, location, format, card_id, flags FROM containers ORDER BY id")?;
         let rows = st.query_map([], |r| {
@@ -245,6 +250,23 @@ impl Store {
         Ok(())
     }
 
+    /// Every local unit row of a container, by unit id.
+    pub fn local_units_of(&self, container: i64) -> Result<Vec<(String, LocalUnit)>> {
+        let mut st = self.conn.prepare(
+            "SELECT unit_id, content_hash, base_version FROM local_units WHERE container_id = ?1 ORDER BY unit_id",
+        )?;
+        let rows = st.query_map([container], |r| {
+            Ok((r.get::<_, String>(0)?, LocalUnit { content_hash: r.get(1)?, base: r.get(2)? }))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn delete_local_unit(&self, unit: &str, container: i64) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM local_units WHERE unit_id = ?1 AND container_id = ?2", params![unit, container])?;
+        Ok(())
+    }
+
     // ---- versions ----
 
     /// Inserts a version record. Returns false if it was already known.
@@ -273,6 +295,15 @@ impl Store {
             out.push(StoredVersion { rec: serde_json::from_str(&rec)?, origin });
         }
         Ok(out)
+    }
+
+    /// Ids of units with at least one version whose id starts with `prefix` (e.g. `ps2:Mcd001:`).
+    pub fn units_with_prefix(&self, prefix: &str) -> Result<Vec<String>> {
+        let mut st = self
+            .conn
+            .prepare("SELECT DISTINCT unit_id FROM versions WHERE substr(unit_id, 1, ?2) = ?1 ORDER BY unit_id")?;
+        let rows = st.query_map(params![prefix, prefix.chars().count() as i64], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     pub fn all_version_ids(&self) -> Result<Vec<String>> {

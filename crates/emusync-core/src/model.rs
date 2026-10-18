@@ -181,9 +181,22 @@ pub fn content_id(data: &[u8]) -> String {
     format!("b3:{}", blake3::hash(data).to_hex())
 }
 
+/// The unit id of a save on a card: `ps2:Mcd001:BASLUS-20062GTA3` (DESIGN §2.4).
+pub fn unit_id(card_id: &str, name: &str) -> String {
+    format!("{card_id}:{name}")
+}
+
 /// The unit id of a card in whole-file mode: `ps2:Mcd001:@card`.
 pub fn whole_file_unit(card_id: &str) -> String {
-    format!("{card_id}:{}", emusync_formats::WHOLE_FILE_UNIT)
+    unit_id(card_id, emusync_formats::WHOLE_FILE_UNIT)
+}
+
+/// Splits a unit id into its card id (`platform:card`) and the unit's name in the card. The
+/// name may itself contain `:`.
+pub fn split_unit(unit: &str) -> Option<(&str, &str)> {
+    let first = unit.find(':')?;
+    let second = first + 1 + unit[first + 1..].find(':')?;
+    Some((&unit[..second], &unit[second + 1..]))
 }
 
 /// Short form of a `b3:` id for display.
@@ -233,6 +246,15 @@ mod tests {
             assert!(matches!(parse_record(line.as_bytes()), Err(RecordError::Malformed(_))), "{bad}");
         }
         assert!(is_hash_id(&content_id(b"x")));
+    }
+
+    #[test]
+    fn unit_ids() {
+        assert_eq!(unit_id("ps2:Mcd001", "BASLUS-20062GTA3"), "ps2:Mcd001:BASLUS-20062GTA3");
+        assert_eq!(split_unit("ps2:Mcd001:BASLUS-20062GTA3"), Some(("ps2:Mcd001", "BASLUS-20062GTA3")));
+        assert_eq!(split_unit("ps2:Mcd001:a:b"), Some(("ps2:Mcd001", "a:b")));
+        assert_eq!(split_unit(&whole_file_unit("ps2:Mcd001")), Some(("ps2:Mcd001", "@card")));
+        assert_eq!(split_unit("ps2:Mcd001"), None);
     }
 
     #[test]

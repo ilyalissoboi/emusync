@@ -25,8 +25,8 @@ mod store;
 
 pub use engine::{
     Applied, Blocked, CardStatus, ConflictInfo, ConflictPolicy, ContainerDesc, Engine, EngineOptions, HistoryEntry,
-    Resolution, SyncReport,
+    Resolution, SyncReport, UnitStatus,
 };
 pub use error::{Error, Result};
-pub use model::{short_id, CardMode, VersionRecord};
+pub use model::{short_id, split_unit, unit_id, CardMode, VersionRecord};
 pub use store::ContainerRow;
