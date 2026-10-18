@@ -963,9 +963,10 @@ Where the M0 code differs from or pins down the design above:
 4. **Discovery.** Card files in the profiles' folders, and directories in them holding the
    profile's folder card marker, are registered automatically (`--no-discover` turns this
    off). emusync's own scratch directories are never registered, though `<card>.emusync-tmp`
-   holds a superblock while a replace runs. A new folder in a card folder arms the debounce,
-   because PCSX2 creates the folder before its superblock and the flat watch doesn't see the
-   superblock arrive. A file that can't be registered, such as a second
+   holds a superblock while a replace runs. PCSX2 creates a folder card's directory before its
+   superblock, and the card folder's flat watch doesn't see the superblock arrive. So a new
+   folder in a card folder arms the debounce, and is checked for the marker at each process
+   probe for a minute, in case the superblock comes after the debounce expires. A file that can't be registered, such as a second
    `Mcd001.ps2` in another folder, or an `Mcd001` folder card next to an `Mcd001.ps2` file,
    is skipped with one warning.
 5. **Reporting.** `SyncReport::resolved` lists units the `newest` policy merged, so the log can

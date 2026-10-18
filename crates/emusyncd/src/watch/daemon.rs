@@ -110,6 +110,9 @@ pub struct WatchDir {
     pub recursive: bool,
 }
 
+/// How long a new folder in a card folder is checked for a folder card marker.
+const CANDIDATE_TTL: Duration = Duration::from_secs(60);
+
 /// The engine reports this reason for units it routed to the inbox because of `set_busy`.
 const IN_USE: &str = "container is in use";
 
@@ -132,6 +135,9 @@ pub struct Daemon<P> {
     folders: HashMap<String, PathBuf>,
     /// Folder cards that were replaced, so their recursive watch follows the old directory.
     rewatch: Vec<PathBuf>,
+    /// New folders in card folders that may still become folder cards, by path key, with when
+    /// they were seen.
+    candidates: HashMap<String, (PathBuf, Instant)>,
     /// Card files that discovery could not register (warned about once).
     skipped: HashSet<String>,
     /// Units held back by the last cycle (logged once, not on every poll).
@@ -158,6 +164,7 @@ impl<P: ProcessProbe> Daemon<P> {
             fingerprints: HashMap::new(),
             folders: HashMap::new(),
             rewatch: Vec::new(),
+            candidates: HashMap::new(),
             skipped: HashSet::new(),
             held: HashSet::new(),
             offline: false,
@@ -229,9 +236,13 @@ impl<P: ProcessProbe> Daemon<P> {
         if path.ancestors().any(fsutil::is_scratch) {
             return;
         }
-        let is_card = path.ancestors().any(|a| self.fingerprints.contains_key(&path_key(a)))
-            || self.profiles.iter().any(|p| p.claims(path))
-            || self.may_become_folder_card(path);
+        let candidate = self.may_become_folder_card(path);
+        if candidate {
+            self.candidates.insert(path_key(path), (path.to_path_buf(), now));
+        }
+        let is_card = candidate
+            || path.ancestors().any(|a| self.fingerprints.contains_key(&path_key(a)))
+            || self.profiles.iter().any(|p| p.claims(path));
         if is_card {
             log::debug!("change: {}", path.display());
             self.last_change = Some(now);
@@ -240,6 +251,7 @@ impl<P: ProcessProbe> Daemon<P> {
 
     /// A new folder in a card folder: PCSX2 creates a folder card's directory before its
     /// superblock file, and the card folder's flat watch doesn't see the superblock arrive.
+    /// Such folders are checked for the marker for a while ([`Daemon::check_candidates`]).
     fn may_become_folder_card(&self, path: &Path) -> bool {
         let Some(parent) = path.parent().map(path_key) else { return false };
         self.discover
@@ -248,6 +260,29 @@ impl<P: ProcessProbe> Daemon<P> {
                 .profiles
                 .iter()
                 .any(|p| p.folder_card_marker.is_some() && p.card_dirs.iter().any(|d| path_key(d) == parent))
+    }
+
+    /// Arms the debounce once a candidate folder's marker has appeared, which can be after
+    /// the debounce its creation armed has expired. Gives up on folders that are gone or that
+    /// stayed plain folders for [`CANDIDATE_TTL`].
+    fn check_candidates(&mut self, now: Instant) {
+        let (profiles, fingerprints) = (&self.profiles, &self.fingerprints);
+        let mut arrived = false;
+        self.candidates.retain(|key, (path, seen)| {
+            if fingerprints.contains_key(key) {
+                return false;
+            }
+            if profiles.iter().any(|p| p.claims(path)) {
+                log::debug!("new folder card: {}", path.display());
+                arrived = true;
+                return false;
+            }
+            path.is_dir() && now.duration_since(*seen) < CANDIDATE_TTL
+        });
+        // A debounce already armed finds the new card when it expires.
+        if arrived && self.last_change.is_none() {
+            self.last_change = Some(now);
+        }
     }
 
     fn want(&mut self, t: Trigger) {
@@ -259,6 +294,7 @@ impl<P: ProcessProbe> Daemon<P> {
         if now >= self.next_probe {
             self.next_probe = now + self.timing.probe_every;
             self.probe_processes();
+            self.check_candidates(now);
         }
         if let Some(t) = self.last_change {
             if now.duration_since(t) >= self.timing.debounce {
@@ -991,12 +1027,32 @@ mod tests {
             assert_eq!(formats.len(), 2);
             assert!(formats.contains(&"ps2.card.folder".to_string()), "{formats:?}");
 
-            // A folder that never becomes a card is looked at once and left alone.
+            // The superblock can arrive after the debounce the directory armed has expired; the
+            // folder is still checked at each process probe.
+            let late = memcards.join("Mcd003");
+            std::fs::create_dir(&late).unwrap();
+            d.on_event(&late, t0 + s(4.0));
+            assert!(d.tick(t0 + s(6.1)).is_none(), "no marker yet");
+            std::fs::write(late.join("_pcsx2_superblock"), b"").unwrap();
+            assert!(d.tick(t0 + s(8.2)).is_none(), "marker seen: debounce armed");
+            let c = d.tick(t0 + s(10.3)).expect("late card");
+            assert_eq!(c.trigger, Trigger::Changed);
+            assert_eq!(d.engine().containers().unwrap().len(), 3);
+            assert!(d.candidates.is_empty());
+
+            // A folder that never becomes a card is checked for a minute, then left alone.
             let other = memcards.join("screenshots");
             std::fs::create_dir(&other).unwrap();
-            d.on_event(&other, t0 + s(4.0));
-            assert!(d.tick(t0 + s(6.1)).is_none());
-            assert_eq!(d.engine().containers().unwrap().len(), 2);
+            d.on_event(&other, t0 + s(11.0));
+            assert!(d.tick(t0 + s(13.1)).is_none());
+            assert_eq!(d.candidates.len(), 1);
+            let mut t = t0 + s(13.1);
+            while t < t0 + s(11.0) + CANDIDATE_TTL + s(2.0) {
+                t += s(2.0);
+                d.tick(t);
+            }
+            assert!(d.candidates.is_empty());
+            assert_eq!(d.engine().containers().unwrap().len(), 3);
         }
     }
 }
