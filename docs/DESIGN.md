@@ -330,7 +330,7 @@ Every apply follows the same steps, whatever the format:
 - Because it shares the PS2 canonical form with `ps2.card`, a folder card on macOS and a file
   card on Android sync with no conversion step.
 - Implementation notes, including the layout as read in PCSX2's source and the atomic
-  directory replace: §18.
+  directory replace: §19.
 
 ### 5.3 Other v1 and v2 adapters
 
@@ -927,9 +927,40 @@ Where the M0 code differs from or pins down the design above:
     has not been tested against cards written by a real PS2 BIOS or by PCSX2 with saves on
     them, because the only real cards available were unformatted.
 
-## 18. Implementation notes (PCSX2 folder cards)
+## 18. Implementation notes (sidecar: `emusync watch`)
 
-### 18.1 The on-disk layout
+1. **Profiles are JSON** (`crates/emusyncd/profiles/`, built in with `include_str!`; more with
+   `--profile file.json`). Each lists, per OS, process names (matched without regard to case),
+   default card folders (`{home}`, `{documents}`, `{config}`, `{data}` placeholders, resolved
+   with the `dirs` crate so redirected Documents folders work) and optional lock files, plus the
+   card file extensions the emulator owns. PCSX2 ships built in. A profile must give the current
+   OS at least one process name or lock file, or it is rejected: without one the emulator would
+   never look busy. Process names are compared with both the reported name and the executable's
+   file name, and a 15-byte name (Linux truncates `comm`) also matches a longer profile name it
+   starts.
+2. **Busy is per card.** Before every cycle, each container is marked busy (`Engine::set_busy`)
+   if an emulator whose profile claims its extension is running. Cards no profile claims are
+   busy whenever any watched emulator runs. Busy cards are still snapshotted and uploaded; only
+   applies wait in the inbox. Process lists come from `sysinfo` every 2 s, behind a
+   `ProcessProbe` trait so tests use a fake.
+3. **Triggers.** File events (`notify`, non-recursive, on the folders holding cards) arm a 2 s
+   debounce. When it expires, a cycle runs only if a card's content hash changed, so the
+   watcher's own reads and applies don't loop. (Size and mtime are not enough: cards have a
+   fixed size, and coarse mtimes can hide a second write.) Emulator start (poll at once, cards now busy) and
+   exit (apply the inbox) each run a cycle. A cycle due while writes are still settling waits
+   for them, except on exit. Polls back off from 30 s to 15 min, doubling after a poll with no
+   news or with the remote unreachable, and resetting after anything else.
+4. **Discovery.** Card files in the profiles' folders are registered automatically
+   (`--no-discover` turns this off). A file that can't be registered, such as a second
+   `Mcd001.ps2` in another folder, is skipped with one warning.
+5. **Reporting.** `SyncReport::resolved` lists units the `newest` policy merged, so the log can
+   say which saves diverged and where the losing version is kept.
+6. **Not yet:** running as a service or tray app, graceful shutdown with a final sync, and
+   PCSX2 portable installs (cards next to the executable; register them with `card add`).
+
+## 19. Implementation notes (PCSX2 folder cards)
+
+### 19.1 The on-disk layout
 
 Read from PCSX2's `pcsx2/SIO/Memcard/MemoryCardFolder.cpp` and `MemoryCardFile.cpp` (master
 at `161a6cd`, October 2026). **Confirmed** below means read in that source; **inferred** means
@@ -951,7 +982,7 @@ reasoned from it, not observed in a running PCSX2.
 | YAML output | inferred | emusync writes block-style YAML, quoting keys that need it. Any YAML parser reads that, but it hasn't been loaded into a real PCSX2. |
 | Non-UTF-8 names | inferred | PCSX2 hands raw name bytes to the host as a UTF-8 path. emusync writes names that aren't valid UTF-8 as Latin-1 and keeps the real bytes in a metadata file. |
 
-### 18.2 Adapter
+### 19.2 Adapter
 
 1. **Same units as `ps2.card`.** `ps2.card.folder` turns each save directory into the same
    `Node` tree and builds its canonical unit with the same `ps2::canonical` and `ps2::decode`.
@@ -984,7 +1015,7 @@ reasoned from it, not observed in a running PCSX2.
    folder cards, because a `.ps2` image is not a valid folder card. Per-save mode is the one
    that interoperates.
 
-### 18.3 Directory containers in the core
+### 19.3 Directory containers in the core
 
 1. **Tree images.** Adapters stay pure. `ContainerFormat::kind()` says whether a container is
    a file or a directory. For a directory, the engine reads everything under it into a

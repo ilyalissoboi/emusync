@@ -1,4 +1,4 @@
-//! `ps2.card.folder`: PCSX2 folder memory cards (DESIGN §5.2, §18).
+//! `ps2.card.folder`: PCSX2 folder memory cards (DESIGN §5.2, §19).
 //!
 //! A folder card is a host directory that PCSX2 turns into a card image while a game runs:
 //!

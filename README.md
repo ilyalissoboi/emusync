@@ -7,8 +7,8 @@ platforms. Design: [docs/DESIGN.md](docs/DESIGN.md). C API contract: [include/em
 Amazon S3 or any S3-compatible service: saves of different games played offline on different
 devices merge without conflicts, and every save has its own version history. PCSX2 folder
 cards hold the same saves, so a folder card on one device syncs with a `.ps2` file on another.
-Other card formats sync as whole files (byte-identical mirrors). A background watcher for
-unmodified PCSX2 comes next.
+Other card formats sync as whole files (byte-identical mirrors). `emusync watch` keeps
+unmodified PCSX2 in sync with no manual steps.
 
 ## Crates
 
@@ -18,7 +18,7 @@ unmodified PCSX2 comes next.
 | `emusync-formats` | Container format adapters: `ps2.card` (PS2 memory card file system), `ps2.card.folder` (PCSX2 folder cards), `raw` |
 | `emusync-remote` | `Remote` trait, S3 backend (SigV4 + rustls), in-memory remote, conformance suite |
 | `emusync-ffi` | C ABI (stub in M0) |
-| `emusyncd` | The `emusync` command-line tool |
+| `emusyncd` | The `emusync` command-line tool, including the `emusync watch` sidecar |
 
 ## Quick start
 
@@ -45,6 +45,44 @@ empty; emusync formats it when the first save arrives. Cards synced by M0 as who
 working; to switch one to per-save sync, run `emusync card add <file>` again on each device,
 then `emusync card mode Mcd001 units` on one of them. `emusync card mode Mcd001 whole-file`
 goes back to byte-identical mirrors.
+
+## Watching PCSX2 (sidecar mode)
+
+`emusync watch` runs in the foreground next to an unmodified emulator and syncs without any
+manual steps:
+
+```sh
+emusync remote add "s3://my-saves/emusync/v1?region=eu-west-1"   # once per device
+emusync watch                                                    # leave it running
+```
+
+- **Cards:** it picks up every card file in the emulator's default folder and registers it
+  (PCSX2: `Documents\PCSX2\memcards` on Windows, `~/Library/Application Support/PCSX2/memcards`
+  on macOS, `~/.config/PCSX2/memcards` or the Flatpak equivalent on Linux). Cards added with
+  `emusync card add` are watched too. `--no-discover` limits it to those.
+- **Uploads:** when a card file changes, it syncs once the writes have been quiet for 2 s
+  (`--debounce-ms`), and again when the emulator exits.
+- **Downloads never touch an open card.** While PCSX2 is running, its cards are left alone:
+  newer versions from other devices are fetched and wait (`held back` in the log), then are
+  applied as soon as PCSX2 exits. Your own saves still upload while you play.
+- **Polling:** it checks the remote every 30 s, doubling up to 15 min while nothing changes
+  (`--poll-min-secs`, `--poll-max-secs`), and right away when PCSX2 starts. Any change resets
+  the interval, so downloads are usually in place before the next launch.
+- **Conflicts:** the newest version wins (`--policy newest`, the default here) and the other
+  stays in `emusync history`, so nothing is lost. `--policy ask` records conflicts for
+  `emusync resolve` instead.
+
+The log (stderr, with UTC times) says what was applied, uploaded or held back; `-v` adds
+debug detail. Stop it with Ctrl+C at any time: card writes are atomic. Don't run `emusync sync`
+against the same data directory while the watcher is running, since it doesn't know the
+emulator is open.
+
+Emulators are described by JSON profiles (`crates/emusyncd/profiles/`): process names, default
+card folders and card file extensions for each OS, plus optional lock files that exist only
+while the emulator runs (each OS section needs at least one of the two). `--profile
+my-emulator.json` loads another one, and `--profile` can be
+repeated. Cards that no watched profile claims are written only while none of the watched
+emulators is running.
 
 For MinIO or other S3-compatible services:
 `s3://<bucket>/<prefix>?endpoint=http://nas.local:9000&path_style=1`.

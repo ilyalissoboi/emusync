@@ -24,7 +24,7 @@ use std::sync::Arc;
 /// Local content hash of a unit that is not on the card (deleted, or not placed yet).
 const ABSENT: &str = "absent";
 
-/// Reads a container's image: a file's bytes, or a directory as a tree image (DESIGN §18).
+/// Reads a container's image: a file's bytes, or a directory as a tree image (DESIGN §19).
 /// With `recover`, an interrupted directory replace is completed first.
 fn read_image(path: &Path, fmt: &dyn ContainerFormat, recover: bool) -> std::io::Result<Vec<u8>> {
     match fmt.kind() {
@@ -38,7 +38,7 @@ fn read_image(path: &Path, fmt: &dyn ContainerFormat, recover: bool) -> std::io:
     }
 }
 
-/// Atomically replaces a container with `image` (DESIGN §5 step 5; §18 for directories).
+/// Atomically replaces a container with `image` (DESIGN §5 step 5; §19 for directories).
 fn write_image(path: &Path, fmt: &dyn ContainerFormat, image: &[u8]) -> std::io::Result<()> {
     match fmt.kind() {
         ContainerKind::File => fsutil::atomic_replace(path, image),
@@ -122,6 +122,9 @@ pub struct SyncReport {
     pub blocked: Vec<Blocked>,
     /// Ids of open conflicts touched in this cycle.
     pub conflicts: Vec<i64>,
+    /// Units whose diverged versions the `newest` policy merged in this cycle (the losing
+    /// versions stay in history as merge parents).
+    pub resolved: Vec<String>,
     /// Cards whose mode another device changed.
     pub mode_changes: Vec<String>,
     /// `(old, new)` when this installation found its device id in use elsewhere and minted a new one.
@@ -930,7 +933,10 @@ impl Engine {
                             }
                             return Ok(None);
                         }
-                        ConflictPolicy::Newest => self.auto_merge(unit, tips, newest(tips))?,
+                        ConflictPolicy::Newest => {
+                            report.resolved.push(unit.to_string());
+                            self.auto_merge(unit, tips, newest(tips))?
+                        }
                     }
                 }
             }

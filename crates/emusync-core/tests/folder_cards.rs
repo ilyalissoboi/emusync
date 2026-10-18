@@ -1,4 +1,4 @@
-//! PCSX2 folder memory cards (DESIGN §5.2, §18): a folder card and a card file of the same
+//! PCSX2 folder memory cards (DESIGN §5.2, §19): a folder card and a card file of the same
 //! logical card sync with each other directly, over the in-memory remote.
 
 use emusync_core::{fsutil, ConflictPolicy, ContainerDesc, Engine, EngineOptions, SyncReport};

@@ -1,4 +1,4 @@
-//! Directory containers held in memory (DESIGN §5.2, §18).
+//! Directory containers held in memory (DESIGN §5.2, §19).
 //!
 //! Adapters are pure, so a container that is a directory on the host (a PCSX2 folder memory
 //! card) reaches them as a [`Tree`] image: every file and directory under the container

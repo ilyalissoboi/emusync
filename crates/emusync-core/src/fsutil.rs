@@ -1,4 +1,4 @@
-//! File helpers: atomic replace of files and directories (DESIGN §5, step 5; §18).
+//! File helpers: atomic replace of files and directories (DESIGN §5, step 5; §19).
 
 use emusync_formats::tree::{self, EntryKind, Tree};
 use std::fs::{self, File};
