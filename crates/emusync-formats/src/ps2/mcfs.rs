@@ -85,6 +85,9 @@ pub struct Card {
     ecc: bool,
     alloc_offset: u32,
     alloc_end: u32,
+    /// Allocatable clusters the BIOS actually uses (8,001 on an 8 MB card). Clusters from here
+    /// to `alloc_end` are a reserve the BIOS never allocates, so emusync doesn't either.
+    alloc_limit: u32,
     root_cluster: u32,
     /// Absolute cluster numbers of the FAT clusters, in order.
     fat_clusters: Vec<u32>,
@@ -355,10 +358,18 @@ impl Card {
         let raw = reader.dir_entries(root_cluster, root_len)?;
         let root_dotdot = raw[1];
         let entries = reader.children(&raw, 0)?;
+        // The limit stored in the superblock, or for cards that lack it, the one the BIOS derives.
+        let stored_limit = u32_at(img, 0x170);
+        let alloc_limit = if stored_limit != 0xFFFF_FFFF && stored_limit > 0 {
+            stored_limit.min(alloc_end)
+        } else {
+            bios_alloc_limit(alloc_end)
+        };
         Ok(Card {
             ecc,
             alloc_offset,
             alloc_end,
+            alloc_limit,
             root_cluster,
             fat_clusters,
             has_bad_blocks,
@@ -385,7 +396,7 @@ impl Card {
 
     /// Clusters available for entries (root directory included).
     pub fn capacity_clusters(&self) -> u32 {
-        self.alloc_end
+        self.alloc_limit
     }
 
     /// Builds a new image from `original` (the image this card was parsed from) holding
@@ -404,7 +415,7 @@ impl Card {
             raw_page: if self.ecc { PAGE + SPARE } else { PAGE },
             ecc: self.ecc,
             alloc_offset: self.alloc_offset,
-            alloc_end: self.alloc_end,
+            limit: self.alloc_limit,
             next: 0,
             fat: vec![FAT_FREE; self.alloc_end as usize],
         };
@@ -453,7 +464,8 @@ struct Writer {
     raw_page: usize,
     ecc: bool,
     alloc_offset: u32,
-    alloc_end: u32,
+    /// Clusters [`Self::alloc`] may hand out (see [`Card::alloc_limit`]).
+    limit: u32,
     next: u32,
     fat: Vec<u32>,
 }
@@ -488,7 +500,7 @@ impl Writer {
         if n == 0 {
             return Ok(NO_CLUSTER);
         }
-        if self.next as u64 + n > self.alloc_end as u64 {
+        if self.next as u64 + n > self.limit as u64 {
             return Err(FormatError::NoSpace);
         }
         let first = self.next;
@@ -582,6 +594,12 @@ impl Writer {
 /// it formats a card.
 const SB_TAIL: std::ops::Range<usize> = 0x154..0x184;
 
+/// The allocatable-cluster limit the BIOS derives from `alloc_end`: rounded down to a thousand,
+/// plus one (8,135 → 8,001).
+fn bios_alloc_limit(alloc_end: u32) -> u32 {
+    (alloc_end / 1000 * 1000 + 1).min(alloc_end)
+}
+
 /// The derived superblock fields, in the order the BIOS stores them: cluster size, FAT entries
 /// per cluster, clusters per erase block, card form (-1), three zero words, the allocatable
 /// cluster limit (8,001 on an 8 MB card), two zero words, -1 and a zero word.
@@ -594,7 +612,7 @@ fn superblock_tail(clusters_per_block: u32, alloc_end: u32) -> [u8; 0x30] {
         0,
         0,
         0,
-        alloc_end / 1000 * 1000 + 1,
+        bios_alloc_limit(alloc_end),
         0,
         0,
         0xFFFF_FFFF,
@@ -618,7 +636,7 @@ pub fn blank_card(clusters_per_card: u32, ecc: bool, time: [u8; 8]) -> Vec<u8> {
         raw_page,
         ecc,
         alloc_offset: 0,
-        alloc_end: 0,
+        limit: 0,
         next: 0,
         fat: Vec::new(),
     };
@@ -727,6 +745,7 @@ mod tests {
         assert!(is_card_size(img.len()));
         let card = Card::parse(&img).unwrap();
         assert_eq!((card.alloc_offset, card.alloc_end), (41, 8135), "matches the standard 8 MB layout");
+        assert_eq!(card.capacity_clusters(), 8001, "the BIOS uses 8,001 of them");
         assert!(card.entries.is_empty());
         let no_ecc = blank_card(8192, false, T);
         assert_eq!(no_ecc.len(), 8_388_608);
@@ -871,7 +890,12 @@ mod tests {
         let cap = card.capacity_clusters() as usize;
         // The root (3 entries) and the save directory (3 entries) take two clusters each.
         let fits = vec![dir("SAVE", vec![file("big", &vec![1; (cap - 4) * CLUSTER])])];
-        assert!(card.build(&img, &fits).is_ok());
+        let full = card.build(&img, &fits).unwrap();
+        // The reserve between the BIOS limit and alloc_end stays free.
+        let fat = &card.fat_clusters;
+        let entry = |i: usize| u32_at(&full, fat[i / 256] as usize * CLUSTER + (i % 256) * 4);
+        assert!((0..cap).all(|i| entry(i) & FAT_ALLOCATED != 0));
+        assert!((cap..card.alloc_end as usize).all(|i| entry(i) == FAT_FREE));
         let too_big = vec![dir("SAVE", vec![file("big", &vec![1; (cap - 4) * CLUSTER + 1])])];
         assert!(matches!(card.build(&img, &too_big), Err(FormatError::NoSpace)));
     }
