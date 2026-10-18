@@ -1,0 +1,27 @@
+{
+  "id": "pcsx2",
+  "name": "PCSX2",
+  "card_extensions": ["ps2"],
+  "windows": {
+    "processes": [
+      "pcsx2-qt.exe",
+      "pcsx2-qtx64.exe",
+      "pcsx2-qtx64-avx2.exe",
+      "pcsx2.exe",
+      "pcsx2x64.exe",
+      "pcsx2x64-avx2.exe"
+    ],
+    "card_dirs": ["{documents}/PCSX2/memcards"]
+  },
+  "macos": {
+    "processes": ["PCSX2", "PCSX2-qt"],
+    "card_dirs": ["{home}/Library/Application Support/PCSX2/memcards"]
+  },
+  "linux": {
+    "processes": ["pcsx2-qt", "pcsx2", "PCSX2"],
+    "card_dirs": [
+      "{config}/PCSX2/memcards",
+      "{home}/.var/app/net.pcsx2.PCSX2/config/PCSX2/memcards"
+    ]
+  }
+}
