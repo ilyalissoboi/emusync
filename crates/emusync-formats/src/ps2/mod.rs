@@ -14,6 +14,8 @@
 //! standard layout, so a fresh card on a new device can receive saves from the cloud.
 
 pub mod ecc;
+pub mod folder;
+mod index;
 pub mod mcfs;
 
 use crate::{ApplyOp, Canonical, Confidence, ContainerFormat, FormatError, Result, UnitRef};
@@ -257,7 +259,8 @@ fn format_like(image: &[u8], time: [u8; 8]) -> Vec<u8> {
     blank_card(clusters, with_ecc, time)
 }
 
-fn canonical(node: &Node) -> Canonical {
+/// The canonical unit of a root entry, with its `ps2.layout`.
+pub fn canonical(node: &Node) -> Canonical {
     let mut meta = BTreeMap::new();
     meta.insert(LAYOUT_META.to_string(), layout(node));
     Canonical { name: name_to_string(&node.name), bytes: encode(node), meta }

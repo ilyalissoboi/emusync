@@ -13,7 +13,7 @@ use crate::model::{
     content_id, parse_record, split_unit, unit_id, whole_file_unit, CardMode, CardRecord, LogRecord, VersionRecord,
 };
 use crate::store::{ContainerRow, LocalUnit, Store, StoredVersion, CF_READ_ONLY};
-use emusync_formats::{self as formats, ApplyOp, Canonical, ContainerFormat, FormatError};
+use emusync_formats::{self as formats, ApplyOp, Canonical, ContainerFormat, ContainerKind, FormatError};
 use emusync_remote::{create_only, probe_conditional_writes, PutOutcome, Remote, RemoteError};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -23,6 +23,32 @@ use std::sync::Arc;
 
 /// Local content hash of a unit that is not on the card (deleted, or not placed yet).
 const ABSENT: &str = "absent";
+
+/// Reads a container's image: a file's bytes, or a directory as a tree image (DESIGN §19).
+/// With `recover`, an interrupted directory replace is completed first.
+fn read_image(path: &Path, fmt: &dyn ContainerFormat, recover: bool) -> std::io::Result<Vec<u8>> {
+    match fmt.kind() {
+        ContainerKind::File => fs::read(path),
+        ContainerKind::Directory => {
+            if recover {
+                fsutil::recover_dir_replace(path)?;
+            }
+            Ok(fsutil::read_tree(path)?.encode())
+        }
+    }
+}
+
+/// Atomically replaces a container with `image` (DESIGN §5 step 5; §19 for directories).
+fn write_image(path: &Path, fmt: &dyn ContainerFormat, image: &[u8]) -> std::io::Result<()> {
+    match fmt.kind() {
+        ContainerKind::File => fsutil::atomic_replace(path, image),
+        ContainerKind::Directory => {
+            let tree = formats::tree::Tree::decode(image)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+            fsutil::replace_dir(path, &tree)
+        }
+    }
+}
 
 /// What to do when a unit has more than one tip (DESIGN §6.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -341,6 +367,9 @@ impl Engine {
     /// as `raw` by M0 becomes `ps2.card`). Publishes the card (in unit mode when the format has
     /// an adapter, else whole-file mode) unless the repository already knows it, in which case
     /// the repository's mode is adopted.
+    ///
+    /// A directory is registered as a PCSX2 folder card (`ps2.card.folder`, platform `ps2`) if
+    /// it has a `_pcsx2_superblock`, and refused otherwise.
     pub fn add_container(&mut self, desc: ContainerDesc) -> Result<i64> {
         let location = std::path::absolute(&desc.location)?;
         let loc = location.to_string_lossy().into_owned();
@@ -348,8 +377,17 @@ impl Engine {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .ok_or_else(|| Error::InvalidArg(format!("{loc} has no file name")))?;
+        let is_dir = location.is_dir();
         let format = match &desc.format {
             Some(f) => f.clone(),
+            None if is_dir => {
+                let image = fsutil::read_tree(&location)?.encode();
+                formats::detect_dir(&image).map(|f| f.id().to_string()).ok_or_else(|| {
+                    Error::InvalidArg(format!(
+                        "{loc} is a directory but not a PCSX2 folder memory card (it has no _pcsx2_superblock)"
+                    ))
+                })?
+            }
             None => match fs::read(&location) {
                 Ok(image) => formats::detect(&file_name, &image).id().to_string(),
                 Err(_) if formats::infer_platform(&file_name) == "ps2" => "ps2.card".into(),
@@ -358,6 +396,12 @@ impl Engine {
         };
         let fmt = formats::by_id(&format)
             .ok_or_else(|| Error::InvalidArg(format!("format {format:?} is not available in this build")))?;
+        if location.exists() && is_dir != (fmt.kind() == ContainerKind::Directory) {
+            return Err(Error::InvalidArg(format!(
+                "{loc} is {}, which format {format:?} can't use",
+                if is_dir { "a directory" } else { "a file" }
+            )));
+        }
         let containers = self.store.containers()?;
         if let Some(c) = containers.iter().find(|c| c.location == loc) {
             if c.format != format {
@@ -371,7 +415,10 @@ impl Engine {
             }
             return Ok(c.id);
         }
-        let platform = desc.platform.clone().unwrap_or_else(|| formats::infer_platform(&file_name).to_string());
+        let platform = desc.platform.clone().unwrap_or_else(|| match fmt.id() {
+            "ps2.card.folder" => "ps2".to_string(),
+            _ => formats::infer_platform(&file_name).to_string(),
+        });
         let name = match &desc.card {
             Some(n) => n.clone(),
             None => location.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
@@ -495,7 +542,7 @@ impl Engine {
             // What the card file holds right now, so saves that haven't synced yet show up too.
             let on_card: Option<HashMap<String, Vec<String>>> = match (c, mode) {
                 (Some(c), CardMode::Units) => self.format_of(c).ok().and_then(|fmt| {
-                    let image = fs::read(&c.location).ok()?;
+                    let image = read_image(Path::new(&c.location), fmt, false).ok()?;
                     let units = fmt.extract_all(&image).ok()?;
                     Some(units.into_iter().map(|u| (unit_id(&card_id, &u.name), fmt.titles(&u.name))).collect())
                 }),
@@ -616,15 +663,20 @@ impl Engine {
             return Ok(None);
         }
         let path = Path::new(&c.location);
-        let image = match fs::read(path) {
+        let fmt = self.format_of(c)?;
+        // An interrupted replace of a folder card is finished first, unless the emulator has it.
+        let image = match read_image(path, fmt, !self.busy.contains(&c.id)) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 report.blocked.push(Blocked { unit: card_unit, reason: format!("{} does not exist", c.location) });
                 return Ok(None);
             }
+            Err(e) if fmt.kind() == ContainerKind::Directory => {
+                report.blocked.push(Blocked { unit: card_unit, reason: format!("cannot read {}: {e}", c.location) });
+                return Ok(None);
+            }
             Err(e) => return Err(e.into()),
         };
-        let fmt = self.format_of(c)?;
         if let Err(e) = fmt.validate(&image) {
             // A container that fails validation is never synced, so corruption doesn't spread.
             report.blocked.push(Blocked { unit: card_unit, reason: e.to_string() });
@@ -944,8 +996,9 @@ impl Engine {
             return Ok(());
         }
         let path = Path::new(&c.location);
+        let fmt = self.format_of(c)?;
         // 1. Read the current container. It must still be what we scanned (and validated).
-        let current = fs::read(path)?;
+        let current = read_image(path, fmt, false)?;
         if content_id(&current) != image_hash {
             for (unit, _) in &pending {
                 report.blocked.push(Blocked {
@@ -955,7 +1008,6 @@ impl Engine {
             }
             return Ok(());
         }
-        let fmt = self.format_of(c)?;
         // Deletions first, so they free space for what comes next.
         pending.sort_by_key(|(_, t)| !t.rec.tombstone);
         let mut ready = Vec::new();
@@ -1007,8 +1059,8 @@ impl Engine {
                 }
             }
         }
-        // 5. Temp file, fsync, atomic replace.
-        if let Err(e) = fsutil::atomic_replace(path, &image) {
+        // 5. Temp file (or directory), fsync, atomic replace.
+        if let Err(e) = write_image(path, fmt, &image) {
             for (unit, t) in &applied {
                 self.block(c, unit, &t.rec.id, format!("cannot replace {}: {e}", c.location), report)?;
             }

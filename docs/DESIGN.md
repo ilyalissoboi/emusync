@@ -329,6 +329,8 @@ Every apply follows the same steps, whatever the format:
   folder card that is open** (§6.4).
 - Because it shares the PS2 canonical form with `ps2.card`, a folder card on macOS and a file
   card on Android sync with no conversion step.
+- Implementation notes, including the layout as read in PCSX2's source and the atomic
+  directory replace: §19.
 
 ### 5.3 Other v1 and v2 adapters
 
@@ -918,7 +920,7 @@ Where the M0 code differs from or pins down the design above:
    be byte-identical, so each device's image is a different version. Either side is fine to
    take.
 10. **`card list` reads the card file**, so saves that haven't synced yet are listed too.
-11. **Not yet:** folder cards (§5.2), per-game title-scoped containers (§2.2), the sidecar
+11. **Not yet:** per-game title-scoped containers (§2.2), the sidecar
     watcher (§6.4), in-game titles from `icon.sys` (Shift-JIS), and a cargo-fuzz target. The
     parsers are covered by randomized tests instead (corrupted cards and saves must be rejected
     without panicking; random apply sequences are checked against a model). The PS2 adapter
@@ -955,3 +957,106 @@ Where the M0 code differs from or pins down the design above:
    say which saves diverged and where the losing version is kept.
 6. **Not yet:** running as a service or tray app, graceful shutdown with a final sync, and
    PCSX2 portable installs (cards next to the executable; register them with `card add`).
+
+## 19. Implementation notes (PCSX2 folder cards)
+
+### 19.1 The on-disk layout
+
+Read from PCSX2's `pcsx2/SIO/Memcard/MemoryCardFolder.cpp` and `MemoryCardFile.cpp` (master
+at `161a6cd`, October 2026). **Confirmed** below means read in that source; **inferred** means
+reasoned from it, not observed in a running PCSX2.
+
+| Item | Status | Detail |
+|---|---|---|
+| Card root | confirmed | A directory. PCSX2 treats a directory as a folder card if it holds a `_pcsx2_superblock` file (`FileMcd_IsFolder`). |
+| `_pcsx2_superblock` | confirmed | The card's first erase block (8,192 bytes, no ECC), read and written as is. A new folder card is a directory with an **empty** superblock file. The card counts as formatted only if byte `0x16` is `0x6F` (the `o` of "Format"). An unformatted card loads no saves, even if directories exist. |
+| Saves | confirmed | One directory per root entry. Root-level files are skipped, and so is every name starting with `_pcsx2_`. With "auto-manage" filtering on, PCSX2 loads only `DATA-SYSTEM`, `BWNETCNF` and folders matching the running game's serial. That changes what the game sees, not what is on disk. |
+| `_pcsx2_index` | confirmed | One per directory, YAML (rapidyaml). `$ROOT` (`%ROOT` before a rapidyaml fix) holds the directory's own `timeCreated`/`timeModified`. Each file has `order`, `timeCreated` and `timeModified`. Times are Unix seconds, converted to the card's date fields in UTC (`gmtime`, `_mkgmtime`/`timegm`). PCSX2 creates the file in flow style (`{$ROOT: {...}}`), and rewrites it with each flush. |
+| Entry order | confirmed | Subdirectories don't get an `order`. They come first, in host enumeration order, then files sorted by `order`. Files missing from the index get negative positions in enumeration order, so they come first. PCSX2 drops a file whose `order` duplicates another file's (`try_emplace`). |
+| Non-default entries | confirmed | `_pcsx2_meta_directory` (inside a directory) and `_pcsx2_meta/<file>` hold the raw 512-byte directory entry. They are written when the mode differs from the default (`0x8427` for directories, `0x8497` for files), the attribute is non-zero, or the name had to change on the host. When one exists, the name (if at least `0x60` bytes were read), mode, attribute and timestamps come from it. |
+| Host names | confirmed | `\ % : \| " < >` become `_`, as do trailing dots and spaces. A name without metadata is copied into the 32-byte name field with `strlcpy`, so at most 31 bytes are kept. |
+| Deletions | confirmed | A deleted save is renamed to `_pcsx2_deleted_<name>`, replacing any earlier one of that name. |
+| Capacity | confirmed | Saves get the cluster count the BIOS reports: `alloc_end` rounded down to a thousand, minus one (7,999 clusters on 8 MB). PCSX2 adds saves in enumeration order and skips, with a warning, any save that doesn't fit. |
+| While open | confirmed | PCSX2 builds the card image in memory when the card is opened. It writes changes back a couple of frames after the last write, and again on close. It keeps the files of loaded saves open, so outside changes to an open card are lost or overwritten. |
+| Root order | inferred | Root save order is the host's enumeration order (`FindFiles`), so it isn't kept anywhere. emusync reads directories sorted by name. The root order recorded in `ps2.layout` is therefore not preserved on folder cards. Order inside a save is preserved. |
+| YAML output | inferred | emusync writes block-style YAML, quoting keys that need it. Any YAML parser reads that, but it hasn't been loaded into a real PCSX2. |
+| Non-UTF-8 names | inferred | PCSX2 hands raw name bytes to the host as a UTF-8 path. emusync writes names that aren't valid UTF-8 as Latin-1 and keeps the real bytes in a metadata file. |
+
+### 19.2 Adapter
+
+1. **Same units as `ps2.card`.** `ps2.card.folder` turns each save directory into the same
+   `Node` tree and builds its canonical unit with the same `ps2::canonical` and `ps2::decode`.
+   A folder card bound to `ps2:Mcd001` (from the directory name, `Mcd001` or `Mcd001.ps2`)
+   and a `Mcd001.ps2` file on another device hold identical units, with no conversion step.
+   Identical saves on both are adopted on first sync, not raised as conflicts. A folder card's
+   platform is always `ps2`, whatever its extension.
+2. **Reading mirrors `AddFolder`:** the same order rules, metadata files winning over the index,
+   and the index winning over host modification times. Modes always get the "exists" bit,
+   since the card build sets it anyway. If the index can't be parsed, it is ignored, as PCSX2
+   does: order and times fall back. Some folders are invalid and never synced:
+   - a metadata file whose mode lacks the directory or file bit;
+   - an index giving two files the same `order` (PCSX2 would load only one of them);
+   - a folder holding more than the card's capacity. PCSX2 skips a save exactly when all of
+     them together don't fit, whatever the load order, so syncing such a folder would spread
+     saves the emulator doesn't show. The user removes saves or picks a bigger card.
+3. **Writing mirrors `FlushFileEntries`.** A save is written as its directory, an index listing
+   every file's order and both timestamps, and metadata files only for non-default entries.
+   A changed save replaces its whole directory. A deleted save is renamed to
+   `_pcsx2_deleted_<name>`. Everything else in the folder is kept unchanged: stray files,
+   earlier deleted saves, and saves the adapter doesn't touch. The first save written to an
+   unformatted card writes the standard 8 MB superblock (the one `ps2.card` formats new card
+   files with), stamped with that save's time.
+4. **Refused:** saves PCSX2 would not load. That covers root-level files, names starting with
+   `_pcsx2_`, and two entries whose host names would clash (after cleaning, compared without
+   case, for Windows and macOS). These are reported as unsupported and wait in the inbox. A
+   change that would push the saves past the BIOS capacity fails with `NO_SPACE`, as on a full
+   card file.
+5. **Whole-file mode** works too: the unit is the folder's tree image. It only syncs with other
+   folder cards, because a `.ps2` image is not a valid folder card. Per-save mode is the one
+   that interoperates.
+
+### 19.3 Directory containers in the core
+
+1. **Tree images.** Adapters stay pure. `ContainerFormat::kind()` says whether a container is
+   a file or a directory. For a directory, the engine reads everything under it into a
+   `formats::tree::Tree` (paths, contents and modification times) and serializes it
+   (`ES-TREE1`). That image goes through the same scan, validate, apply and verify steps as a
+   card file's bytes. Its hash, modification times included, is the "container changed during
+   sync" check before an apply.
+2. **Atomic directory replace** (`fsutil::replace_dir`), the directory form of §5 step 5:
+   1. Write the new tree to `<card>.emusync-tmp`, fsyncing every file (and directory on Unix).
+      File and directory modification times are restored from the image (directories after
+      their children), so the result reads back as the same image. That matters in whole-file
+      mode, where the image is the unit.
+   2. Write the journal `<card>.emusync-swap` (temp file + rename).
+   3. Rename `<card>` to `<card>.emusync-old`, then `<card>.emusync-tmp` to `<card>`.
+   4. Remove `<card>.emusync-old`, then the journal.
+
+   Without a journal, a leftover temp tree is incomplete and is deleted; the original was
+   never touched. With a journal, the new tree is known to be complete, so
+   `fsutil::recover_dir_replace` rolls forward from whichever rename the crash interrupted.
+   It runs before every scan of a folder card that isn't busy. If a rename fails (on Windows,
+   because a program holds a file in the folder open), the replace rolls back. The saves wait
+   in the inbox with the error and are retried next cycle.
+3. **Busy cards.** As for card files, nothing is applied to a container marked busy
+   (`Engine::set_busy` / `es_session_begin`). For folder cards this matters more, because
+   PCSX2 would overwrite outside changes on its next flush. Recovery is also skipped while a
+   card is busy. Without a host integration (the CLI), the rename failing on open files is the
+   only protection on Windows. On macOS and Linux the rename succeeds and PCSX2 can then write
+   to the old directory, so hosts must report sessions.
+4. **Side effects.** While a replace runs, PCSX2's memory card list can show
+   `<card>.emusync-tmp` as an extra folder card, since it holds a `_pcsx2_superblock`. It
+   disappears when the replace finishes.
+5. **CLI.** `emusync card add <dir>` registers a folder card if the directory has a
+   `_pcsx2_superblock`, and refuses any other directory. `emusync card inspect <dir>` lists its
+   saves.
+6. **Tests.** `crates/emusync-core/tests/folder_cards.rs` syncs a folder card against a card
+   file over the in-memory remote. It covers saves in both directions, offline merges,
+   deletions, adoption of identical saves, a busy card, and an interrupted replace rolled
+   forward. `ps2_robustness.rs` runs random apply sequences on both adapters and checks that
+   they hold the same units. It also checks that corrupted folder images and damaged index or
+   metadata files are rejected without panicking.
+7. **Not yet:** a real PCSX2 has not loaded a folder written by emusync, and emusync has not
+   read a folder card with saves written by PCSX2. The tests build folders from the format
+   as read in PCSX2's source. Folder cards larger than 8 MB are read with their own
+   superblock's capacity, but an unformatted folder card is always formatted as 8 MB.

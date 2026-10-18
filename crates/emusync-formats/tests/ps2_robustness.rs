@@ -1,10 +1,11 @@
-//! Randomised tests for the PS2 card adapter: model-checked apply sequences, and corrupted
+//! Randomised tests for the PS2 card adapters: model-checked apply sequences, and corrupted
 //! inputs that must be rejected without panicking (DESIGN §13). The fuzz target in
 //! `fuzz/` explores the same parsers without a time budget.
 
 use emusync_formats::ps2::mcfs::{Node, NodeKind, MODE_DIR_DEFAULT, MODE_FILE_DEFAULT};
 use emusync_formats::ps2::{blank_card, encode, layout, name_to_string, LAYOUT_META};
-use emusync_formats::{ApplyOp, Canonical, ContainerFormat, FormatError, Ps2Card};
+use emusync_formats::tree::{EntryKind, Tree};
+use emusync_formats::{ApplyOp, Canonical, ContainerFormat, FormatError, Ps2Card, Ps2Folder};
 use std::collections::BTreeMap;
 
 /// xorshift64*: small, deterministic, good enough for test inputs.
@@ -188,4 +189,91 @@ fn corrupted_saves_never_panic() {
             assert_eq!(Ps2Card.extract_all(&out).unwrap()[0].bytes, c.bytes);
         }
     }
+}
+
+fn new_folder_card() -> Vec<u8> {
+    let mut t = Tree::default();
+    t.insert("_pcsx2_superblock".into(), 0, EntryKind::File(vec![])).unwrap();
+    t.encode()
+}
+
+/// The folder adapter under the same random sequences: it must hold the same units as a card
+/// file given the same changes (folder cards keep no root order, so compare by name).
+#[test]
+fn folder_cards_match_card_files() {
+    const NAMES: [&str; 5] = ["BASLUS-20062GTA3", "BASCUS-97199RAC", "BESLES-50330", "BISLPM-65000", "BADATA-SYSTEM"];
+    for seed in 1..=8u64 {
+        let mut rng = Rng(seed.wrapping_mul(0xD1B5_4A32_D192_ED03));
+        let mut folder = new_folder_card();
+        let mut file = blank_card(8192, true, [0; 8]);
+        for step in 0..12 {
+            let mut ops = Vec::new();
+            for _ in 0..1 + rng.below(3) {
+                let name = NAMES[rng.below(NAMES.len() as u64) as usize];
+                if rng.below(4) == 0 {
+                    ops.push(ApplyOp::Delete(name.to_string()));
+                } else {
+                    ops.push(ApplyOp::Put(canonical(&random_save(&mut rng, name))));
+                }
+            }
+            folder = Ps2Folder.apply(&folder, &ops).unwrap_or_else(|e| panic!("seed {seed} step {step}: {e}"));
+            file = Ps2Card.apply(&file, &ops).unwrap();
+            let by_name = |v: Vec<Canonical>| -> BTreeMap<String, Canonical> {
+                v.into_iter().map(|c| (c.name.clone(), c)).collect()
+            };
+            let (f, c) =
+                (by_name(Ps2Folder.extract_all(&folder).unwrap()), by_name(Ps2Card.extract_all(&file).unwrap()));
+            assert_eq!(f.keys().collect::<Vec<_>>(), c.keys().collect::<Vec<_>>(), "seed {seed} step {step}");
+            for (name, unit) in &f {
+                assert_eq!(unit.bytes, c[name].bytes, "seed {seed} step {step}: {name}");
+            }
+        }
+    }
+}
+
+#[test]
+fn corrupted_folder_cards_never_panic() {
+    let mut rng = Rng(0xF01DE5);
+    let saves: Vec<ApplyOp> =
+        (0..3).map(|i| ApplyOp::Put(canonical(&random_save(&mut rng, &format!("BASLUS-2000{i}SAVE"))))).collect();
+    let good = Ps2Folder.apply(&new_folder_card(), &saves).unwrap();
+    let tree = Tree::decode(&good).unwrap();
+    let mut rejected = 0;
+    for i in 0..600 {
+        // Raw corruption of the image, or a damaged index or metadata file inside a valid tree.
+        let img = if i % 2 == 0 {
+            let mut img = good.clone();
+            for _ in 0..1 + rng.below(4) {
+                let off = rng.below(img.len() as u64) as usize;
+                img[off] = rng.next() as u8;
+            }
+            img
+        } else {
+            let mut t = tree.clone();
+            let paths: Vec<String> = t.entries.keys().filter(|p| p.contains("_pcsx2_")).cloned().collect();
+            let p = &paths[rng.below(paths.len() as u64) as usize];
+            if let Some(EntryKind::File(data)) = t.entries.get_mut(p).map(|e| &mut e.kind) {
+                if data.is_empty() || rng.below(3) == 0 {
+                    let n = rng.below(600) as usize;
+                    *data = rng.bytes(n);
+                } else {
+                    let off = rng.below(data.len() as u64) as usize;
+                    const BYTES: &[u8] = b"{}:'\"\n -0123456789abc\0";
+                    data[off] = BYTES[rng.below(BYTES.len() as u64) as usize];
+                }
+            }
+            t.encode()
+        };
+        match Ps2Folder.extract_all(&img) {
+            Ok(units) => {
+                let ops: Vec<ApplyOp> = units.into_iter().map(ApplyOp::Put).collect();
+                if let Ok(out) = Ps2Folder.apply(&img, &ops) {
+                    assert!(Ps2Folder.validate(&out).is_ok());
+                }
+            }
+            Err(FormatError::Invalid(_) | FormatError::Unsupported(_)) => rejected += 1,
+            Err(e) => panic!("unexpected error {e}"),
+        }
+    }
+    assert!(rejected > 0, "some corruptions must be detected");
 }

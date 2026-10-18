@@ -5,16 +5,17 @@ platforms. Design: [docs/DESIGN.md](docs/DESIGN.md). C API contract: [include/em
 
 **Status: M1.** PS2 memory cards (`.ps2`, the PCSX2/ARMSX2 default) sync **per save** through
 Amazon S3 or any S3-compatible service: saves of different games played offline on different
-devices merge without conflicts, and every save has its own version history. Other card
-formats sync as whole files (byte-identical mirrors). `emusync watch` keeps unmodified PCSX2
-in sync with no manual steps. Folder cards come next.
+devices merge without conflicts, and every save has its own version history. PCSX2 folder
+cards hold the same saves, so a folder card on one device syncs with a `.ps2` file on another.
+Other card formats sync as whole files (byte-identical mirrors). `emusync watch` keeps
+unmodified PCSX2 in sync with no manual steps.
 
 ## Crates
 
 | Crate | Purpose |
 |---|---|
 | `emusync-core` | Data model, version DAG, SQLite state, sync engine |
-| `emusync-formats` | Container format adapters: `ps2.card` (PS2 memory card file system), `raw` |
+| `emusync-formats` | Container format adapters: `ps2.card` (PS2 memory card file system), `ps2.card.folder` (PCSX2 folder cards), `raw` |
 | `emusync-remote` | `Remote` trait, S3 backend (SigV4 + rustls), in-memory remote, conformance suite |
 | `emusync-ffi` | C ABI (stub in M0) |
 | `emusyncd` | The `emusync` command-line tool, including the `emusync watch` sidecar |
@@ -28,6 +29,7 @@ export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=...
 # On every device (the card name defaults to the file stem, so Mcd001.ps2 matches everywhere):
 emusync remote add "s3://my-saves/emusync/v1?region=eu-west-1"
 emusync card add ~/PCSX2/memcards/Mcd001.ps2
+# (a PCSX2 folder card is added the same way: emusync card add ~/PCSX2/memcards/Mcd001)
 emusync sync                               # run with the emulator closed
 
 emusync card list                          # cards and the saves on them

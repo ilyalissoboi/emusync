@@ -33,9 +33,27 @@ fn card_add_and_list_without_remote() {
     let (success, out) = emusync(&data, &["sync"]);
     assert!(!success && out.contains("no remote configured"), "{out}");
     let (success, out) = emusync(&data, &["card", "add", dir.path().join("Mcd002.ps2").to_str().unwrap()]);
-    assert!(!success && out.contains("not a file"), "{out}");
+    assert!(!success && out.contains("does not exist"), "{out}");
     let (success, out) = emusync(&data, &["remote", "add", "ftp://nope"]);
     assert!(!success && out.contains("unsupported scheme"), "{out}");
+}
+
+#[test]
+fn folder_cards_are_detected() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    // As PCSX2 creates a folder card: a directory with an empty superblock file.
+    let folder = dir.path().join("Mcd002");
+    std::fs::create_dir(&folder).unwrap();
+    std::fs::write(folder.join("_pcsx2_superblock"), b"").unwrap();
+    let out = ok(&data, &["card", "add", folder.to_str().unwrap()]);
+    assert!(out.contains("card ps2:Mcd002 (unit mode"), "{out}");
+    let out = ok(&data, &["card", "inspect", folder.to_str().unwrap()]);
+    assert!(out.contains("format ps2.card.folder") && out.contains("unformatted"), "{out}");
+    let plain = dir.path().join("photos");
+    std::fs::create_dir(&plain).unwrap();
+    let (success, out) = emusync(&data, &["card", "add", plain.to_str().unwrap()]);
+    assert!(!success && out.contains("not a PCSX2 folder memory card"), "{out}");
 }
 
 /// A save directory with one data file, as a game would write it.
