@@ -1,0 +1,18 @@
+[package]
+name = "emusync-remote"
+description = "Storage backends for emusync: the Remote trait, an in-memory remote, and S3"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+aws-sigv4.workspace = true
+aws-credential-types.workspace = true
+aws-smithy-runtime-api.workspace = true
+hex.workspace = true
+log.workspace = true
+thiserror.workspace = true
+ureq.workspace = true
+uuid.workspace = true

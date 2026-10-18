@@ -837,3 +837,39 @@ event and released explicitly. `es_abi_version()` lets a host refuse a mismatche
    bucket, policy and keys?
 7. **S3-compatible providers:** which ones are tested and supported at launch (R2, B2, Wasabi,
    MinIO)?
+
+## 16. Implementation notes (M0)
+
+Where the M0 code differs from or pins down the design above:
+
+1. **Cycle order.** A sync cycle runs pull → snapshot local changes → reconcile/apply → push
+   (§6.1 lists push first). Pulling first lets a first sync adopt identical cloud content
+   instead of publishing a duplicate. Local changes still reach the remote in the same cycle.
+2. **Divergence is a tip set.** A local change becomes a version (parent = base) as soon as
+   it is snapshotted, so every row of §6.3 reduces to "how many tips does the unit have".
+   Tips with identical content are merged automatically, whatever the policy.
+3. **`newest` writes a deterministic merge.** Its parents are all tips (sorted), its HLC is
+   the highest tip HLC plus one, and its content is the winner's. Every device computes the
+   same record and id, so concurrent automatic resolutions converge. The loser stays in
+   history as a merge parent rather than as an open branch tip. A tip with history beats a
+   first-sync root; between roots the older one wins. Merges may have more than two parents.
+4. **First sync** also adopts an *older* version with identical content (a stale copy of the
+   card), which then fast-forwards instead of raising a conflict.
+5. **Version ids** are `b3:` + BLAKE3 of the record's canonical JSON (sorted keys, no
+   whitespace, without `op` and `id`), verified on pull. Fields added by later versions are
+   covered automatically.
+6. **Blobs** carry a one-byte encoding header (0 = raw, 1 = zstd).
+7. **Lost responses.** A segment's body is fixed before the first upload attempt. On `412` the
+   existing object is fetched and compared, so a write whose response was lost is not
+   mistaken for a cloned device id.
+8. **Not yet implemented:** compaction snapshots and garbage collection (new devices replay
+   full logs), `device.json` last-seen updates (it is written once), sessions and leases
+   (`Engine::set_busy` routes results to the inbox instead), the size+mtime fingerprint
+   shortcut (cards are re-hashed each scan), and the FFI beyond version/status functions.
+9. **Platform details.** HTTP is `ureq` 2 with rustls/ring. On Windows the atomic replace is
+   `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` (via `std::fs::rename`) rather than `ReplaceFileW`.
+   Devices are discovered with one delimiter LIST of `devices/` per cycle. The conditional-write
+   probe leaves a small `_probe/<uuid>` object.
+10. **CLI.** S3 credentials come from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` /
+    `AWS_SESSION_TOKEN` and are never stored. `emusync sync` defaults to the `ask` policy
+    (`--policy newest` for unattended use).

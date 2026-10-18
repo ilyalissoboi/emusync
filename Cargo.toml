@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/emusync-core",
+    "crates/emusync-formats",
+    "crates/emusync-remote",
+    "crates/emusync-ffi",
+    "crates/emusyncd",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ilyalissoboi/emusync"
+rust-version = "1.80"
+
+[workspace.dependencies]
+emusync-core = { path = "crates/emusync-core" }
+emusync-formats = { path = "crates/emusync-formats" }
+emusync-remote = { path = "crates/emusync-remote" }
+aws-sigv4 = { version = "1", default-features = false, features = ["sign-http", "http1"] }
+aws-credential-types = "1"
+aws-smithy-runtime-api = { version = "1", features = ["client"] }
+blake3 = "1"
+clap = { version = "4", features = ["derive"] }
+fastcdc = "3"
+hex = "0.4"
+log = "0.4"
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+ureq = "2"
+uuid = { version = "1", features = ["v7"] }
+zstd = { version = "0.13", default-features = false }
+tempfile = "3"
