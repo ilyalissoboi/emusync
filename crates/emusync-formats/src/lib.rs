@@ -6,12 +6,18 @@
 //!
 //! - [`raw`]: a whole file as one opaque unit; the fallback for formats without an adapter.
 //! - [`ps2`] (`ps2.card`): PS2 memory card images, one unit per save directory.
+//! - [`ps2::folder`] (`ps2.card.folder`): PCSX2 folder memory cards, with the same units.
+//!
+//! A container that is a directory on the host is handed to its adapter as a [`tree::Tree`]
+//! image ([`ContainerKind::Directory`]).
 
 use std::collections::BTreeMap;
 
 pub mod ps2;
 pub mod raw;
+pub mod tree;
 
+pub use ps2::folder::Ps2Folder;
 pub use ps2::Ps2Card;
 pub use raw::Raw;
 
@@ -64,10 +70,23 @@ pub enum ApplyOp {
     Delete(String),
 }
 
+/// What a container is on the host, which decides how the core reads and writes its image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContainerKind {
+    /// A single file; the image is its bytes.
+    File,
+    /// A directory; the image is a [`tree::Tree`] of everything under it.
+    Directory,
+}
+
 /// A container format. Mirrors the trait sketched in DESIGN §5, working on in-memory images.
 pub trait ContainerFormat: Send + Sync {
     /// Adapter id, e.g. `"raw"` or `"ps2.card"`.
     fn id(&self) -> &'static str;
+    /// Whether containers of this format are files or directories.
+    fn kind(&self) -> ContainerKind {
+        ContainerKind::File
+    }
     /// Whether this adapter can supply units for a card (unit mode). `raw` cannot.
     fn supports_units(&self) -> bool;
     /// Auto-detection.
@@ -95,8 +114,15 @@ pub fn by_id(id: &str) -> Option<&'static dyn ContainerFormat> {
     match id {
         "raw" => Some(&Raw),
         "ps2.card" => Some(&Ps2Card),
+        "ps2.card.folder" => Some(&Ps2Folder),
         _ => None,
     }
+}
+
+/// Picks the adapter for a directory container from its [`tree::Tree`] image: a PCSX2 folder
+/// card (it has a `_pcsx2_superblock`), or nothing.
+pub fn detect_dir(image: &[u8]) -> Option<&'static dyn ContainerFormat> {
+    (Ps2Folder.probe(image) == Confidence::Certain).then_some(&Ps2Folder as &dyn ContainerFormat)
 }
 
 /// Picks the adapter for a card file: one whose format is recognised in the image, or whose
