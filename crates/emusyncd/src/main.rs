@@ -13,6 +13,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
+mod watch;
+
 #[derive(Parser)]
 #[command(name = "emusync", version, about = "Sync emulator memory cards through S3")]
 struct Cli {
@@ -68,6 +70,9 @@ enum Cmd {
     },
     /// Show this device's identity and remote.
     Status,
+    /// Run in the foreground: sync cards as the emulator writes them, and apply changes from
+    /// other devices only while the emulator is closed.
+    Watch(watch::WatchArgs),
 }
 
 #[derive(Subcommand)]
@@ -137,7 +142,8 @@ enum Policy {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    init_logging(cli.verbose);
+    // The watcher is a daemon: its log is its output.
+    init_logging(cli.verbose + u8::from(matches!(cli.cmd, Cmd::Watch(_))), matches!(cli.cmd, Cmd::Watch(_)));
     match run(cli) {
         Ok(code) => code,
         Err(e) => {
@@ -338,6 +344,12 @@ fn run(cli: Cli) -> AnyResult<ExitCode> {
             let report = engine.sync()?;
             print_report(&engine, &report)?;
         }
+        Cmd::Watch(args) => {
+            if !attach(&mut engine)? {
+                return Err("no remote configured (run `emusync remote add <uri>`)".into());
+            }
+            watch::run(engine, args)?;
+        }
         Cmd::History { target } => {
             let unit = engine.resolve_unit(target)?;
             let entries = engine.history(&unit)?;
@@ -473,27 +485,40 @@ fn print_report(engine: &Engine, r: &SyncReport) -> AnyResult<()> {
     Ok(())
 }
 
-struct StderrLogger(log::LevelFilter);
+struct StderrLogger {
+    level: log::LevelFilter,
+    /// Prefix lines with the UTC time.
+    timestamps: bool,
+}
 
 impl log::Log for StderrLogger {
     fn enabled(&self, m: &log::Metadata) -> bool {
-        m.level() <= self.0 && (m.target().starts_with("emusync") || m.level() <= log::Level::Warn)
+        m.level() <= self.level && (m.target().starts_with("emusync") || m.level() <= log::Level::Warn)
     }
     fn log(&self, r: &log::Record) {
         if self.enabled(r.metadata()) {
-            eprintln!("[{}] {}", r.level().as_str().to_ascii_lowercase(), r.args());
+            let level = r.level().as_str().to_ascii_lowercase();
+            if self.timestamps {
+                let ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_millis() as i64);
+                let now = emusync_core::hlc::Hlc { ms, counter: 0 }.display_time();
+                eprintln!("{now}Z [{level}] {}", r.args());
+            } else {
+                eprintln!("[{level}] {}", r.args());
+            }
         }
     }
     fn flush(&self) {}
 }
 
-fn init_logging(verbose: u8) {
+fn init_logging(verbose: u8, timestamps: bool) {
     let level = match verbose {
         0 => log::LevelFilter::Warn,
         1 => log::LevelFilter::Info,
         _ => log::LevelFilter::Debug,
     };
-    if log::set_logger(Box::leak(Box::new(StderrLogger(level)))).is_ok() {
+    if log::set_logger(Box::leak(Box::new(StderrLogger { level, timestamps }))).is_ok() {
         log::set_max_level(level);
     }
 }

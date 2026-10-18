@@ -96,6 +96,9 @@ pub struct SyncReport {
     pub blocked: Vec<Blocked>,
     /// Ids of open conflicts touched in this cycle.
     pub conflicts: Vec<i64>,
+    /// Units whose diverged versions the `newest` policy merged in this cycle (the losing
+    /// versions stay in history as merge parents).
+    pub resolved: Vec<String>,
     /// Cards whose mode another device changed.
     pub mode_changes: Vec<String>,
     /// `(old, new)` when this installation found its device id in use elsewhere and minted a new one.
@@ -878,7 +881,10 @@ impl Engine {
                             }
                             return Ok(None);
                         }
-                        ConflictPolicy::Newest => self.auto_merge(unit, tips, newest(tips))?,
+                        ConflictPolicy::Newest => {
+                            report.resolved.push(unit.to_string());
+                            self.auto_merge(unit, tips, newest(tips))?
+                        }
                     }
                 }
             }
