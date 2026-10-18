@@ -209,6 +209,13 @@ fn read_dir(tree: &Tree, path: &str, host: &str, host_mtime: i64, depth: usize) 
         }
     }
     files.sort_by_key(|(o, _)| *o);
+    // PCSX2 keys files by order in a map and keeps only the first of two with the same order.
+    // Refuse such a folder rather than sync a file the emulator doesn't show.
+    if files.windows(2).any(|w| w[0].0 == w[1].0) {
+        return Err(invalid(format!(
+            "{path}/{INDEX} gives two files the same order, and PCSX2 loads only one of them"
+        )));
+    }
     let children: Vec<Node> = dirs.into_iter().chain(files.into_iter().map(|(_, f)| f)).collect();
     let mut names: Vec<&[u8]> = children.iter().map(|c| c.name.as_slice()).collect();
     names.sort();
@@ -246,11 +253,23 @@ fn read_saves(tree: &Tree) -> Result<Vec<(String, Node)>> {
     Ok(saves)
 }
 
+/// Parses a folder card. PCSX2 loads saves one by one and skips, with a warning, each one
+/// that no longer fits; that happens exactly when all of them together don't fit, whatever
+/// the order. Such a folder is refused, so saves the emulator doesn't show are never synced.
 fn parse(image: &[u8]) -> Result<Parsed> {
     let tree = Tree::decode(image)?;
     let sb = tree.file(SUPERBLOCK).ok_or_else(|| invalid("not a PCSX2 folder memory card (no _pcsx2_superblock)"))?;
     let formatted = is_formatted(sb);
     let saves = if formatted { read_saves(&tree)? } else { vec![] };
+    if formatted {
+        let (used, cap) = (card_clusters(saves.iter().map(|(_, n)| n)), capacity(sb));
+        if used > cap {
+            return Err(invalid(format!(
+                "the folder holds more than the card can ({used} of {cap} clusters), so PCSX2 doesn't load \
+                 every save; remove some or use a bigger card"
+            )));
+        }
+    }
     Ok(Parsed { tree, formatted, saves })
 }
 
@@ -409,7 +428,6 @@ impl ContainerFormat for Ps2Folder {
         let parsed = parse(image)?;
         let mut tree = parsed.tree;
         let mut saves = parsed.saves;
-        let before = card_clusters(saves.iter().map(|(_, n)| n));
         if !parsed.formatted {
             let first_put = ops.iter().find_map(|op| match op {
                 ApplyOp::Put(c) => Some(decode(c, FALLBACK_TIME).map(|n| n.created)),
@@ -455,7 +473,7 @@ impl ContainerFormat for Ps2Folder {
         }
         if let Some(sb) = tree.file(SUPERBLOCK).filter(|sb| is_formatted(sb)) {
             let after = card_clusters(saves.iter().map(|(_, n)| n));
-            if after > capacity(sb) && after > before {
+            if after > capacity(sb) {
                 return Err(FormatError::NoSpace);
             }
         }
@@ -674,6 +692,21 @@ mod tests {
         let big = canonical(&save(b"BIG", vec![file(b"f", &vec![0; 8000 * 1024], T0)], T0));
         assert!(matches!(Ps2Folder.apply(&new_card(), &[ApplyOp::Put(big)]), Err(FormatError::NoSpace)));
         let fits = canonical(&save(b"BIG", vec![file(b"f", &vec![0; 7990 * 1024], T0)], T0));
-        assert!(Ps2Folder.apply(&new_card(), &[ApplyOp::Put(fits)]).is_ok());
+        let full = Ps2Folder.apply(&new_card(), &[ApplyOp::Put(fits)]).unwrap();
+        // A folder holding more than fits (copied in by hand): PCSX2 would skip a save.
+        let mut t = Tree::decode(&full).unwrap();
+        t.insert("EXTRA".into(), 0, EntryKind::Dir).unwrap();
+        t.insert("EXTRA/f".into(), 0, EntryKind::File(vec![0; 10 * 1024])).unwrap();
+        assert!(matches!(Ps2Folder.extract_all(&t.encode()), Err(FormatError::Invalid(_))));
+        // Two files with the same order: PCSX2 loads only one.
+        let mut t = Tree::decode(&new_card()).unwrap();
+        t.insert(SUPERBLOCK.into(), 0, EntryKind::File(blank_card(8192, false, T0)[..SUPERBLOCK_LEN].to_vec()))
+            .unwrap();
+        t.insert("S".into(), 0, EntryKind::Dir).unwrap();
+        t.insert("S/a".into(), 0, EntryKind::File(vec![1])).unwrap();
+        t.insert("S/b".into(), 0, EntryKind::File(vec![2])).unwrap();
+        let ix = "a:\n  order: 1\nb:\n  order: 1\n";
+        t.insert("S/_pcsx2_index".into(), 0, EntryKind::File(ix.as_bytes().to_vec())).unwrap();
+        assert!(matches!(Ps2Folder.validate(&t.encode()), Err(FormatError::Invalid(_))));
     }
 }

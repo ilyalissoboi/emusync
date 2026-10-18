@@ -127,28 +127,59 @@ pub fn read_tree(dir: &Path) -> io::Result<Tree> {
 }
 
 /// Writes `tree` into the new directory `dir`, fsyncing every file.
+fn system_time(secs: i64) -> SystemTime {
+    if secs >= 0 {
+        UNIX_EPOCH + Duration::from_secs(secs as u64)
+    } else {
+        UNIX_EPOCH - Duration::from_secs(secs.unsigned_abs())
+    }
+}
+
+/// Opens a directory so its timestamps can be set.
+#[cfg(windows)]
+fn open_dir_for_times(path: &Path) -> io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    fs::OpenOptions::new().access_mode(FILE_WRITE_ATTRIBUTES).custom_flags(FILE_FLAG_BACKUP_SEMANTICS).open(path)
+}
+
+#[cfg(not(windows))]
+fn open_dir_for_times(path: &Path) -> io::Result<File> {
+    File::open(path)
+}
+
+/// Writes `tree` into the new directory `dir`, fsyncing every file. Modification times are
+/// restored too (directories last, after their children), so reading the result back gives
+/// the same tree image. Setting a time is best effort: a file system that can't store it
+/// exactly only makes the next scan see a change.
 fn write_tree(dir: &Path, tree: &Tree) -> io::Result<()> {
     fs::create_dir(dir)?;
-    let mut dirs = vec![dir.to_path_buf()];
+    let mut dirs = vec![(dir.to_path_buf(), None)];
     for (rel, e) in &tree.entries {
         let path = rel.split('/').fold(dir.to_path_buf(), |p, s| p.join(s));
         match &e.kind {
             EntryKind::Dir => {
                 fs::create_dir(&path)?;
-                dirs.push(path);
+                dirs.push((path, Some(e.mtime)));
             }
             EntryKind::File(data) => {
                 let mut f = File::create(&path)?;
                 f.write_all(data)?;
-                if e.mtime > 0 {
-                    // Keeps the host time PCSX2 falls back to for files its index doesn't list.
-                    let _ = f.set_modified(UNIX_EPOCH + Duration::from_secs(e.mtime as u64));
-                }
+                // Also the host time PCSX2 falls back to for files its index doesn't list.
+                let _ = f.set_modified(system_time(e.mtime));
                 f.sync_all()?;
             }
         }
     }
-    for d in dirs.iter().rev() {
+    // Children come after their parent in path order, so this sets each directory's time
+    // once nothing more is written into it.
+    for (d, mtime) in dirs.iter().rev() {
+        if let Some(mtime) = mtime {
+            if let Ok(f) = open_dir_for_times(d) {
+                let _ = f.set_modified(system_time(*mtime));
+            }
+        }
         sync_dir(d)?;
     }
     Ok(())
@@ -238,9 +269,9 @@ mod tests {
     fn sample() -> Tree {
         let mut t = Tree::default();
         t.insert("_pcsx2_superblock".into(), 1_700_000_000, EntryKind::File(vec![7; 100])).unwrap();
-        t.insert("SAVE".into(), 0, EntryKind::Dir).unwrap();
+        t.insert("SAVE".into(), 1_500_000_000, EntryKind::Dir).unwrap();
         t.insert("SAVE/data".into(), 1_600_000_000, EntryKind::File(b"new".to_vec())).unwrap();
-        t.insert("SAVE/empty".into(), 0, EntryKind::Dir).unwrap();
+        t.insert("SAVE/empty".into(), 1_400_000_000, EntryKind::Dir).unwrap();
         t
     }
 
@@ -264,7 +295,7 @@ mod tests {
         replace_dir(&card, &sample()).unwrap();
         let back = read_tree(&card).unwrap();
         assert_eq!(files(&back), files(&sample()));
-        assert_eq!(back.get("SAVE/data").unwrap().mtime, 1_600_000_000, "file times are kept");
+        assert_eq!(back, sample(), "the same image, modification times included");
         for p in [temp_path(&card), old_path(&card), journal_path(&card)] {
             assert!(!p.exists(), "{} left behind", p.display());
         }

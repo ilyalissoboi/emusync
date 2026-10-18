@@ -962,8 +962,12 @@ reasoned from it, not observed in a running PCSX2.
 2. **Reading mirrors `AddFolder`:** the same order rules, metadata files winning over the index,
    and the index winning over host modification times. Modes always get the "exists" bit,
    since the card build sets it anyway. If the index can't be parsed, it is ignored, as PCSX2
-   does: order and times fall back. A metadata file whose mode lacks the directory or file bit
-   makes the card invalid, so it is never synced.
+   does: order and times fall back. Some folders are invalid and never synced:
+   - a metadata file whose mode lacks the directory or file bit;
+   - an index giving two files the same `order` (PCSX2 would load only one of them);
+   - a folder holding more than the card's capacity. PCSX2 skips a save exactly when all of
+     them together don't fit, whatever the load order, so syncing such a folder would spread
+     saves the emulator doesn't show. The user removes saves or picks a bigger card.
 3. **Writing mirrors `FlushFileEntries`.** A save is written as its directory, an index listing
    every file's order and both timestamps, and metadata files only for non-default entries.
    A changed save replaces its whole directory. A deleted save is renamed to
@@ -990,7 +994,9 @@ reasoned from it, not observed in a running PCSX2.
    sync" check before an apply.
 2. **Atomic directory replace** (`fsutil::replace_dir`), the directory form of §5 step 5:
    1. Write the new tree to `<card>.emusync-tmp`, fsyncing every file (and directory on Unix).
-      File modification times are restored from the image.
+      File and directory modification times are restored from the image (directories after
+      their children), so the result reads back as the same image. That matters in whole-file
+      mode, where the image is the unit.
    2. Write the journal `<card>.emusync-swap` (temp file + rename).
    3. Rename `<card>` to `<card>.emusync-old`, then `<card>.emusync-tmp` to `<card>`.
    4. Remove `<card>.emusync-old`, then the journal.
