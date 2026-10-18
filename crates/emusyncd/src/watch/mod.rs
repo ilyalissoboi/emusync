@@ -97,13 +97,6 @@ impl WatchArgs {
 /// Runs the watcher until Ctrl+C, SIGTERM or `emusync service stop`, then does a final sync
 /// unless an emulator is running.
 pub fn run(mut engine: Engine, args: &WatchArgs, data_dir: &Path) -> AnyResult<()> {
-    if let Some(pid) = control::running_pid(data_dir) {
-        return Err(format!(
-            "a watcher is already running on {} (pid {pid}); stop it with `emusync service stop`",
-            data_dir.display()
-        )
-        .into());
-    }
     let _pid_file = control::PidFile::create(data_dir)?;
     let stop = Arc::new(AtomicBool::new(false));
     let flag = stop.clone();

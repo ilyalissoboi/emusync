@@ -147,7 +147,8 @@ pub fn launchd_plist(cmd: &Command) -> String {
 /// needed to register it), on battery too, without a time limit, restarting after a crash.
 pub fn task_xml(user: &str, cmd: &Command) -> String {
     let user = xml_escape(user);
-    let command = xml_escape(&windows_quote(&cmd.program.display().to_string()));
+    // `<Command>` is a path (`ExecAction.Path`), not a command-line token: no quotes.
+    let command = xml_escape(&cmd.program.display().to_string());
     let args = xml_escape(&cmd.args.iter().map(|a| windows_quote(a)).collect::<Vec<_>>().join(" "));
     format!(
         r#"<?xml version="1.0" encoding="UTF-16"?>
@@ -336,7 +337,7 @@ mod tests {
     fn task_xml_runs_at_this_users_logon() {
         let xml = task_xml(r"AzureAD\Me & Co", &cmd(r"C:\Program Files\emusync\emusyncw.exe"));
         assert_eq!(xml.matches(r"<UserId>AzureAD\Me &amp; Co</UserId>").count(), 2, "trigger and principal");
-        assert!(xml.contains(r"<Command>&quot;C:\Program Files\emusync\emusyncw.exe&quot;</Command>"));
+        assert!(xml.contains(r"<Command>C:\Program Files\emusync\emusyncw.exe</Command>"));
         let args = xml.lines().find_map(|l| l.trim().strip_prefix("<Arguments>")).unwrap();
         let args = args.strip_suffix("</Arguments>").unwrap();
         let unescaped = args.replace("&quot;", "\"").replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&");

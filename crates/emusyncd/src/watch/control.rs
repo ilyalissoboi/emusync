@@ -40,23 +40,55 @@ pub fn running_pid(data_dir: &Path) -> Option<u32> {
 pub struct PidFile(PathBuf);
 
 impl PidFile {
-    pub fn create(data_dir: &Path) -> std::io::Result<Self> {
-        // A stop request nobody picked up must not stop this watcher.
-        let _ = std::fs::remove_file(stop_path(data_dir));
+    /// Claims `data_dir` for this watcher. The pid file is created exclusively, so of two
+    /// watchers starting at once only one gets it; a pid file left by a watcher that was
+    /// killed is replaced.
+    pub fn create(data_dir: &Path) -> Result<Self, String> {
         let path = pid_path(data_dir);
-        std::fs::write(&path, format!("{}\n", std::process::id()))?;
-        Ok(Self(path))
+        for _ in 0..2 {
+            match std::fs::File::create_new(&path) {
+                Ok(mut f) => {
+                    use std::io::Write;
+                    writeln!(f, "{}", std::process::id())
+                        .map_err(|e| format!("can't write {}: {e}", path.display()))?;
+                    // A stop request nobody picked up must not stop this watcher.
+                    let _ = std::fs::remove_file(stop_path(data_dir));
+                    return Ok(Self(path));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if let Some(pid) = running_pid(data_dir) {
+                        return Err(already_running(data_dir, pid));
+                    }
+                    // Stale. If another watcher replaces it first, the retry sees that one.
+                    let _ = std::fs::remove_file(&path);
+                }
+                Err(e) => return Err(format!("can't create {}: {e}", path.display())),
+            }
+        }
+        Err(match running_pid(data_dir) {
+            Some(pid) => already_running(data_dir, pid),
+            None => format!("another watcher is starting on {}", data_dir.display()),
+        })
     }
+}
+
+fn already_running(data_dir: &Path, pid: u32) -> String {
+    format!("a watcher is already running on {} (pid {pid}); stop it with `emusync service stop`", data_dir.display())
 }
 
 impl Drop for PidFile {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+        // Only our own: a pid file another watcher wrote after replacing ours stays.
+        let mine = std::fs::read_to_string(&self.0).is_ok_and(|s| s.trim() == std::process::id().to_string());
+        if mine {
+            let _ = std::fs::remove_file(&self.0);
+        }
     }
 }
 
 /// Asks the watcher on `data_dir` to stop after its current cycle (with a final sync), and
-/// waits up to `timeout` for it to exit. Returns whether it has.
+/// waits up to `timeout` for it to exit. Returns whether it has. On a timeout the request
+/// stays, so a watcher stuck in a slow sync still stops once the sync returns.
 pub fn stop(data_dir: &Path, timeout: Duration) -> std::io::Result<bool> {
     if running_pid(data_dir).is_none() {
         return Ok(true);
@@ -69,7 +101,6 @@ pub fn stop(data_dir: &Path, timeout: Duration) -> std::io::Result<bool> {
         }
         std::thread::sleep(Duration::from_millis(250));
     }
-    let _ = std::fs::remove_file(stop_path(data_dir));
     Ok(false)
 }
 
@@ -162,5 +193,15 @@ mod tests {
         std::fs::write(stop_path(dir.path()), b"").unwrap();
         assert!(stop_requested(dir.path()));
         assert!(!stop_requested(dir.path()));
+    }
+
+    #[test]
+    fn a_pid_file_is_only_removed_by_its_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid = PidFile::create(dir.path()).unwrap();
+        // Another watcher replaced it (ours was taken for stale).
+        std::fs::write(pid_path(dir.path()), "12345\n").unwrap();
+        drop(pid);
+        assert_eq!(std::fs::read_to_string(pid_path(dir.path())).unwrap(), "12345\n");
     }
 }
