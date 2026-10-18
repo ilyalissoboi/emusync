@@ -7,7 +7,7 @@ optionally save states) in sync across devices and operating systems through the
 continue in ARMSX2 on Android. Memory card progress follows you with no manual copying. If you
 play on two devices while offline, nothing is lost.
 
-Status: design draft, v0.1. The C API contract is sketched in [`include/emusync.h`](../include/emusync.h).
+Status: design draft, v0.2 (one-file-per-card layout made the default; S3 is the first backend). The C API contract is sketched in [`include/emusync.h`](../include/emusync.h).
 
 ---
 
@@ -19,14 +19,17 @@ Status: design draft, v0.1. The C API contract is sketched in [`include/emusync.
    recovered. This rule outranks every other goal.
 2. **Sync per save, not per file.** A PS2 memory card holds saves for many games. Two devices
    playing *different* games offline must merge cleanly, with no conflict.
-3. **Work across emulators and layouts.** PCSX2 with an 8 MB `.ps2` file card, PCSX2 with a
-   folder card, and ARMSX2 with a per-game card all hold the same logical saves and must
-   interoperate.
+3. **Cards just work with default settings.** The default layout in PCSX2, ARMSX2 and most
+   other emulators is one image file per memory card (`Mcd001.ps2`, `Mcd002.ps2`). That layout
+   must sync with zero configuration beyond choosing the cloud storage. Other layouts (folder
+   cards, per-game cards) must interoperate with it.
 4. **Embeddable.** A small C ABI that emulators (C++, Kotlin/JNI, Swift) can link without
    pulling in an async runtime, a GUI, or GPL-incompatible terms.
-5. **Bring your own storage.** Works with a reference sync server, but also with plain object or
-   file storage (S3, WebDAV, Dropbox, Google Drive, OneDrive, iCloud Drive, or a local folder
-   synced by Syncthing). None of these may be required.
+5. **Bring your own storage, starting with S3.** The repository runs on plain object storage
+   and needs no server of its own. **Amazon S3 and S3-compatible services are the first
+   supported backend** (§6.2). The layout also allows WebDAV, Dropbox, Google Drive, OneDrive,
+   iCloud Drive, a Syncthing folder, or an optional reference server later, so no single provider
+   is ever required.
 6. **Mobile-friendly.** Survives Android process death, metered networks, scoped storage (SAF)
    and short background time budgets.
 
@@ -41,11 +44,77 @@ Status: design draft, v0.1. The C API contract is sketched in [`include/emusync.
 
 ---
 
-## 2. The core idea: containers vs. save units
+## 2. The core idea: cards, containers, and save units
 
-Emulators store saves in **containers**: physical files or folders with emulator-specific
-layouts. The library breaks each container into **save units**, the smallest pieces of data a
-game owns on its own, and syncs those.
+The model has three layers:
+
+- **Logical card**: what the user thinks of as "Memory Card 1". It has a name and is the same
+  card on every device: `Mcd001.ps2` on Windows, macOS and Android all hold logical card
+  `ps2:Mcd001`.
+- **Container**: the local file or folder that holds a logical card on one device. That can be
+  a card file, a folder card, or a per-game card.
+- **Save unit**: one game's save inside a card, such as a PS2 save directory. Versions and
+  conflicts are tracked per unit.
+
+### 2.1 One file per memory card (the default layout)
+
+The most common setup, and the default in PCSX2 (and ARMSX2, which inherits its settings), is
+**one image file per memory card**, shared by every game: `memcards/Mcd001.ps2` in slot 1 and
+`Mcd002.ps2` in slot 2. DuckStation's shared cards, Dolphin's Card A/B `.raw` images, and
+ePSXe's `.mcr` files follow the same pattern. This is the primary layout, and every default in
+the library is tuned for it:
+
+- **Cards match by name, with no setup needed.** When a host registers a card file, it is bound
+  to the logical card named after the file stem (`Mcd001`), unless the host picks another name.
+  A user who keeps the emulator's defaults on every device gets matching cards automatically.
+  Where file names differ between emulators (DuckStation's `shared_card_1.mcd` versus another
+  PS1 emulator's `epsxe000.mcr`, say), the host or user sets the logical name explicitly.
+- **Saves stay on their card.** A save on `Mcd002` on Windows lands on `Mcd002` on Android,
+  never on `Mcd001`.
+- **Sync inside a card is still per save.** Play *GTA III* on Windows and *Ratchet & Clank* on an
+  offline phone, both on `Mcd001`, and the card merges with no conflict. Afterwards each device's
+  `Mcd001.ps2` holds the same saves with the same contents. The files are not necessarily
+  byte-identical, because free-cluster allocation can differ, but games and emulators read the
+  card's file system, not its byte layout, so this makes no difference to them.
+- **Every save on the card syncs.** A shared card container receives all units of its logical
+  card during idle syncs, not only those of the game being played, so opening the emulator's
+  memory card manager on any device shows the same card.
+- **Card size is per device.** Devices may use different card sizes (8 MB standard, or PCSX2's
+  16–64 MB). If a unit doesn't fit on a smaller card, it is held back and reported (§5.1); it is
+  never dropped.
+
+#### Whole-file mode
+
+Each logical card can instead be set to **whole-file mode**. The card image itself is then the
+only unit (`ps2:Mcd001:@card`), synced through the `raw` adapter:
+
+| | Unit mode (default) | Whole-file mode |
+|---|---|---|
+| Result on each device | Same saves, file layout may differ | Byte-identical card files |
+| Offline play on two devices, different games | Merges cleanly | **Conflict**: the user picks one card, the other stays in history |
+| Upload per save | The changed save (tens of KB to a few MB) | Changed chunks of the image (typically 100–300 KB, thanks to content-defined chunking, §7) |
+| Requires a format adapter | Yes | No: works for any card format |
+
+Whole-file mode exists for formats without an adapter (where it is the only mode), for users
+who want exact mirrors, and for the first milestone, which ships before the PS2 adapter (§14).
+The mode is a property of the **logical card**, recorded in the repository (§6.1), so every
+device syncs a card the same way. Changing it is an explicit operation (`es_card_set_mode`). A
+card image that fails validation is never synced in either mode, so corruption doesn't spread;
+the host gets an error and the image is left alone.
+
+### 2.2 Other layouts
+
+- **Folder cards** (a PCSX2 option): a folder card bound to `Mcd001` holds the same logical card
+  as a `Mcd001.ps2` file on another device. Both use the same canonical units, so the two
+  interoperate with no conversion.
+- **Per-game cards** (the DuckStation default, optional in PCSX2): a per-game container has a
+  **title scope**. It holds only the part of a logical card that belongs to one title. The host
+  binds it to the shared logical card of its slot (`Mcd001` for slot 1), so a device with
+  per-game cards and a device with one shared card still exchange saves: GTA's units from the
+  shared `Mcd001` go into the GTA per-game card, and back. A host can bind per-game cards to a
+  separate logical card if the user wants them kept apart.
+
+### 2.3 Save units by platform
 
 | Platform | Container formats (local) | Save unit | Title identity |
 |---|---|---|---|
@@ -56,35 +125,33 @@ game owns on its own, and syncs those.
 | PSP | `SAVEDATA/<dir>` | Directory | Directory prefix (`ULUS10041`) |
 | Anything else | Any file or directory | The whole file or directory (opaque) | Set by the host |
 
-Because sync works on units, a PS2 save made on Windows in a shared `Mcd001.ps2` can be written
-into the per-game card ARMSX2 uses on Android, and back again. Only the unit has to match.
-Cards never have to be byte-identical.
-
 ```
- Windows (PCSX2)            cloud repository                 Android (ARMSX2)
- ┌──────────────┐          ┌───────────────────┐           ┌─────────────────┐
- │ Mcd001.ps2   │ extract  │ unit ps2:BASLUS-  │  apply    │ SLUS-20312.ps2  │
- │  ├ BASLUS-203│────────▶ │  20312GTA3        │ ────────▶ │  └ BASLUS-203…  │
- │  ├ BESLES-50…│          │  v1 → v2 → v3     │           │                 │
- │  └ BASCUS-97…│          │ unit ps2:BESLES-… │           │ Mcd001.ps2      │
- └──────────────┘          └───────────────────┘           └─────────────────┘
+ Windows (PCSX2)           S3 repository: card ps2:Mcd001       Android (ARMSX2)
+ ┌────────────────┐       ┌──────────────────────────────┐     ┌────────────────┐
+ │ Mcd001.ps2     │extract│ BASLUS-20062GTA3  v1→v2→v3   │apply│ Mcd001.ps2     │
+ │  ├ BASLUS-20062│──────▶│ BASCUS-97199RAC   v1→v2      │────▶│  ├ BASLUS-20062│
+ │  └ BASCUS-97199│◀──────│ BESLES-50330…     v1         │◀────│  ├ BASCUS-97199│
+ ├────────────────┤       ├──────────────────────────────┤     │  └ BESLES-50330│
+ │ Mcd002.ps2     │──────▶│ card ps2:Mcd002 (separate)   │────▶│ Mcd002.ps2     │
+ └────────────────┘       └──────────────────────────────┘     └────────────────┘
 ```
 
-### 2.1 Unit identity
+### 2.4 Unit identity
 
-`unit_id = platform ":" namespace ":" native_name`, for example
-`ps2:default:BASLUS-20312GTA3`.
+`unit_id = platform ":" card ":" native_name`, for example `ps2:Mcd001:BASLUS-20062GTA3`. A card
+in whole-file mode has the single unit `ps2:Mcd001:@card`.
 
-- `native_name` is the name inside the container: the PS2 directory name, the PS1 block
-  filename, or the GCI `gamecode+filename`.
-- `namespace` defaults to `default`. If a device holds two *different* copies of the same unit
-  in two containers (a user who keeps a backup card, for example), the second copy gets the
-  namespace of its container, so the copies never silently overwrite each other.
+- `native_name` is the name inside the card: the PS2 directory name, the PS1 block filename, or
+  the GCI `gamecode+filename`.
+- Because the card is part of the identity, the same save directory on two different cards
+  (a user who keeps a backup copy on `Mcd002`, for example) is two independent units, and the
+  copies never overwrite each other.
 - Each unit is tagged with the **titles** it belongs to, parsed from the name (for PS2, the
-  `BA`/`BE`/`BI` region prefix plus the serial). The tag decides what to pull before a game
-  starts. Saves the parser can't recognise still sync. They are just not pulled ahead of time.
+  `BA`/`BE`/`BI` region prefix plus the serial). The tag decides what to pull first when a game
+  starts, and which per-game container a unit belongs in. Saves the parser can't recognise still
+  sync with their card.
 
-### 2.2 Canonical form and hashing
+### 2.5 Canonical form and hashing
 
 Each format adapter turns a unit into a **canonical form**:
 
@@ -170,7 +237,8 @@ DuckStation) and into closed-source frontends.
 ```
 Repository (one per user / sync space)
  ├─ Device        id (UUIDv7), name, platform, emulator id + version
- ├─ Unit          unit_id, platform, titles[], format_hint
+ ├─ Card          card_id ("ps2:Mcd001"), platform, mode (units | whole-file), HLC
+ ├─ Unit          unit_id, card_id, titles[], format_hint
  │   └─ Version   version_id = BLAKE3(header), parents[0..2], content_hash,
  │                manifest (chunk list), meta {timestamps, icon title, size},
  │                origin device, HLC timestamp, playtime_ms, tombstone?
@@ -192,7 +260,8 @@ Repository (one per user / sync space)
 
 | Table | Purpose |
 |---|---|
-| `containers` | Registered containers: format, location, flags, last-seen fingerprint (size + mtime + quick hash) |
+| `containers` | Registered containers: format, location, logical card, title scope, flags, last-seen fingerprint (size + mtime + quick hash) |
+| `cards` | Logical cards known to the repository and their sync mode |
 | `local_units` | unit_id → container, current local `content_hash`, **base version** (the last version synced at this location) |
 | `versions` | Cache of remote version headers (the full DAG metadata, which is small) |
 | `outbox` | Durable queue of local versions waiting to upload, with blobs staged in `data_dir/staging` |
@@ -245,7 +314,8 @@ Every apply follows the same steps, whatever the format:
   contiguous when it can, as the console does), writes directory entries with the timestamps
   from metadata, updates the FAT, and recomputes ECC for every touched page.
 - **Card full:** `plan_apply` fails with `NO_SPACE`. The unit stays in the inbox and the host
-  gets `ES_EV_APPLY_BLOCKED` with an option to place the unit in a per-game card (§5.4).
+  gets `ES_EV_APPLY_BLOCKED`, so it can tell the user which save didn't fit and suggest freeing
+  space or using a bigger card. The unit is applied automatically once there is room.
 - Prior art to check against: PCSX2's `FolderMemoryCard` (which already converts between folder
   and image at runtime), `mymc`, and `ps2mc-browser`. Golden images from all of them, plus
   console-formatted dumps, go in the test fixtures.
@@ -256,7 +326,7 @@ Every apply follows the same steps, whatever the format:
   (ordering, attributes, timestamps).
 - PCSX2 keeps the folder card in memory while a VM runs and writes it back on flush. Anything
   modified externally while it is open is lost. The adapter therefore **never applies to a
-  folder card that is open** (§6.3).
+  folder card that is open** (§6.4).
 - Because it shares the PS2 canonical form with `ps2.card`, a folder card on macOS and a file
   card on Android sync with no conversion step.
 
@@ -268,20 +338,25 @@ Every apply follows the same steps, whatever the format:
 - `sram`: normalises cartridge save files between emulators (v2, with a quirk table for each
   emulator).
 - `dir`: any directory tree as one unit (PSP `SAVEDATA/*`, Citra/Azahar and others).
-- `raw`: any single file as one opaque unit. This always works and is the fallback.
+- `raw`: any single file as one opaque unit. This always works, and it implements whole-file
+  mode for cards (§2.1). For whole-file cards, apply still goes through the steps above, and
+  step 1 runs the card's format adapter when one exists, so a corrupt image is never published or
+  written.
 
 ### 5.4 Placement: where incoming units go
 
-A unit that is new to a device has to land in some container. The rules, in order:
+Every unit belongs to a logical card, so placement only has to pick which local container of
+that card receives it:
 
 1. If the unit already exists locally, update it in place.
-2. If the unit belongs to the title being started, use the container the host reported as
-   mounted in slot 1 for this session. That might be a per-game card.
-3. Otherwise use the container flagged `ES_CF_DEFAULT_PLACEMENT`.
-4. Otherwise keep it in the inbox and place it the first time its title starts. This is lazy
-   placement, the default on mobile to save storage.
-
-Containers flagged `ES_CF_MIRROR_ALL` receive every unit for their platform during idle syncs.
+2. If the device has a **title-scoped** (per-game) container for this card and the unit's
+   title, use it.
+3. Otherwise use the device's **shared** container for the card (for example `Mcd001.ps2`).
+4. If the device has no container for the card at all (say, Android has only `Mcd001` but the
+   save is on `Mcd002`), keep the unit in the inbox and report `ES_EV_APPLY_BLOCKED` with
+   `ES_E_NOT_FOUND`. It is placed as soon as the host registers a container for that card. The
+   library never creates card files on its own, because the emulator owns their format and
+   settings.
 
 ---
 
@@ -290,8 +365,9 @@ Containers flagged `ES_CF_MIRROR_ALL` receive every unit for their platform duri
 ### 6.1 Repository layout that works on plain storage
 
 The repository is designed so that **no file is ever written by more than one device**. That
-removes any need for locks or compare-and-swap, so it runs unchanged on S3, WebDAV, Dropbox,
-Drive, OneDrive, iCloud, or a Syncthing-shared folder.
+removes any need for locks or compare-and-swap. It runs on S3, the first supported backend
+(§6.2), and the same layout works unchanged on WebDAV, Dropbox, Drive, OneDrive, iCloud, or a
+Syncthing-shared folder when those backends are added.
 
 ```
 emusync/v1/
@@ -306,13 +382,19 @@ emusync/v1/
 Log records (one JSON object per line):
 
 ```json
-{"op":"version","unit":"ps2:default:BASLUS-20312GTA3","id":"b3:…","parents":["b3:…"],
+{"op":"card","card":"ps2:Mcd001","mode":"units","hlc":"2026-10-12T19:40:00.000Z/0000"}
+{"op":"version","unit":"ps2:Mcd001:BASLUS-20062GTA3","id":"b3:…","parents":["b3:…"],
  "content":"b3:…","chunks":["b3:…"],"size":91136,"meta":{"title":"GTA III","mtime":"…"},
  "hlc":"2026-10-18T11:02:07.120Z/0003","playtime_ms":5520000,"titles":["ps2:SLUS-20062"]}
 {"op":"state","id":"…","title":"ps2:SLUS-20062","slot":"resume","compat":"pcsx2:sv=…","chunks":[…],"links":{…}}
 {"op":"lease","title":"ps2:SLUS-20062","expires":"…"}
 {"op":"lease_release","title":"ps2:SLUS-20062"}
 ```
+
+A `card` record is written the first time any device publishes a logical card, and again when
+`es_card_set_mode` changes its mode. The record with the highest HLC wins. When a card switches
+mode, every device takes a final snapshot in the old mode before syncing in the new one, so the
+switch loses no history.
 
 A **sync cycle** works like this:
 
@@ -322,19 +404,116 @@ A **sync cycle** works like this:
 2. **Pull.** For every other device, list `log/` segments past the stored cursor, fetch them,
    and merge the records into the local `versions` table. A new device starts from each
    device's latest `compact/` snapshot instead of replaying every log.
-3. **Reconcile** each affected unit (§6.2).
+3. **Reconcile** each affected unit (§6.3).
 4. **Apply** results to containers that are not in use. Results for containers in use go to the
    inbox.
 
 The cost is one LIST per device per cycle. Each device writes a compaction snapshot every N
 segments, and segments older than everyone's snapshots can be garbage-collected.
 
-**Reference server (optional):** the same records through an HTTP API, plus server push
+**Reference server (later, optional):** the same records through an HTTP API, plus server push
 (WebSocket or long-poll on desktop, FCM/APNs on mobile), atomic blob dedup, quotas, and a web
-UI for history and restore. On plain storage the client polls instead: on title start, on title
-end, when the app returns to the foreground, and on a back-off timer (30 s to 15 min).
+UI for history and restore. On S3 and other plain storage the client polls instead: on title
+start, on title end, when the app returns to the foreground, and on a back-off timer (30 s to
+15 min) while the emulator is open.
 
-### 6.2 Reconciliation for each unit
+### 6.2 S3 backend (first supported remote)
+
+**Scope.** Amazon S3, plus S3-compatible services (Cloudflare R2, Backblaze B2, Wasabi, MinIO,
+and others) through a custom endpoint, with both virtual-hosted and path-style addressing.
+
+```
+s3://<bucket>/<prefix>?region=eu-west-1
+s3://<bucket>/<prefix>?endpoint=https://<account>.r2.cloudflarestorage.com&region=auto
+s3://<bucket>/<prefix>?endpoint=http://nas.local:9000&path_style=1
+```
+
+**How the layout maps onto S3.** Each file in §6.1 is one object under the prefix. Only five
+operations are used:
+
+| Operation | Used for |
+|---|---|
+| `PutObject` with `If-None-Match: *` | Every write: blobs, log segments, compaction snapshots, `device.json`. Writes are create-only. |
+| `GetObject` | Fetching blobs, segments and snapshots |
+| `ListObjectsV2` with `prefix` + `start-after` | Finding new log segments past each device's cursor. Zero-padded hex sequence numbers make lexical order equal log order. |
+| `HeadObject` | Rare existence checks during repair |
+| `DeleteObjects` | Garbage collection only (§7), and only from a device allowed to delete |
+
+Chunks are at most 256 KB and log segments are small, so multipart upload is never needed.
+
+**Create-only writes.** S3 conditional writes (`If-None-Match: *`) enforce the "never overwrite"
+rule on the server:
+
+- On a blob, `412 Precondition Failed` means the blob already exists. Since blobs are named by
+  their contents, that counts as success. The local DB records every content hash seen in any
+  log, so most blobs that already exist are skipped without a request.
+- On a log segment, `412` means another installation is using this device's ID. That happens
+  when an app backup is restored onto a second phone. The device then mints a new ID and writes
+  its segment under that, so the two installs never interleave logs.
+- Conditional-write support differs between S3-compatible providers. Setup probes it once with
+  a test write. If it is missing, the backend falls back to HEAD-before-PUT, which is only racy
+  in the cloned-device case above.
+
+**Consistency.** AWS S3 has strong read-after-write and list-after-write consistency, so a pull
+straight after another device's push sees it. Some S3-compatible services list with a delay.
+The protocol tolerates that, because every write is an append: an object that isn't visible
+yet is fetched on the next cycle, and a missing object is never read as a deletion.
+
+**Credentials.**
+
+- **v1: per-user access keys.** The user creates an IAM user (or an R2/B2 API token) limited
+  to the repository prefix. Least-privilege policy:
+
+  ```json
+  {
+    "Version": "2012-10-17",
+    "Statement": [
+      { "Sid": "ListRepo", "Effect": "Allow", "Action": "s3:ListBucket",
+        "Resource": "arn:aws:s3:::my-saves",
+        "Condition": { "StringLike": { "s3:prefix": ["emusync/v1/*"] } } },
+      { "Sid": "ReadWriteRepo", "Effect": "Allow",
+        "Action": ["s3:GetObject", "s3:PutObject"],
+        "Resource": "arn:aws:s3:::my-saves/emusync/v1/*" }
+    ]
+  }
+  ```
+
+  `s3:DeleteObject` is needed only on the device that runs garbage collection, typically one
+  desktop. Every other device, phones included, can hold keys that can't delete anything. That
+  limits the damage a leaked phone key can do, and with bucket versioning (below) even
+  overwrites are recoverable.
+- The host supplies keys through the **credential provider callback** (`es_credentials`,
+  `ES_CRED_S3`). Platform bindings keep them in the OS keystore, and the library never writes
+  them to `data_dir`.
+- The same callback can return **temporary STS credentials** (with session token and expiry),
+  for example from a Cognito identity pool or a small token-vending service. The library asks
+  for fresh credentials before the current ones expire. This is the path to a hosted offering
+  without changing the protocol.
+
+**Recommended bucket settings.** The `emusync s3 check` CLI command verifies these and prints
+what's missing:
+
+- Block Public Access on, with default encryption (SSE-S3). This is independent of emusync's
+  own end-to-end encryption, which is still recommended (§7).
+- **Versioning on**, with a lifecycle rule that expires noncurrent versions after 30 days. This
+  safety net catches client bugs, including bad garbage collection.
+- A lifecycle rule that aborts incomplete multipart uploads. emusync doesn't use multipart, but
+  other tools sharing the bucket might.
+
+**Implementation.** SigV4 signing via the `aws-sigv4` crate on top of the library's own
+`rustls` HTTP client, rather than the full AWS SDK, which keeps the binary small on mobile. The
+S3 backend implements the same `Remote` trait as future backends.
+
+**Cost.** Requests dominate. Three devices, each polling about 1,500 times a month while
+emulators are open and listing the other two devices' logs each time, come to roughly 9,000
+LIST requests a month, about $0.05 at S3 Standard prices ($0.005 per 1,000). Uploading saves
+adds a few hundred PUTs. Storing saves with history is well under 1 GB. Save states, if enabled,
+are the largest item: about 2 GB for 20 games × 3 slots × 30 MB, roughly $0.05 a month. Downloads
+stay inside AWS's free monthly transfer allowance at this scale. Push notifications aren't
+available from S3 to clients, so latency is bounded by the poll triggers above (game start
+always polls first).
+
+### 6.3 Reconciliation for each unit
 
 Inputs: `L` (the current local content), `B` (the local base version), and `T` (the set of
 remote tips).
@@ -365,7 +544,7 @@ device.
 with the remote by hash. Identical units are adopted silently. Differing ones become conflicts,
 grouped into a single "first sync" prompt: *use cloud / use this device / decide per game*.
 
-### 6.3 When sync happens
+### 6.4 When sync happens
 
 What matters most for correctness is never changing a container while the emulator has it
 open, and never snapshotting a save halfway through being written.
@@ -387,7 +566,7 @@ containers for changes and detects that the emulator is running through a per-em
 exited" trigger. This is less precise than embedded hooks but safe, and it covers unmodified
 PCSX2 on Windows and macOS on day one.
 
-### 6.4 Leases ("playing now")
+### 6.5 Leases ("playing now")
 
 Leases are advisory. They are log records with a 10-minute expiry, renewed every 4 minutes while
 a session is open. Their only job is UX: warning *before* a conflict happens. A device that is
@@ -416,15 +595,20 @@ data.
   - Chunks are encrypted with XChaCha20-Poly1305. Content addresses use keyed BLAKE3, so the
     storage provider can't confirm "this user has save X".
   - Log segments are encrypted as well. Only file names and sizes are visible to the provider.
-- **Credentials:** the library never shows UI. OAuth backends use a host-supplied **token
-  provider callback**. The library ships PKCE helpers (`es_oauth_begin` returns a URL;
-  `es_oauth_complete` takes the redirect), but the host owns the browser or intent.
+- **Credentials:** the library never shows UI. Every backend gets credentials from a
+  host-supplied **credential provider callback**. For S3, the callback returns access keys or
+  temporary STS credentials (§6.2). For OAuth backends added later (Dropbox, Drive, OneDrive),
+  it returns a bearer token, and the library will ship PKCE helpers (`es_oauth_begin` returns a
+  URL; `es_oauth_complete` takes the redirect), with the host owning the browser or intent.
 - **Retention** (configurable):
   - Unit versions: the last 20, plus one per day for 30 days, plus one per month for a year.
     Branch tips and tombstones are kept for at least 30 days.
   - States: the last 3 for each `(title, slot, compat_key)`.
   - Local snapshot store: 100 MB, kept as a ring with LRU eviction, but a unit's most recently
     overwritten version is never evicted.
+  - Remote garbage collection runs only on a device whose credentials allow deletes (on S3,
+    `s3:DeleteObject`, §6.2). It deletes only blobs and segments that no retained version or
+    compaction snapshot refers to.
 - **Metered networks:** each host sets whether states sync on cellular (default: off) and
   whether saves sync on cellular (default: on, since they are small).
 
@@ -478,11 +662,21 @@ memory-card file layer (`FileMcd_*` in `pcsx2/SIO/Memcard/`):
 ```cpp
 // At startup (once)
 es_config cfg = ES_CONFIG_INIT;
-cfg.data_dir = EmuFolders::DataRoot + "/emusync";
+const std::string data_dir = Path::Combine(EmuFolders::DataRoot, "emusync");
+cfg.data_dir = data_dir.c_str();
 cfg.emulator_id = "pcsx2"; cfg.emulator_version = BuildVersion::GitRev;
 es_client* sync = nullptr; es_client_create(&cfg, &sync);
-es_remote_add(sync, Host::GetStringSettingValue("EmuSync", "Remote").c_str(), &token_provider);
-for (each configured card) es_container_add(sync, &desc /* "ps2.card" or "ps2.card.folder" */, &id);
+// e.g. "s3://my-saves/emusync/v1?region=eu-west-1"; keys come from the OS keystore via the callback
+es_remote_add(sync, Host::GetStringSettingValue("EmuSync", "Remote").c_str(), &keystore_credentials);
+
+// Default PCSX2 layout: one file per card. The logical card defaults to the file stem ("Mcd001").
+for (u32 slot = 0; slot < 2; slot++) {
+  es_container_desc d = ES_CONTAINER_DESC_INIT;
+  d.format   = "ps2.card";                        // or "ps2.card.folder" for folder cards
+  const std::string path = MemoryCardPathForSlot(slot);   // PCSX2's configured Mcd00N.ps2
+  d.location = path.c_str();                               // copied by es_container_add
+  es_container_add(sync, &d, &slot_ids[slot]);
+}
 
 // VMManager::Initialize, after the serial is known and BEFORE FileMcd_EmuOpen()
 es_title t = ES_TITLE_INIT; t.platform = "ps2"; t.serial = serial.c_str();
@@ -509,8 +703,10 @@ The ARMSX2 native core shares the PCSX2 hooks above. The Kotlin layer adds:
 
 ```kotlin
 val sync = EmuSync.create(context, EmuSyncConfig(emulatorId = "armsx2", emulatorVersion = BuildConfig.VERSION_NAME))
-sync.addRemote("dropbox:", tokenProvider = DropboxTokens(context))
-sync.addContainer(ContainerDesc(format = "ps2.card", location = cardUri /* content:// works */))
+sync.addRemote("s3://my-saves/emusync/v1?region=eu-west-1", credentials = KeystoreS3Credentials(context))
+// Same default layout as desktop: Mcd001.ps2 / Mcd002.ps2 bind to logical cards Mcd001 / Mcd002
+sync.addContainer(ContainerDesc(format = "ps2.card", location = mcd001Uri /* content:// works */))
+sync.addContainer(ContainerDesc(format = "ps2.card", location = mcd002Uri))
 
 override fun onPause()  { sync.appSuspend(budgetMs = 1500) }    // flush to outbox and schedule WorkManager
 override fun onResume() { sync.appResume() }
@@ -519,11 +715,16 @@ lifecycleScope.launch { sync.events.collect { ui.handle(it) } }
 
 ### 10.3 End-to-end scenario
 
+All three devices use the emulator defaults: `Mcd001.ps2` in slot 1 and `Mcd002.ps2` in slot 2,
+synced to one S3 bucket.
+
 1. **Windows evening:** you play *GTA III* (SLUS-20062). Saving in-game writes
    `Mcd001.ps2`, PCSX2 calls `touched`, and after the debounce the library extracts unit
-   `BASLUS-20062…`, which is new. It uploads version v1 and releases the lease when you quit.
+   `ps2:Mcd001:BASLUS-20062…`, which is new. It uploads version v1 and releases the lease when
+   you quit.
 2. **Mac next morning:** `session_begin(SLUS-20062)` pulls v1 and fast-forwards it into the Mac's
-   folder card, all before PCSX2 opens the card. You play and save, which creates v2 (parent v1).
+   `Mcd001.ps2`, all before PCSX2 opens the card. (It would work the same if the Mac used a
+   folder card.) You play and save, which creates v2 (parent v1).
 3. **Android on the train, offline:** `session_begin` times out after 3 s and play goes ahead on
    the stale v1. You also start *Ratchet & Clank* and save it (a new, independent unit). The GTA
    save becomes v3' (parent v1). Both versions wait in the outbox.
@@ -532,6 +733,9 @@ lifecycleScope.launch { sync.events.collect { ui.handle(it) } }
    conflict. ARMSX2 shows *"GTA III — Mac: today 09:12, 3h41m played · This phone: today 18:40,
    3h05m played"*. You pick one, and a merge version records the choice. The other stays in
    history and can be restored from any device.
+5. **Next idle sync on Windows and Mac:** R&C's save is written into their `Mcd001.ps2` too, so
+   all three cards now hold the same saves. Had `Mcd001` been in whole-file mode, step 4 would
+   instead have been a conflict over the entire card, even with no GTA change on the phone.
 
 ---
 
@@ -542,7 +746,10 @@ lifecycleScope.launch { sync.events.collect { ui.handle(it) } }
 | Process killed mid-upload | Outbox and staged blobs are on disk; the upload resumes on next start or in WorkManager. The log is written only after its blobs, so there are no dangling references. |
 | Killed mid-apply | Atomic rename, or a journalled copy rolled forward on start. The original stays intact until the swap. |
 | Snapshot taken during a multi-step save | Debounce, parse validation, and retry. `flushed` is the authoritative point. |
-| Card full on the target device | `APPLY_BLOCKED` event. The unit stays in the inbox, and the host can offer a per-game card. |
+| Card full on the target device | `APPLY_BLOCKED` event (`ES_E_NO_SPACE`). The unit stays in the inbox and applies once there is room. |
+| Logical card missing on a device (has `Mcd001`, not `Mcd002`) | `APPLY_BLOCKED` event (`ES_E_NOT_FOUND`). Units wait in the inbox until the host registers that card. The library never creates card files itself. |
+| App backup restored onto a second device (cloned device ID) | A create-only S3 write of a log segment fails with `412`. The clone mints a new device ID before writing anything. |
+| S3-compatible provider with delayed listing | Objects not yet listed are picked up next cycle. Absence is never read as deletion. |
 | Clock skew between devices | Ordering comes from the DAG. HLC is used only for display and tie-breaks. |
 | Corrupt or malicious remote data | Hash verification. Parsers are fuzzed and bounds-checked. Applies are verified before the swap. A bad container is never modified. |
 | Different card sizes or formats on each device | Units are format-independent. Placement only checks for free space. |
@@ -560,10 +767,11 @@ emusync/
   crates/
     emusync-core/       model, sync engine, local DB, scheduler
     emusync-formats/    ps2mc, ps1mc, gc, sram, dir, raw adapters (no I/O deps; pure parse/build)
-    emusync-remote/     backends behind a `Remote` trait
+    emusync-remote/     `Remote` trait; S3 first (SigV4 + rustls), in-memory remote for tests
     emusync-ffi/        C ABI, event queue, struct-size versioning
-    emusyncd/           sidecar daemon + `emusync` CLI (inspect cards, export .psu, restore versions)
-    emusync-server/     reference server (axum + Postgres/SQLite + S3 blobs)
+    emusyncd/           sidecar daemon + `emusync` CLI (inspect cards, export .psu, restore
+                        versions, `s3 check`)
+    emusync-server/     reference server (later)
   include/emusync.h     the C ABI contract (checked in; CI fails if cbindgen output drifts)
   bindings/cpp/         emusync.hpp: RAII wrappers, std::string_view, expected<>
   bindings/android/     Gradle module → AAR (JNI + Kotlin)
@@ -588,8 +796,13 @@ event and released explicitly. `es_abi_version()` lets a host refuse a mismatche
 - **Simulated sync:** a deterministic multi-device simulator with an in-memory remote and
   injected partitions, crashes, and clock skew. The invariant to check: every version ever
   created stays reachable, and all devices converge once they are connected.
-- **Backend conformance suite** run against every `Remote`, including eventually-consistent
-  listing (S3, Drive) and slow propagation (Syncthing folders).
+- **Backend conformance suite** run against every `Remote`. For S3: MinIO in CI on every
+  change, plus nightly runs against AWS S3 and at least one S3-compatible service (such as R2).
+  The suite covers conditional-write behaviour, the HEAD-before-PUT fallback, and an injected
+  delayed-listing mode.
+- **Card-mode tests:** both unit mode and whole-file mode for the same card fixtures, a switch
+  between modes in the middle of a session, and mixed layouts (file card ↔ folder card ↔
+  per-game card).
 - **Device lab:** the Windows → macOS → Android scenario from §10.3, scripted, run on every
   release.
 
@@ -599,10 +812,10 @@ event and released explicitly. `es_abi_version()` lets a host refuse a mismatche
 
 | Milestone | Scope |
 |---|---|
-| **M0: Core** | Data model, DAG reconciliation, SQLite state, outbox/inbox, `folder` remote, `raw` adapter, CLI. Syncs any file between machines through a Syncthing or Dropbox folder. |
-| **M1: PS2** | `ps2.card` + `ps2.card.folder` adapters with full round-trip and fuzz coverage. `emusyncd` with a PCSX2 profile for Windows/macOS/Linux. |
-| **M2: Embedded + mobile** | C ABI freeze (v1), C++ header, Android AAR with SAF VFS. ARMSX2 fork and PCSX2 fork integrations. WebDAV, S3, Dropbox, Google Drive backends. E2E encryption. |
-| **M3: States + server** | Save states with compat keys, links, and the `resume` slot. Reference server with push and leases. Handoff. |
+| **M0: Core + S3** | Data model, DAG reconciliation, SQLite state, outbox/inbox, **S3 backend** (AWS + MinIO), `raw` adapter, logical cards with **whole-file mode**, CLI. Already useful: `Mcd001.ps2` syncs between machines as a whole file. |
+| **M1: PS2** | `ps2.card` + `ps2.card.folder` adapters with full round-trip and fuzz coverage, making unit mode the default for PS2 cards. `emusyncd` with a PCSX2 profile for Windows/macOS/Linux. |
+| **M2: Embedded + mobile** | C ABI freeze (v1), C++ header, Android AAR with SAF VFS and keystore-backed S3 credentials. ARMSX2 fork and PCSX2 fork integrations. E2E encryption. |
+| **M3: States + more backends** | Save states with compat keys, links, and the `resume` slot. STS temporary credentials. Further backends (WebDAV, Dropbox, Google Drive) on the same layout. Reference server with push, leases and handoff if the hosted question (§15) is answered yes. |
 | **M4: More platforms** | PS1 (DuckStation, SwanStation/Beetle in RetroArch), GameCube (Dolphin), cartridge SRAM normalisation, PSP. RetroArch frontend integration. |
 
 ## 15. Open questions
@@ -616,5 +829,11 @@ event and released explicitly. `es_abi_version()` lets a host refuse a mismatche
 4. **Per-game card naming:** PCSX2 and ARMSX2 support per-game cards with different naming
    conventions. Placement handles either, but the default should match what each emulator
    expects.
-5. **Hosted service:** is a first-party server in scope (with operating cost and privacy
-   obligations), or BYO storage only?
+5. **Hosted service:** with S3 first, a hosted offering could be a managed bucket plus STS
+   credential vending rather than a custom server. Is that in scope, or is it bring-your-own
+   bucket only?
+6. **S3 onboarding:** creating an IAM user and pasting keys is a hurdle for non-technical users.
+   Should M0 ship a guided setup (CloudFormation template or `emusync s3 init`) that creates the
+   bucket, policy and keys?
+7. **S3-compatible providers:** which ones are tested and supported at launch (R2, B2, Wasabi,
+   MinIO)?
