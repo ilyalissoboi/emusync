@@ -95,8 +95,9 @@ enum RemoteCmd {
 
 #[derive(Subcommand)]
 enum CardCmd {
-    /// Register a memory card file. The logical card name defaults to the file stem, so
-    /// Mcd001.ps2 on every device is the same card.
+    /// Register a memory card: a card file, or a PCSX2 folder card (a directory with a
+    /// _pcsx2_superblock). The logical card name defaults to the file stem, so Mcd001.ps2 on
+    /// every device is the same card, whether it is a file or a folder.
     Add {
         path: PathBuf,
         /// Logical card name (default: file stem, e.g. Mcd001).
@@ -105,7 +106,7 @@ enum CardCmd {
         /// Platform (default: from the extension, e.g. .ps2 → ps2).
         #[arg(long)]
         platform: Option<String>,
-        /// Upload from this file but never write to it.
+        /// Upload from this card but never write to it.
         #[arg(long)]
         read_only: bool,
     },
@@ -122,7 +123,7 @@ enum CardCmd {
         #[arg(long)]
         no_sync: bool,
     },
-    /// List the saves in a card file without registering or changing it.
+    /// List the saves in a card file or folder card without registering or changing it.
     Inspect { path: PathBuf },
 }
 
@@ -232,9 +233,16 @@ fn target_of(unit: &str) -> String {
 }
 
 fn inspect(path: &Path) -> AnyResult<()> {
-    let image = std::fs::read(path)?;
-    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let fmt = emusync_formats::detect(&name, &image);
+    let (image, fmt) = if path.is_dir() {
+        let image = emusync_core::fsutil::read_tree(path)?.encode();
+        let fmt = emusync_formats::detect_dir(&image).ok_or("not a PCSX2 folder memory card (no _pcsx2_superblock)")?;
+        (image, fmt)
+    } else {
+        let image = std::fs::read(path)?;
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let fmt = emusync_formats::detect(&name, &image);
+        (image, fmt)
+    };
     println!("{}: {}, format {}", path.display(), human_size(image.len() as u64), fmt.id());
     fmt.validate(&image).map_err(|e| format!("not a valid card: {e}"))?;
     if !fmt.supports_units() {
@@ -243,7 +251,7 @@ fn inspect(path: &Path) -> AnyResult<()> {
     }
     let saves = fmt.extract_all(&image)?;
     if saves.is_empty() {
-        if emusync_formats::ps2::is_unformatted(&image) {
+        if emusync_formats::ps2::is_unformatted(&image) || emusync_formats::ps2::folder::is_unformatted(&image) {
             println!("unformatted (empty); emusync formats it when the first save arrives");
         } else {
             println!("no saves");
@@ -286,9 +294,9 @@ fn run(cli: Cli) -> AnyResult<ExitCode> {
             }
         }
         Cmd::Card(CardCmd::Add { path, name, platform, read_only }) => {
-            if !path.is_file() {
+            if !path.is_file() && !path.is_dir() {
                 return Err(format!(
-                    "{} is not a file (emusync never creates card files; create the card in the emulator first)",
+                    "{} does not exist (emusync never creates cards; create the card in the emulator first)",
                     path.display()
                 )
                 .into());
