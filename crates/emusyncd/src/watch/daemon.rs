@@ -7,10 +7,13 @@
 //!   Local changes are still snapshotted and uploaded.
 //! - When the emulator exits, a cycle applies whatever waited.
 //! - The remote is polled on a back-off timer, and right away when the emulator starts.
+//! - Folder cards (DESIGN §19) are hashed as tree images and watched recursively. emusync's own
+//!   directory replace swaps the folder, so its watch is renewed afterwards.
 
 use super::process::ProcessProbe;
 use super::profile::Profile;
-use emusync_core::{short_id, split_unit, ContainerDesc, ContainerRow, Engine, SyncReport};
+use emusync_core::{fsutil, short_id, split_unit, ContainerDesc, ContainerRow, Engine, SyncReport};
+use emusync_formats::ContainerKind;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -71,13 +74,20 @@ pub struct Cycle {
     pub held_back: usize,
 }
 
-/// Hash of a card file's content, to tell a real write from our own reads, our own applies or
-/// a spurious event. Size and mtime are not enough: cards have a fixed size, and a coarse mtime
-/// can miss a second write within the same tick.
+/// Hash of a card's content, to tell a real write from our own reads, our own applies or a
+/// spurious event. Size and mtime are not enough: cards have a fixed size, and a coarse mtime
+/// can miss a second write within the same tick. A folder card is hashed as its tree image,
+/// modification times included, as the engine reads it.
 type Fingerprint = Option<blake3::Hash>;
 
-fn fingerprint(path: &Path) -> Fingerprint {
-    std::fs::read(path).ok().map(|b| blake3::hash(&b))
+fn fingerprint(path: &Path, folder: bool) -> Fingerprint {
+    let image = if folder { fsutil::read_tree(path).map(|t| t.encode()) } else { std::fs::read(path) };
+    image.ok().map(|b| blake3::hash(&b))
+}
+
+/// Whether a registered card is a directory (a folder card) rather than a file.
+fn is_folder(c: &ContainerRow) -> bool {
+    emusync_formats::by_id(&c.format).is_some_and(|f| f.kind() == ContainerKind::Directory)
 }
 
 /// Paths compare without regard to case on Windows and macOS, whose file systems usually
@@ -90,6 +100,14 @@ fn path_key(path: &Path) -> String {
     } else {
         s.to_string()
     }
+}
+
+/// A folder to watch for changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WatchDir {
+    pub path: PathBuf,
+    /// Watch everything under it: folder cards keep saves in subdirectories.
+    pub recursive: bool,
 }
 
 /// The engine reports this reason for units it routed to the inbox because of `set_busy`.
@@ -110,6 +128,10 @@ pub struct Daemon<P> {
     poll_interval: Duration,
     /// Card fingerprints as of the last cycle, by path key.
     fingerprints: HashMap<String, Fingerprint>,
+    /// Registered folder cards, by path key.
+    folders: HashMap<String, PathBuf>,
+    /// Folder cards that were replaced, so their recursive watch follows the old directory.
+    rewatch: Vec<PathBuf>,
     /// Card files that discovery could not register (warned about once).
     skipped: HashSet<String>,
     /// Units held back by the last cycle (logged once, not on every poll).
@@ -134,6 +156,8 @@ impl<P: ProcessProbe> Daemon<P> {
             poll_interval: timing.poll_min,
             timing,
             fingerprints: HashMap::new(),
+            folders: HashMap::new(),
+            rewatch: Vec::new(),
             skipped: HashSet::new(),
             held: HashSet::new(),
             offline: false,
@@ -159,33 +183,71 @@ impl<P: ProcessProbe> Daemon<P> {
         t
     }
 
-    /// Folders to watch: those holding registered cards, plus the profiles' card folders
-    /// when discovery is on.
-    pub fn watch_dirs(&self) -> Vec<PathBuf> {
-        let mut dirs: Vec<PathBuf> = self
-            .engine
-            .containers()
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|c| Path::new(&c.location).parent().map(Path::to_path_buf))
-            .collect();
-        if self.discover {
-            dirs.extend(self.profiles.iter().flat_map(|p| p.card_dirs.iter().cloned()));
+    /// Folders to watch: those holding registered cards, registered folder cards themselves
+    /// (recursively), plus the profiles' card folders when discovery is on.
+    pub fn watch_dirs(&self) -> Vec<WatchDir> {
+        let flat = |path: &Path| WatchDir { path: path.to_path_buf(), recursive: false };
+        let mut dirs = Vec::new();
+        for c in self.engine.containers().unwrap_or_default() {
+            let p = Path::new(&c.location);
+            dirs.extend(p.parent().map(flat));
+            if is_folder(&c) {
+                dirs.push(WatchDir { path: p.to_path_buf(), recursive: true });
+            }
         }
-        dirs.retain(|d| d.is_dir());
-        dirs.sort_by_key(|d| path_key(d));
-        dirs.dedup_by_key(|d| path_key(d));
+        if self.discover {
+            dirs.extend(self.profiles.iter().flat_map(|p| p.card_dirs.iter().map(|d| flat(d))));
+        }
+        dirs.retain(|d| d.path.is_dir());
+        dirs.sort_by(|a, b| path_key(&a.path).cmp(&path_key(&b.path)).then(b.recursive.cmp(&a.recursive)));
+        dirs.dedup_by(|later, first| path_key(&later.path) == path_key(&first.path));
         dirs
     }
 
-    /// A file in a watched folder changed. Only card files arm the debounce.
+    /// Folder cards whose watch must be dropped and set up again: the directory was replaced
+    /// (by our own apply, or from outside), and the old watch follows the old directory.
+    pub fn take_rewatch(&mut self) -> Vec<PathBuf> {
+        let mut cards = std::mem::take(&mut self.rewatch);
+        cards.sort_by_key(|p| path_key(p));
+        cards.dedup_by_key(|p| path_key(p));
+        cards
+    }
+
+    /// A path in a watched folder was created, removed or renamed. A folder card replaced
+    /// that way (by another program; our own applies are handled in the cycle) needs a new
+    /// watch. Writes inside a folder card also report the folder as modified, but those keep it.
+    pub fn on_moved(&mut self, path: &Path) {
+        if let Some(card) = self.folders.get(&path_key(path)) {
+            self.rewatch.push(card.clone());
+        }
+    }
+
+    /// A path in a watched folder changed. Only changes to cards arm the debounce: a card
+    /// file, anything inside a folder card, or a new folder that may become one.
     pub fn on_event(&mut self, path: &Path, now: Instant) {
-        let key = path_key(path);
-        let is_card = self.profiles.iter().any(|p| p.claims(path)) || self.fingerprints.contains_key(&key);
+        // emusync's own replace works in sibling scratch paths (DESIGN §19.3).
+        if path.ancestors().any(fsutil::is_scratch) {
+            return;
+        }
+        let is_card = path.ancestors().any(|a| self.fingerprints.contains_key(&path_key(a)))
+            || self.profiles.iter().any(|p| p.claims(path))
+            || self.may_become_folder_card(path);
         if is_card {
             log::debug!("change: {}", path.display());
             self.last_change = Some(now);
         }
+    }
+
+    /// A new folder in a card folder: PCSX2 creates a folder card's directory before its
+    /// superblock file, and the card folder's flat watch doesn't see the superblock arrive.
+    fn may_become_folder_card(&self, path: &Path) -> bool {
+        let Some(parent) = path.parent().map(path_key) else { return false };
+        self.discover
+            && path.is_dir()
+            && self
+                .profiles
+                .iter()
+                .any(|p| p.folder_card_marker.is_some() && p.card_dirs.iter().any(|d| path_key(d) == parent))
     }
 
     fn want(&mut self, t: Trigger) {
@@ -285,7 +347,7 @@ impl<P: ProcessProbe> Daemon<P> {
         let containers = self.engine.containers().unwrap_or_default();
         containers.iter().any(|c| {
             let p = Path::new(&c.location);
-            self.fingerprints.get(&path_key(p)) != Some(&fingerprint(p))
+            self.fingerprints.get(&path_key(p)) != Some(&fingerprint(p, is_folder(c)))
         }) || !self.undiscovered().is_empty()
     }
 
@@ -340,6 +402,7 @@ impl<P: ProcessProbe> Daemon<P> {
         let containers = self.engine.containers()?;
         let mut busy = HashSet::new();
         let mut before = HashMap::new();
+        self.folders.clear();
         for c in &containers {
             let p = Path::new(&c.location);
             let in_use = self.in_use(p);
@@ -347,14 +410,23 @@ impl<P: ProcessProbe> Daemon<P> {
             if in_use {
                 busy.insert(c.card_id.clone());
             }
-            before.insert(path_key(p), fingerprint(p));
+            let folder = is_folder(c);
+            if folder {
+                self.folders.insert(path_key(p), p.to_path_buf());
+            }
+            before.insert(path_key(p), fingerprint(p, folder));
         }
         let report = self.engine.sync()?;
         // Fingerprints from before the cycle, so a write that lands during it still counts as
         // a change; cards this cycle wrote are re-read.
         for a in &report.applied {
             let p = Path::new(&a.location);
-            before.insert(path_key(p), fingerprint(p));
+            let key = path_key(p);
+            let folder = self.folders.contains_key(&key);
+            if folder {
+                self.rewatch.push(p.to_path_buf());
+            }
+            before.insert(key, fingerprint(p, folder));
         }
         self.fingerprints = before;
         Ok((report, busy))
@@ -485,6 +557,7 @@ mod tests {
                 id: "fake".into(),
                 name: "FakeEmu".into(),
                 card_extensions: vec!["bin".into()],
+                folder_card_marker: None,
                 processes: vec![EMU.into()],
                 card_dirs: vec![card.parent().unwrap().to_path_buf()],
                 lock_files: vec![],
@@ -671,6 +744,7 @@ mod tests {
             id: "fake".into(),
             name: "FakeEmu".into(),
             card_extensions: vec!["bin".into()],
+            folder_card_marker: None,
             processes: vec![EMU.into()],
             card_dirs: vec![card_a.parent().unwrap().to_path_buf()],
             lock_files: vec![],
@@ -691,5 +765,238 @@ mod tests {
         assert_eq!(std::fs::read(&card_a).unwrap(), b"v1 from b");
         let history = d.engine().history("card").unwrap();
         assert!(history.iter().any(|h| d.engine().read_version(&h.version.id).unwrap() == b"v1 from a"));
+    }
+
+    mod folder {
+        //! A PCSX2 folder card on device A, run by the daemon, against a `.ps2` card file on B.
+
+        use super::*;
+        use emusync_formats::ps2::mcfs::{Node, NodeKind, MODE_DIR_DEFAULT, MODE_FILE_DEFAULT};
+        use emusync_formats::ps2::{blank_card, decode, encode, layout, LAYOUT_META};
+        use emusync_formats::tree::EntryKind;
+        use emusync_formats::{ApplyOp, Canonical, ContainerFormat, Ps2Card, Ps2Folder};
+        use std::collections::BTreeMap;
+
+        const PCSX2: &str = "pcsx2-qt.exe";
+        const OTHER: &str = "otheremu.exe";
+        const GTA: &str = "BASLUS-20062GTA3";
+        const RAC: &str = "BASCUS-97199RAC";
+        const T: [u8; 8] = [0, 0, 30, 12, 18, 10, 0xEA, 0x07];
+
+        fn save(name: &str, data: &[u8]) -> ApplyOp {
+            let file = |n: &[u8], d: &[u8]| Node {
+                name: n.to_vec(),
+                mode: MODE_FILE_DEFAULT,
+                attr: 0,
+                created: T,
+                modified: T,
+                kind: NodeKind::File(d.to_vec()),
+            };
+            let node = Node {
+                name: name.as_bytes().to_vec(),
+                mode: MODE_DIR_DEFAULT,
+                attr: 0,
+                created: T,
+                modified: T,
+                kind: NodeKind::Dir(vec![file(b"icon.sys", &[0x50; 964]), file(b"data", data)]),
+            };
+            ApplyOp::Put(Canonical {
+                name: name.into(),
+                bytes: encode(&node),
+                meta: [(LAYOUT_META.to_string(), layout(&node))].into(),
+            })
+        }
+
+        /// Save name → its `data` file.
+        fn saves(fmt: &dyn ContainerFormat, image: &[u8]) -> BTreeMap<String, Vec<u8>> {
+            fmt.extract_all(image)
+                .unwrap()
+                .into_iter()
+                .map(|c| {
+                    let NodeKind::Dir(files) = decode(&c, T).unwrap().kind else { panic!("{} is a file", c.name) };
+                    let data = files.into_iter().find(|f| f.name == b"data").map(|f| match f.kind {
+                        NodeKind::File(d) => d,
+                        NodeKind::Dir(_) => vec![],
+                    });
+                    (c.name, data.unwrap_or_default())
+                })
+                .collect()
+        }
+
+        fn folder_saves(card: &Path) -> BTreeMap<String, Vec<u8>> {
+            saves(&Ps2Folder, &fsutil::read_tree(card).unwrap().encode())
+        }
+
+        fn file_saves(card: &Path) -> BTreeMap<String, Vec<u8>> {
+            saves(&Ps2Card, &std::fs::read(card).unwrap())
+        }
+
+        /// PCSX2 flushes a save into the open folder card: files written in place, no rename.
+        fn pcsx2_writes(card: &Path, op: ApplyOp) {
+            let image = Ps2Folder.apply(&fsutil::read_tree(card).unwrap().encode(), &[op]).unwrap();
+            for (rel, entry) in emusync_formats::tree::Tree::decode(&image).unwrap().entries {
+                let p = rel.split('/').fold(card.to_path_buf(), |p, s| p.join(s));
+                match entry.kind {
+                    EntryKind::Dir => std::fs::create_dir_all(&p).unwrap(),
+                    EntryKind::File(data) => std::fs::write(&p, data).unwrap(),
+                }
+            }
+        }
+
+        fn other_saves(b: &mut Engine, card: &Path, op: ApplyOp) {
+            let image = Ps2Card.apply(&std::fs::read(card).unwrap(), &[op]).unwrap();
+            std::fs::write(card, image).unwrap();
+            assert_eq!(b.sync().unwrap().uploaded_versions, 1);
+        }
+
+        fn profile(id: &str, ext: &str, marker: Option<&str>, process: &str, card_dirs: Vec<PathBuf>) -> Profile {
+            Profile {
+                id: id.into(),
+                name: id.into(),
+                card_extensions: vec![ext.into()],
+                folder_card_marker: marker.map(Into::into),
+                processes: vec![process.into()],
+                card_dirs,
+                lock_files: vec![],
+            }
+        }
+
+        #[test]
+        fn folder_card_changes_sync_and_wait_while_pcsx2_runs() {
+            let w = World::new();
+            let t0 = Instant::now();
+
+            // A: a new folder card, as PCSX2 creates it (a directory with an empty superblock),
+            // named without an extension.
+            let memcards = w.dir.path().join("a").join("memcards");
+            let card_a = memcards.join("Mcd001");
+            std::fs::create_dir_all(&card_a).unwrap();
+            std::fs::write(card_a.join("_pcsx2_superblock"), b"").unwrap();
+            let profiles = vec![
+                profile("pcsx2", "ps2", Some("_pcsx2_superblock"), PCSX2, vec![memcards.clone()]),
+                profile("other", "srm", None, OTHER, vec![]),
+            ];
+            let probe = FakeProbe::default();
+            let mut d = Daemon::new(w.engine("a"), profiles, probe.clone(), Timing::default(), true, t0);
+            let c = d.tick(t0).expect("startup cycle");
+            assert!(!c.failed);
+            let containers = d.engine().containers().unwrap();
+            assert_eq!(containers.len(), 1, "folder card discovered");
+            assert_eq!(containers[0].format, "ps2.card.folder");
+            assert_eq!(
+                d.watch_dirs(),
+                [
+                    WatchDir { path: memcards.clone(), recursive: false },
+                    WatchDir { path: std::path::absolute(&card_a).unwrap(), recursive: true },
+                ]
+            );
+
+            // B: the same logical card as a card file.
+            let mut b = w.engine("b");
+            let dir_b = w.dir.path().join("b").join("memcards");
+            std::fs::create_dir_all(&dir_b).unwrap();
+            let card_b = dir_b.join("Mcd001.ps2");
+            std::fs::write(&card_b, blank_card(8192, true, T)).unwrap();
+            b.add_container(ContainerDesc { location: card_b.clone(), ..Default::default() }).unwrap();
+            b.sync().unwrap();
+
+            // PCSX2 saves on A, deep inside the folder: the debounced cycle uploads it.
+            pcsx2_writes(&card_a, save(GTA, b"gta v1"));
+            d.on_event(&card_a.join(GTA).join("data"), t0 + s(5.0));
+            d.on_event(&card_a.join("_pcsx2_superblock"), t0 + s(5.1));
+            let c = d.tick(t0 + s(7.2)).expect("debounced cycle");
+            assert_eq!(c.trigger, Trigger::Changed);
+            b.sync().unwrap();
+            assert_eq!(file_saves(&card_b), [(GTA.to_string(), b"gta v1".to_vec())].into());
+
+            // emusync's own scratch paths never count as changes, even ones holding a superblock.
+            let tmp = fsutil::temp_path(&card_a);
+            std::fs::create_dir(&tmp).unwrap();
+            std::fs::write(tmp.join("_pcsx2_superblock"), b"").unwrap();
+            for p in [tmp.join(GTA).join("data"), tmp.clone(), fsutil::journal_path(&card_a), fsutil::old_path(&card_a)]
+            {
+                d.on_event(&p, t0 + s(8.0));
+            }
+            assert!(d.tick(t0 + s(10.5)).is_none());
+            std::fs::remove_dir_all(&tmp).unwrap();
+
+            // Another emulator runs: PCSX2's profile claims the folder card, so it isn't busy and
+            // B's save is applied at the next poll.
+            probe.set(&[OTHER]);
+            assert_eq!(d.tick(t0 + s(13.0)).expect("cycle on start").trigger, Trigger::Started);
+            other_saves(&mut b, &card_b, save(RAC, b"rac v1"));
+            let mut t = t0 + s(13.0) + d.poll_interval();
+            let c = d.tick(t).expect("poll");
+            assert_eq!((c.applied, c.held_back), (1, 0));
+            assert_eq!(folder_saves(&card_a)[RAC], b"rac v1");
+            // The apply swapped the folder, so its recursive watch is renewed.
+            let rewatch = d.take_rewatch();
+            assert_eq!(rewatch.len(), 1);
+            assert_eq!(path_key(&rewatch[0]), path_key(&card_a));
+            // Neither the swap's events nor the old folder's deletion (which Windows reports
+            // under the card's path) are new saves.
+            d.on_event(&card_a, t + s(0.1));
+            d.on_event(&card_a.join(GTA).join("data"), t + s(0.2));
+            assert!(d.tick(t + s(2.5)).is_none());
+            // Another program replacing the folder renews the watch too; writes inside don't.
+            d.on_moved(&card_a.join(GTA));
+            assert!(d.take_rewatch().is_empty());
+            d.on_moved(&card_a);
+            assert_eq!(d.take_rewatch().len(), 1);
+
+            // PCSX2 starts: the folder card is busy, so B's next save waits in the inbox.
+            probe.set(&[OTHER, PCSX2]);
+            t += s(5.0);
+            assert_eq!(d.tick(t).expect("cycle on start").trigger, Trigger::Started);
+            other_saves(&mut b, &card_b, save(RAC, b"rac v2"));
+            t += d.poll_interval();
+            let c = d.tick(t).expect("poll");
+            assert_eq!((c.applied, c.held_back), (0, 1));
+            assert_eq!(folder_saves(&card_a)[RAC], b"rac v1");
+            assert_eq!(d.engine().inbox().unwrap().len(), 1);
+            assert!(d.take_rewatch().is_empty());
+
+            // PCSX2 exits: the waiting save is applied right away.
+            probe.set(&[OTHER]);
+            let c = d.tick(t + s(2.0)).expect("cycle on exit");
+            assert_eq!((c.trigger, c.applied, c.held_back), (Trigger::Exited, 1, 0));
+            assert_eq!(
+                folder_saves(&card_a),
+                [(GTA.to_string(), b"gta v1".to_vec()), (RAC.to_string(), b"rac v2".to_vec())].into()
+            );
+            assert!(d.engine().inbox().unwrap().is_empty());
+        }
+
+        #[test]
+        fn new_folder_cards_are_discovered() {
+            let w = World::new();
+            let t0 = Instant::now();
+            let memcards = w.dir.path().join("a").join("memcards");
+            std::fs::create_dir_all(&memcards).unwrap();
+            std::fs::write(memcards.join("Mcd001.ps2"), blank_card(8192, true, T)).unwrap();
+            let profiles = vec![profile("pcsx2", "ps2", Some("_pcsx2_superblock"), PCSX2, vec![memcards.clone()])];
+            let mut d = Daemon::new(w.engine("a"), profiles, FakeProbe::default(), Timing::default(), true, t0);
+            d.tick(t0).expect("startup cycle");
+            assert_eq!(d.engine().containers().unwrap().len(), 1);
+
+            // PCSX2 creates a folder card: the directory first (the only event the card folder's
+            // flat watch reports), then its superblock.
+            let card = memcards.join("Mcd002");
+            std::fs::create_dir(&card).unwrap();
+            d.on_event(&card, t0 + s(1.0));
+            std::fs::write(card.join("_pcsx2_superblock"), b"").unwrap();
+            let c = d.tick(t0 + s(3.1)).expect("new card");
+            assert_eq!(c.trigger, Trigger::Changed);
+            let formats: Vec<String> = d.engine().containers().unwrap().into_iter().map(|c| c.format).collect();
+            assert_eq!(formats.len(), 2);
+            assert!(formats.contains(&"ps2.card.folder".to_string()), "{formats:?}");
+
+            // A folder that never becomes a card is looked at once and left alone.
+            let other = memcards.join("screenshots");
+            std::fs::create_dir(&other).unwrap();
+            d.on_event(&other, t0 + s(4.0));
+            assert!(d.tick(t0 + s(6.1)).is_none());
+            assert_eq!(d.engine().containers().unwrap().len(), 2);
+        }
     }
 }

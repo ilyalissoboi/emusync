@@ -2,6 +2,7 @@
   "id": "pcsx2",
   "name": "PCSX2",
   "card_extensions": ["ps2"],
+  "folder_card_marker": "_pcsx2_superblock",
   "windows": {
     "processes": [
       "pcsx2-qt.exe",

@@ -70,11 +70,22 @@ pub fn run(mut engine: Engine, args: &WatchArgs) -> AnyResult<()> {
         if let Some(c) = daemon.tick(Instant::now()) {
             log::debug!("{} cycle done{}", c.trigger, if c.failed { " (failed)" } else { "" });
         }
+        for card in daemon.take_rewatch() {
+            if watched.remove(&(card.clone(), true)) {
+                // Fails if the old directory is already gone, which is fine.
+                let _ = watcher.unwatch(&card);
+            }
+        }
         for dir in daemon.watch_dirs() {
-            if watched.insert(dir.clone()) {
-                match watcher.watch(&dir, RecursiveMode::NonRecursive) {
-                    Ok(()) => log::debug!("watching {}", dir.display()),
-                    Err(e) => log::warn!("can't watch {} ({e}); its cards sync on each poll", dir.display()),
+            if watched.insert((dir.path.clone(), dir.recursive)) {
+                let mode = if dir.recursive { RecursiveMode::Recursive } else { RecursiveMode::NonRecursive };
+                match watcher.watch(&dir.path, mode) {
+                    Ok(()) => log::debug!(
+                        "watching {}{}",
+                        dir.path.display(),
+                        if dir.recursive { " recursively" } else { "" }
+                    ),
+                    Err(e) => log::warn!("can't watch {} ({e}); its cards sync on each poll", dir.path.display()),
                 }
             }
         }
@@ -91,6 +102,17 @@ pub fn run(mut engine: Engine, args: &WatchArgs) -> AnyResult<()> {
                     if write_close || !matches!(event.kind, EventKind::Access(_)) {
                         for path in &event.paths {
                             daemon.on_event(path, Instant::now());
+                        }
+                    }
+                    let moved = matches!(
+                        event.kind,
+                        EventKind::Create(_)
+                            | EventKind::Remove(_)
+                            | EventKind::Modify(notify::event::ModifyKind::Name(_))
+                    );
+                    if moved {
+                        for path in &event.paths {
+                            daemon.on_moved(path);
                         }
                     }
                 }
