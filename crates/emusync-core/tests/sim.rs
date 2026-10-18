@@ -556,3 +556,58 @@ fn run_random(seed: u64, steps: usize) {
     }
     assert_all_readable(&devs[1], &ids);
 }
+
+#[test]
+fn a_later_segment_visible_before_an_earlier_one_is_not_skipped() {
+    let remote = Arc::new(MemoryRemote::default());
+    let mut a = Device::new(&remote, "a", &card_image(90), ConflictPolicy::Ask);
+    a.sync();
+    a.write(&card_image(91));
+    a.sync();
+    let mut b = Device::new(&remote, "b", &card_image(90), ConflictPolicy::Ask);
+    // Segment 1 of A isn't listed yet, segment 2 is.
+    let me = a.engine.device_id().unwrap();
+    let seg1 = format!("devices/{me}/log/{:016x}.ndjson", 1);
+    let hidden = remote.raw_delete(&seg1).unwrap();
+    let r = b.sync();
+    assert_eq!(r.pulled_records, 0, "nothing past the gap may be read");
+    remote.raw_put(&seg1, &hidden);
+    b.sync();
+    // B also published its own first-sync version meanwhile; what matters is that segment 1
+    // was read once it became visible.
+    assert!(a.versions().is_subset(&b.versions()), "a version from segment 1 was skipped");
+}
+
+/// A second, distinct repository.
+struct OtherRemote(MemoryRemote);
+
+impl Remote for OtherRemote {
+    fn describe(&self) -> String {
+        "memory://other".into()
+    }
+    fn put(&self, key: &str, data: &[u8], if_none_match: bool) -> emusync_remote::Result<PutOutcome> {
+        self.0.put(key, data, if_none_match)
+    }
+    fn get(&self, key: &str) -> emusync_remote::Result<Option<Vec<u8>>> {
+        self.0.get(key)
+    }
+    fn head(&self, key: &str) -> emusync_remote::Result<bool> {
+        self.0.head(key)
+    }
+    fn list(&self, prefix: &str, start_after: Option<&str>) -> emusync_remote::Result<Vec<String>> {
+        self.0.list(prefix, start_after)
+    }
+    fn list_dirs(&self, prefix: &str) -> emusync_remote::Result<Vec<String>> {
+        self.0.list_dirs(prefix)
+    }
+}
+
+#[test]
+fn a_data_dir_stays_bound_to_its_remote() {
+    let remote = Arc::new(MemoryRemote::default());
+    let mut a = Device::new(&remote, "a", &card_image(95), ConflictPolicy::Ask);
+    a.sync();
+    a.engine.add_remote(a.link.clone()).expect("re-adding the same remote is fine");
+    let err = a.engine.add_remote(Arc::new(OtherRemote(MemoryRemote::default()))).unwrap_err();
+    assert!(err.to_string().contains("already bound"), "{err}");
+}

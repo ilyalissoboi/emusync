@@ -95,6 +95,11 @@ impl MemoryRemote {
         self.objects.lock().unwrap().get(key).map(|o| o.data.clone())
     }
 
+    /// Removes an object behind the protocol's back (to simulate one that isn't visible yet).
+    pub fn raw_delete(&self, key: &str) -> Option<Vec<u8>> {
+        self.objects.lock().unwrap().remove(key).map(|o| o.data)
+    }
+
     /// Overwrites an object behind the protocol's back (for corruption tests).
     pub fn raw_put(&self, key: &str, data: &[u8]) {
         self.objects.lock().unwrap().insert(key.to_string(), Object { data: data.to_vec(), visible_from: 0 });
