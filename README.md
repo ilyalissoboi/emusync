@@ -3,16 +3,18 @@
 Native library enabling seamless cloud-based save sync between game emulators on different
 platforms. Design: [docs/DESIGN.md](docs/DESIGN.md). C API contract: [include/emusync.h](include/emusync.h).
 
-**Status: M0.** Memory cards sync as whole files (byte-identical mirrors) through Amazon S3 or
-any S3-compatible service, with full version history and conflict detection. Per-save sync
-for PS2 cards is M1.
+**Status: M1.** PS2 memory cards (`.ps2`, the PCSX2/ARMSX2 default) sync **per save** through
+Amazon S3 or any S3-compatible service: saves of different games played offline on different
+devices merge without conflicts, and every save has its own version history. Other card
+formats sync as whole files (byte-identical mirrors). Folder cards and a background watcher
+for unmodified PCSX2 come next.
 
 ## Crates
 
 | Crate | Purpose |
 |---|---|
 | `emusync-core` | Data model, version DAG, SQLite state, sync engine |
-| `emusync-formats` | Container format adapters (M0: `raw`) |
+| `emusync-formats` | Container format adapters: `ps2.card` (PS2 memory card file system), `raw` |
 | `emusync-remote` | `Remote` trait, S3 backend (SigV4 + rustls), in-memory remote, conformance suite |
 | `emusync-ffi` | C ABI (stub in M0) |
 | `emusyncd` | The `emusync` command-line tool |
@@ -26,14 +28,21 @@ export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=...
 # On every device (the card name defaults to the file stem, so Mcd001.ps2 matches everywhere):
 emusync remote add "s3://my-saves/emusync/v1?region=eu-west-1"
 emusync card add ~/PCSX2/memcards/Mcd001.ps2
-emusync sync
+emusync sync                               # run with the emulator closed
 
-emusync card list
-emusync history Mcd001
-emusync restore Mcd001 <version>
+emusync card list                          # cards and the saves on them
+emusync card inspect Mcd002.ps2            # list the saves in any card file (read-only)
+emusync history BASLUS-20062GTA3           # a save's versions
+emusync restore BASLUS-20062GTA3 <version>
 emusync conflicts
-emusync resolve Mcd001 --take <version>    # or --keep-local
+emusync resolve BASLUS-20062GTA3 --take <version>    # or --keep-local
 ```
+
+A new card that PCSX2 created but nothing has formatted yet (every byte `0xFF`) counts as
+empty; emusync formats it when the first save arrives. Cards synced by M0 as whole files keep
+working; to switch one to per-save sync, run `emusync card add <file>` again on each device,
+then `emusync card mode Mcd001 units` on one of them. `emusync card mode Mcd001 whole-file`
+goes back to byte-identical mirrors.
 
 For MinIO or other S3-compatible services:
 `s3://<bucket>/<prefix>?endpoint=http://nas.local:9000&path_style=1`.

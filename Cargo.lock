@@ -453,6 +453,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "emusync-core",
+ "emusync-formats",
  "emusync-remote",
  "log",
  "tempfile",

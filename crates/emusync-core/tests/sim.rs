@@ -95,7 +95,7 @@ impl Device {
     }
 
     fn tips(&self) -> Vec<String> {
-        self.engine.cards().unwrap()[0].tips.clone()
+        self.engine.cards().unwrap()[0].units[0].tips.clone()
     }
 }
 

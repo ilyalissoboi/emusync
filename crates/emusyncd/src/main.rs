@@ -1,13 +1,15 @@
-//! `emusync` command-line tool (DESIGN §12). M0: whole-file card sync through S3.
+//! `emusync` command-line tool (DESIGN §12): memory card sync through S3, per save for PS2
+//! cards (unit mode) or as whole files.
 //!
 //! S3 credentials come from `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and optionally
 //! `AWS_SESSION_TOKEN`; they are never written to the data directory.
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use emusync_core::{
-    short_id, ConflictPolicy, ContainerDesc, Engine, EngineOptions, HistoryEntry, Resolution, SyncReport,
+    short_id, split_unit, CardMode, ConflictPolicy, ContainerDesc, Engine, EngineOptions, HistoryEntry, Resolution,
+    SyncReport,
 };
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -37,11 +39,15 @@ enum Cmd {
     Card(CardCmd),
     /// Pull, snapshot local changes, apply remote changes, push.
     Sync(SyncArgs),
-    /// List every version of a card, newest first.
-    History { card: String },
+    /// List every version of a save (or of a card in whole-file mode), newest first.
+    History {
+        /// A save (e.g. BASLUS-20062GTA3), or a card in whole-file mode (e.g. Mcd001).
+        target: String,
+    },
     /// Make an old version current again (creates a new version), then sync.
     Restore {
-        card: String,
+        /// A save (e.g. BASLUS-20062GTA3), or a card in whole-file mode (e.g. Mcd001).
+        target: String,
         version: String,
         /// Only record the restore locally; don't run a sync afterwards.
         #[arg(long)]
@@ -49,9 +55,10 @@ enum Cmd {
     },
     /// List open conflicts.
     Conflicts,
-    /// Resolve a card's open conflict, then sync.
+    /// Resolve an open conflict, then sync.
     Resolve {
-        card: String,
+        /// A save (e.g. BASLUS-20062GTA3), or a card in whole-file mode (e.g. Mcd001).
+        target: String,
         /// Keep this device's version.
         #[arg(long, conflicts_with = "take")]
         keep_local: bool,
@@ -88,10 +95,29 @@ enum CardCmd {
         #[arg(long)]
         read_only: bool,
     },
-    /// List cards known locally or in the repository.
+    /// List cards known locally or in the repository, with their saves.
     List,
     /// Stop syncing a card file on this device (history is kept).
     Remove { card: String },
+    /// Choose how a card syncs, on every device, then sync.
+    Mode {
+        card: String,
+        #[arg(value_enum)]
+        mode: ModeArg,
+        /// Only record the change locally; don't run a sync afterwards.
+        #[arg(long)]
+        no_sync: bool,
+    },
+    /// List the saves in a card file without registering or changing it.
+    Inspect { path: PathBuf },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ModeArg {
+    /// Each save syncs separately; saves of different games never conflict (PS2 default).
+    Units,
+    /// The card file syncs as one unit: byte-identical copies everywhere.
+    WholeFile,
 }
 
 #[derive(Args)]
@@ -157,7 +183,44 @@ fn attach(engine: &mut Engine) -> AnyResult<bool> {
     }
 }
 
+/// The argument that names a unit in commands: the save name, or the card for `@card`.
+fn target_of(unit: &str) -> String {
+    match split_unit(unit) {
+        Some((card, "@card")) => card.to_string(),
+        Some((_, name)) => name.to_string(),
+        None => unit.to_string(),
+    }
+}
+
+fn inspect(path: &Path) -> AnyResult<()> {
+    let image = std::fs::read(path)?;
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let fmt = emusync_formats::detect(&name, &image);
+    println!("{}: {}, format {}", path.display(), human_size(image.len() as u64), fmt.id());
+    fmt.validate(&image).map_err(|e| format!("not a valid card: {e}"))?;
+    if !fmt.supports_units() {
+        println!("no save-level support for this format; it syncs as a whole file");
+        return Ok(());
+    }
+    let saves = fmt.extract_all(&image)?;
+    if saves.is_empty() {
+        if emusync_formats::ps2::is_unformatted(&image) {
+            println!("unformatted (empty); emusync formats it when the first save arrives");
+        } else {
+            println!("no saves");
+        }
+    }
+    for s in saves {
+        println!("  {:<32} {:>10}  {}", s.name, human_size(s.bytes.len() as u64), fmt.titles(&s.name).join(", "));
+    }
+    Ok(())
+}
+
 fn run(cli: Cli) -> AnyResult<ExitCode> {
+    if let Cmd::Card(CardCmd::Inspect { path }) = &cli.cmd {
+        inspect(path)?;
+        return Ok(ExitCode::SUCCESS);
+    }
     let mut engine = open(&cli)?;
     match &cli.cmd {
         Cmd::Remote(RemoteCmd::Add { uri }) => {
@@ -201,10 +264,13 @@ fn run(cli: Cli) -> AnyResult<ExitCode> {
             let card = engine
                 .cards()?
                 .into_iter()
-                .find(|c| c.location.as_deref().map(PathBuf::from) == std::path::absolute(path).ok())
-                .map(|c| c.card_id)
-                .unwrap_or_default();
-            println!("{} → card {card} (whole-file mode)", path.display());
+                .find(|c| c.location.as_deref().map(PathBuf::from) == std::path::absolute(path).ok());
+            let (card_id, mode) = card.map(|c| (c.card_id, c.mode)).unwrap_or((String::new(), CardMode::WholeFile));
+            let mode = match mode {
+                CardMode::Units => "unit mode: each save syncs separately",
+                CardMode::WholeFile => "whole-file mode",
+            };
+            println!("{} → card {card_id} ({mode})", path.display());
             println!("run `emusync sync` to upload it or pull the cloud copy");
         }
         Cmd::Card(CardCmd::List) => {
@@ -213,33 +279,54 @@ fn run(cli: Cli) -> AnyResult<ExitCode> {
                 println!("no cards (run `emusync card add <file>`)");
             }
             for c in cards {
-                let state = if c.conflict.is_some() {
-                    "CONFLICT".to_string()
-                } else if c.location.is_none() {
-                    "not on this device".to_string()
-                } else if c.local_version.is_some() && c.tips.len() == 1 && c.local_version.as_ref() == c.tips.first() {
-                    "in sync".to_string()
-                } else if c.local_version.is_none() {
-                    "not synced yet".to_string()
-                } else {
-                    "behind".to_string()
-                };
-                println!("{:<16} {:<11} {:<18} {}", c.card_id, c.mode.as_str(), state, c.location.unwrap_or_default());
-                if let Some(reason) = c.inbox {
-                    println!("{:<16} waiting to apply: {reason}", "");
+                let location = c.location.clone().unwrap_or_else(|| "not on this device".into());
+                match c.mode {
+                    CardMode::WholeFile => {
+                        let state = c.units.first().map_or("not synced yet", |u| u.state());
+                        println!("{:<16} {:<11} {:<18} {location}", c.card_id, c.mode.as_str(), state);
+                        if let Some(reason) = c.units.first().and_then(|u| u.inbox.clone()) {
+                            println!("{:<16} waiting to apply: {reason}", "");
+                        }
+                    }
+                    CardMode::Units => {
+                        let n = c.units.iter().filter(|u| !u.deleted).count();
+                        println!("{:<16} {:<11} {n} save(s)  {location}", c.card_id, c.mode.as_str());
+                        for u in &c.units {
+                            if u.deleted && !u.present && u.conflict.is_none() {
+                                continue;
+                            }
+                            println!("    {:<32} {:<18} {}", u.name, u.state(), u.titles.join(", "));
+                            if let Some(reason) = &u.inbox {
+                                println!("    {:<32} waiting to apply: {reason}", "");
+                            }
+                        }
+                    }
                 }
             }
         }
         Cmd::Card(CardCmd::Remove { card }) => {
-            let unit = engine.resolve_unit(card)?;
+            let card_id = engine.resolve_card(card)?;
             let c = engine
                 .containers()?
                 .into_iter()
-                .find(|c| unit.starts_with(&format!("{}:", c.card_id)))
+                .find(|c| c.card_id == card_id)
                 .ok_or_else(|| format!("{card} has no container on this device"))?;
             engine.remove_container(c.id)?;
             println!("stopped syncing {} ({})", c.card_id, c.location);
         }
+        Cmd::Card(CardCmd::Mode { card, mode, no_sync }) => {
+            let mode = match mode {
+                ModeArg::Units => CardMode::Units,
+                ModeArg::WholeFile => CardMode::WholeFile,
+            };
+            engine.set_card_mode(card, mode)?;
+            println!("{card} now syncs in {} mode on every device", mode.as_str());
+            if !no_sync && attach(&mut engine)? {
+                let report = engine.sync()?;
+                print_report(&engine, &report)?;
+            }
+        }
+        Cmd::Card(CardCmd::Inspect { .. }) => unreachable!("handled before opening the engine"),
         Cmd::Sync(args) => {
             if !attach(&mut engine)? {
                 return Err("no remote configured (run `emusync remote add <uri>`)".into());
@@ -251,9 +338,9 @@ fn run(cli: Cli) -> AnyResult<ExitCode> {
             let report = engine.sync()?;
             print_report(&engine, &report)?;
         }
-        Cmd::History { card } => {
-            let unit = engine.resolve_unit(card)?;
-            let entries = engine.history(card)?;
+        Cmd::History { target } => {
+            let unit = engine.resolve_unit(target)?;
+            let entries = engine.history(&unit)?;
             println!("{unit}");
             if entries.is_empty() {
                 println!("  no versions yet");
@@ -262,8 +349,8 @@ fn run(cli: Cli) -> AnyResult<ExitCode> {
                 print_entry(&e);
             }
         }
-        Cmd::Restore { card, version, no_sync } => {
-            let rec = engine.restore(card, version)?;
+        Cmd::Restore { target, version, no_sync } => {
+            let rec = engine.restore(target, version)?;
             println!("restored {} as new version {}", short_id(&rec.content), short_id(&rec.id));
             if !no_sync && attach(&mut engine)? {
                 let report = engine.sync()?;
@@ -280,11 +367,12 @@ fn run(cli: Cli) -> AnyResult<ExitCode> {
                 for t in &c.tips {
                     print_entry(t);
                 }
-                println!("  resolve with `emusync resolve <card> --keep-local` or `--take <version>`");
+                let target = target_of(&c.unit);
+                println!("  resolve with `emusync resolve {target} --keep-local` or `--take <version>`");
             }
         }
-        Cmd::Resolve { card, keep_local, take } => {
-            let unit = engine.resolve_unit(card)?;
+        Cmd::Resolve { target, keep_local, take } => {
+            let unit = engine.resolve_unit(target)?;
             let conflict = engine
                 .conflicts()?
                 .into_iter()
@@ -320,6 +408,9 @@ fn print_entry(e: &HistoryEntry) {
     }
     if v.parents.is_empty() {
         tags.push("first".to_string());
+    }
+    if v.tombstone {
+        tags.push("deleted".to_string());
     }
     if let Some(from) = v.meta.get("restored_from") {
         tags.push(format!("restore of {}", short_id(from)));

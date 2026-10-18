@@ -873,3 +873,54 @@ Where the M0 code differs from or pins down the design above:
 10. **CLI.** S3 credentials come from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` /
     `AWS_SESSION_TOKEN` and are never stored. `emusync sync` defaults to the `ask` policy
     (`--policy newest` for unattended use).
+
+## 17. Implementation notes (M1: PS2 cards in unit mode)
+
+1. **Units are root entries.** Each entry in the card's root directory is a unit, normally a
+   save directory. Unit names are the raw entry names decoded as Latin-1 (lossless; plain
+   ASCII for real saves). Titles come from the name (`BASLUS-20062GTA3` → `ps2:SLUS-20062`).
+2. **Canonical form.** A tree of names, modes, attributes and file contents, with each
+   directory's children sorted by name. Timestamps and on-card entry order go in the
+   `ps2.layout` meta field, which is restored on apply but not hashed. The unused fields of
+   directory entries are not kept.
+3. **Rebuild, not patch.** Applying changes rewrites the whole allocatable area and the FAT
+   (§5.1 described first-fit allocation). Entries are laid out contiguously in directory
+   order: rebuilt cards are never fragmented, and two cards holding the same saves in the same
+   order are byte-identical. Free clusters are erased to `0xFF`. The superblock, indirect FAT
+   and backup blocks are copied unchanged. Changed saves keep their position in the root
+   directory; new ones are appended.
+4. **ECC** is recomputed for every page written (three bytes per 128-byte chunk, then four
+   zero bytes) and is not checked on read: pages that were never written have none, and
+   emulators don't check it either.
+5. **Unformatted cards.** PCSX2 creates new card files with every byte `0xFF` and leaves
+   formatting to the PS2 BIOS (the cards on the development machine were in this state). An
+   image like that, of a standard size, is an empty card. The first apply formats it with
+   PCSX2's folder-card layout (8 MB: 41 reserved clusters, 8,135 allocatable; card flags
+   `0x2B`), stamped with the first incoming save's creation time. This is what lets a fresh
+   card on a new device receive every save from the cloud.
+6. **Not rewritten.** Cards listing bad blocks, or whose root directory doesn't start at the
+   first allocatable cluster, are read and uploaded but never written to. Apply reports them as
+   unsupported.
+7. **Deletions** become tombstone versions that delete the save on other devices and stay in
+   history. One exception: if two or more saves disappear and the card is left empty, the card
+   was most likely replaced or reformatted. The saves are restored from the cloud instead of
+   being deleted everywhere, and the sync reports a warning.
+8. **Apply** writes every change for a card in one rebuild. If that fails (card full, or a save
+   the adapter rejects), it applies changes one at a time, deletions first. Saves that still
+   don't fit wait in the inbox with a reason and apply automatically once there is room. Before
+   the swap, every save on the rebuilt card is re-extracted and compared with what it should
+   hold, both changed and untouched ones.
+9. **Mode switching** (`es_card_set_mode`, `emusync card mode`) snapshots the card in its old
+   mode, then publishes the new mode. Identical saves on different devices are adopted, not
+   duplicated, so switching a card that was in sync creates no conflicts. Re-adding a card
+   registered as `raw` by M0 switches its container to `ps2.card`. Switching back to
+   whole-file mode usually raises one conflict per card: cards holding the same saves need not
+   be byte-identical, so each device's image is a different version. Either side is fine to
+   take.
+10. **`card list` reads the card file**, so saves that haven't synced yet are listed too.
+11. **Not yet:** folder cards (§5.2), per-game title-scoped containers (§2.2), the sidecar
+    watcher (§6.4), in-game titles from `icon.sys` (Shift-JIS), and a cargo-fuzz target. The
+    parsers are covered by randomized tests instead (corrupted cards and saves must be rejected
+    without panicking; random apply sequences are checked against a model). The PS2 adapter
+    has not been tested against cards written by a real PS2 BIOS or by PCSX2 with saves on
+    them, because the only real cards available were unformatted.
