@@ -42,6 +42,8 @@ pub const MODE_HIDDEN: u16 = 0x2000;
 pub const MODE_EXISTS: u16 = 0x8000;
 /// Mode of a directory created by the PS2 browser or mymc.
 pub const MODE_DIR_DEFAULT: u16 = MODE_EXISTS | MODE_0400 | MODE_DIR | MODE_READ | MODE_WRITE | MODE_EXECUTE;
+/// Mode of a directory's ".." entry (`0xA426`): hidden, not readable.
+const MODE_DOTDOT: u16 = (MODE_DIR_DEFAULT & !MODE_READ) | MODE_HIDDEN;
 /// Mode of a file created by a typical game (`0x8497`).
 pub const MODE_FILE_DEFAULT: u16 = MODE_EXISTS | MODE_0400 | 0x0080 | MODE_FILE | MODE_READ | MODE_WRITE | MODE_EXECUTE;
 
@@ -525,9 +527,13 @@ impl Writer {
             NodeKind::Dir(children) => {
                 let count = children.len() as u64 + 2;
                 let first = self.alloc(div_ceil(count, ENTRIES_PER_CLUSTER as u64))?;
+                // As mcman, mymc and PCSX2's folder cards write them: the "." entry is the link
+                // to the parent (the parent directory's first cluster and this directory's slot
+                // in it), which is what `..` path lookups follow; the ".." entry is a hidden
+                // placeholder whose cluster and slot are 0.
                 let mut slots = vec![
                     dirent(mode, 0, &node.created, parent_first, slot, &node.modified, 0, b"."),
-                    dirent(mode, 0, &node.created, 0, 0, &node.modified, 0, b".."),
+                    dirent(MODE_DOTDOT, 0, &node.created, 0, 0, &node.modified, 0, b".."),
                 ];
                 for (i, child) in children.iter().enumerate() {
                     slots.push(self.place(child, first, i as u32 + 2, depth + 1)?);
@@ -615,7 +621,7 @@ pub fn blank_card(clusters_per_card: u32, ecc: bool, time: [u8; 8]) -> Vec<u8> {
         w.write_cluster(ifc + 1 + k, &data);
     }
     let dot = dirent(MODE_DIR_DEFAULT, 2, &time, 0, 0, &time, 0, b".");
-    let dotdot = dirent((MODE_DIR_DEFAULT & !MODE_READ) | MODE_HIDDEN, 0, &time, 0, 0, &time, 0, b"..");
+    let dotdot = dirent(MODE_DOTDOT, 0, &time, 0, 0, &time, 0, b"..");
     let mut root = [0u8; CLUSTER];
     root[..ENTRY].copy_from_slice(&dot);
     root[ENTRY..].copy_from_slice(&dotdot);
@@ -685,6 +691,34 @@ mod tests {
         // Removing everything returns to the blank card's allocatable area.
         let empty = back.build(&out, &[]).unwrap();
         assert!(Card::parse(&empty).unwrap().entries.is_empty());
+    }
+
+    #[test]
+    fn dot_entries_link_back_to_the_parent() {
+        let img = blank_card(8192, false, T);
+        let card = Card::parse(&img).unwrap();
+        let nested = dir("SAVE", vec![file("f", b"1"), dir("sub", vec![file("x", b"2")])]);
+        let out = card.build(&img, &[file("a", b"x"), nested]).unwrap();
+        // Rebuilt chains are contiguous, so slot n of a directory is in its cluster first + n / 2.
+        let entry = |first: u32, slot: u32| -> Vec<u8> {
+            let data = read_cluster(&out, PAGE, card.alloc_offset + first + slot / 2).unwrap();
+            data[(slot % 2) as usize * ENTRY..][..ENTRY].to_vec()
+        };
+        // Root: ".", "..", "a", "SAVE". SAVE: ".", "..", "f", "sub".
+        let save = entry(0, 3);
+        assert_eq!(entry_name(&save), b"SAVE");
+        let save_first = u32_at(&save, 0x10);
+        let (save_dot, save_dotdot) = (entry(save_first, 0), entry(save_first, 1));
+        assert_eq!((u32_at(&save_dot, 0x10), u32_at(&save_dot, 0x14)), (0, 3), "SAVE is slot 3 of the root");
+        assert_eq!(u16_at(&save_dotdot, 0), 0xA426);
+        let sub = entry(save_first, 3);
+        assert_eq!(entry_name(&sub), b"sub");
+        let sub_dot = entry(u32_at(&sub, 0x10), 0);
+        assert_eq!((u32_at(&sub_dot, 0x10), u32_at(&sub_dot, 0x14)), (save_first, 3), "sub is slot 3 of SAVE");
+        assert_eq!(
+            Card::parse(&out).unwrap().entries[1],
+            dir("SAVE", vec![file("f", b"1"), dir("sub", vec![file("x", b"2")])])
+        );
     }
 
     #[test]
