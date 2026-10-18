@@ -14,7 +14,7 @@ use emusync_core::{short_id, split_unit, ContainerDesc, ContainerRow, Engine, Sy
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
 pub struct Timing {
@@ -71,13 +71,13 @@ pub struct Cycle {
     pub held_back: usize,
 }
 
-/// Size and modification time: enough to tell a real write from our own reads or a spurious
-/// event. A missed change is still caught by the next poll, which scans every card.
-type Fingerprint = Option<(u64, SystemTime)>;
+/// Hash of a card file's content, to tell a real write from our own reads, our own applies or
+/// a spurious event. Size and mtime are not enough: cards have a fixed size, and a coarse mtime
+/// can miss a second write within the same tick.
+type Fingerprint = Option<blake3::Hash>;
 
 fn fingerprint(path: &Path) -> Fingerprint {
-    let m = std::fs::metadata(path).ok()?;
-    Some((m.len(), m.modified().ok()?))
+    std::fs::read(path).ok().map(|b| blake3::hash(&b))
 }
 
 /// Paths compare without regard to case on Windows and macOS, whose file systems usually
@@ -615,9 +615,19 @@ mod tests {
         let c = d.tick(next_poll + s(1.6)).expect("settled");
         assert_eq!(c.trigger, Trigger::Changed);
 
+        // A same-size write that keeps the old mtime is still a change.
+        let mtime = std::fs::metadata(&card_a).unwrap().modified().unwrap();
+        std::fs::write(&card_a, b"v4").unwrap();
+        std::fs::File::options().write(true).open(&card_a).unwrap().set_modified(mtime).unwrap();
+        d.on_event(&card_a, next_poll + s(1.7));
+        let c = d.tick(next_poll + s(3.8)).expect("same size, same mtime, new content");
+        assert_eq!(c.trigger, Trigger::Changed);
+        b.sync().unwrap();
+        assert_eq!(std::fs::read(&card_b).unwrap(), b"v4");
+
         // Events for other files don't arm the debounce.
-        d.on_event(&card_a.with_extension("bin.emusync-tmp"), next_poll + s(2.0));
-        assert!(d.tick(next_poll + s(4.5)).is_none());
+        d.on_event(&card_a.with_extension("bin.emusync-tmp"), next_poll + s(4.0));
+        assert!(d.tick(next_poll + s(6.5)).is_none());
     }
 
     #[test]

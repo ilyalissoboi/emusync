@@ -77,7 +77,8 @@ emulator is open.
 
 Emulators are described by JSON profiles (`crates/emusyncd/profiles/`): process names, default
 card folders and card file extensions for each OS, plus optional lock files that exist only
-while the emulator runs. `--profile my-emulator.json` loads another one, and `--profile` can be
+while the emulator runs (each OS section needs at least one of the two). `--profile
+my-emulator.json` loads another one, and `--profile` can be
 repeated. Cards that no watched profile claims are written only while none of the watched
 emulators is running.
 

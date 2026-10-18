@@ -12,6 +12,7 @@ name = "emusync"
 path = "src/main.rs"
 
 [dependencies]
+blake3.workspace = true
 emusync-core.workspace = true
 emusync-formats.workspace = true
 emusync-remote.workspace = true

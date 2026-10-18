@@ -4,7 +4,8 @@ use std::collections::HashSet;
 
 /// Reports which processes are running.
 pub trait ProcessProbe {
-    /// Names of the running processes (executable file names, e.g. `pcsx2-qt.exe`).
+    /// Names of the running processes (e.g. `pcsx2-qt.exe`), and their executables' file names
+    /// where known, since some systems shorten process names.
     fn running(&mut self) -> HashSet<String>;
 }
 
@@ -24,9 +25,16 @@ impl ProcessProbe for SystemProbe {
         self.sys.refresh_processes_specifics(
             sysinfo::ProcessesToUpdate::All,
             true,
-            sysinfo::ProcessRefreshKind::nothing(),
+            sysinfo::ProcessRefreshKind::nothing().with_exe(sysinfo::UpdateKind::OnlyIfNotSet),
         );
-        self.sys.processes().values().map(|p| p.name().to_string_lossy().into_owned()).collect()
+        let mut names = HashSet::new();
+        for p in self.sys.processes().values() {
+            names.insert(p.name().to_string_lossy().into_owned());
+            if let Some(exe) = p.exe().and_then(|e| e.file_name()) {
+                names.insert(exe.to_string_lossy().into_owned());
+            }
+        }
+        names
     }
 }
 
@@ -58,7 +66,6 @@ mod tests {
         let me = std::env::current_exe().unwrap();
         let name = me.file_name().unwrap().to_string_lossy().into_owned();
         let running = SystemProbe::new().running();
-        // Linux truncates process names to 15 bytes.
-        assert!(running.iter().any(|p| name.starts_with(p.as_str())), "{name} not in the process list");
+        assert!(running.contains(&name), "{name} not in the process list");
     }
 }

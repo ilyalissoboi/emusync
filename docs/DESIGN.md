@@ -931,15 +931,20 @@ Where the M0 code differs from or pins down the design above:
    `--profile file.json`). Each lists, per OS, process names (matched without regard to case),
    default card folders (`{home}`, `{documents}`, `{config}`, `{data}` placeholders, resolved
    with the `dirs` crate so redirected Documents folders work) and optional lock files, plus the
-   card file extensions the emulator owns. PCSX2 ships built in.
+   card file extensions the emulator owns. PCSX2 ships built in. A profile must give the current
+   OS at least one process name or lock file, or it is rejected: without one the emulator would
+   never look busy. Process names are compared with both the reported name and the executable's
+   file name, and a 15-byte name (Linux truncates `comm`) also matches a longer profile name it
+   starts.
 2. **Busy is per card.** Before every cycle, each container is marked busy (`Engine::set_busy`)
    if an emulator whose profile claims its extension is running. Cards no profile claims are
    busy whenever any watched emulator runs. Busy cards are still snapshotted and uploaded; only
    applies wait in the inbox. Process lists come from `sysinfo` every 2 s, behind a
    `ProcessProbe` trait so tests use a fake.
 3. **Triggers.** File events (`notify`, non-recursive, on the folders holding cards) arm a 2 s
-   debounce. When it expires, a cycle runs only if a card's size or mtime changed, so the
-   watcher's own reads and applies don't loop. Emulator start (poll at once, cards now busy) and
+   debounce. When it expires, a cycle runs only if a card's content hash changed, so the
+   watcher's own reads and applies don't loop. (Size and mtime are not enough: cards have a
+   fixed size, and coarse mtimes can hide a second write.) Emulator start (poll at once, cards now busy) and
    exit (apply the inbox) each run a cycle. A cycle due while writes are still settling waits
    for them, except on exit. Polls back off from 30 s to 15 min, doubling after a poll with no
    news or with the remote unreachable, and resetting after anything else.

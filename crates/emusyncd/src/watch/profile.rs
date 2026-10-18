@@ -5,6 +5,9 @@
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
+/// Longest process name Linux reports (`TASK_COMM_LEN` minus the terminator).
+const LINUX_COMM_LEN: usize = 15;
+
 const BUILT_IN: &[(&str, &str)] = &[("pcsx2", include_str!("../../profiles/pcsx2.json"))];
 
 /// What a profile file contains: per-OS settings plus the card file extensions it owns.
@@ -117,10 +120,16 @@ impl Profile {
             Os::Linux => f.linux,
         };
         let expand = |v: &[String]| v.iter().filter_map(|p| folders.expand(p)).collect::<Vec<_>>();
+        let processes: Vec<String> = section.processes.into_iter().filter(|p| !p.trim().is_empty()).collect();
+        let lock_files = expand(&section.lock_files);
+        // Without a way to tell that the emulator runs, its cards could be written while open.
+        if processes.is_empty() && lock_files.is_empty() {
+            return Err(format!("profile {:?} lists no processes or lock files for {os:?}", f.id));
+        }
         Ok(Self {
             card_dirs: expand(&section.card_dirs),
-            lock_files: expand(&section.lock_files),
-            processes: section.processes,
+            lock_files,
+            processes,
             card_extensions: f.card_extensions.iter().map(|e| e.trim_start_matches('.').to_ascii_lowercase()).collect(),
             id: f.id,
             name: f.name,
@@ -149,9 +158,17 @@ impl Profile {
             .is_some_and(|e| self.card_extensions.contains(&e))
     }
 
-    /// Whether `process` (a running process's name) is this emulator.
+    /// Whether `process` (a running process's name or executable file name) is this emulator.
+    ///
+    /// Linux reports process names cut to 15 bytes, so a 15-byte name that starts one of the
+    /// profile's names matches too. A false match only delays applying downloads.
     pub fn matches_process(&self, process: &str) -> bool {
-        self.processes.iter().any(|p| p.eq_ignore_ascii_case(process))
+        self.processes.iter().any(|p| {
+            p.eq_ignore_ascii_case(process)
+                || (process.len() == LINUX_COMM_LEN
+                    && p.len() > LINUX_COMM_LEN
+                    && p.as_bytes()[..LINUX_COMM_LEN].eq_ignore_ascii_case(process.as_bytes()))
+        })
     }
 
     /// Card files in the default folders, sorted.
@@ -213,6 +230,18 @@ mod tests {
     }
 
     #[test]
+    fn truncated_linux_process_names_match() {
+        let json = r#"{"id":"x","name":"X","card_extensions":["a"],
+            "linux":{"processes":["duckstation-qt-x64","short"]}}"#;
+        let p = Profile::parse(json, Os::Linux, &folders()).unwrap();
+        assert!(p.matches_process("duckstation-qt-"), "15-byte truncation");
+        assert!(p.matches_process("duckstation-qt-x64"), "full executable name");
+        assert!(!p.matches_process("duckstation-q"), "shorter than the kernel limit: another program");
+        assert!(!p.matches_process("shor"));
+        assert!(!p.matches_process("duckstation-qt-x"));
+    }
+
+    #[test]
     fn unknown_folders_drop_the_path_and_bad_profiles_are_rejected() {
         let json = r#"{"id":"x","name":"X","card_extensions":[".SRM"],
             "linux":{"processes":["x"],"card_dirs":["{data}/x","/abs/x"],"lock_files":["{home}/x.lock"]}}"#;
@@ -224,6 +253,12 @@ mod tests {
         assert!(
             Profile::parse(r#"{"id":"x","name":"X","card_extensions":["a"],"typo":1}"#, Os::Linux, &folders()).is_err()
         );
+        let no_signal = r#"{"id":"x","name":"X","card_extensions":["a"],"windows":{"processes":["x.exe"]},
+            "linux":{"processes":[" "],"lock_files":["{data}/x.lock"]}}"#;
+        let e = Profile::parse(no_signal, Os::Linux, &folders()).unwrap_err();
+        assert!(e.contains("no processes or lock files"), "{e}");
+        assert!(Profile::parse(no_signal, Os::Mac, &folders()).is_err(), "missing OS section");
+        assert!(Profile::parse(no_signal, Os::Windows, &folders()).is_ok());
         assert!(Profile::load("nope").is_err());
         assert!(Profile::load("PCSX2").is_ok());
     }
