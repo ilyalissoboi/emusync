@@ -971,8 +971,34 @@ Where the M0 code differs from or pins down the design above:
    is skipped with one warning.
 5. **Reporting.** `SyncReport::resolved` lists units the `newest` policy merged, so the log can
    say which saves diverged and where the losing version is kept.
-6. **Not yet:** running as a service or tray app, graceful shutdown with a final sync, and
-   PCSX2 portable installs (cards next to the executable; register them with `card add`).
+6. **Shutdown.** Ctrl+C, SIGTERM/SIGHUP (`ctrlc` crate) or a `watch.stop` file in the data
+   directory stop the loop between cycles, so a running cycle always finishes. Then
+   `Daemon::shutdown` runs a final cycle unless an emulator is running (its card may be
+   halfway through a write; its settled saves were already uploaded). A second Ctrl+C exits
+   at once. The watcher keeps `watch.pid` in the data directory while it runs; a second
+   watcher on the same directory refuses to start. The stop file exists because the
+   windowless watcher on Windows has no console to signal.
+7. **Starting at login (`emusync service`, `crates/emusyncd/src/service/`).** Per user and
+   without admin rights: a Task Scheduler task with a logon trigger for the current user,
+   `InteractiveToken`, `LeastPrivilege`, no time limit, allowed on battery, restart on failure
+   (registered from UTF-16 XML with `schtasks /Create /XML`); a LaunchAgent with `RunAtLoad`
+   and `KeepAlive.SuccessfulExit = false`; a systemd user unit with `Restart=on-failure`,
+   `WantedBy=default.target`. Stopping waits 90 s for the final sync (`TimeoutStopSec`,
+   `ExitTimeOut`). `stop`/`uninstall` use the stop file on every OS, so the watcher exits 0 and
+   the service manager doesn't restart it. On Windows the task runs `emusyncw.exe`, built from
+   the same library with `windows_subsystem = "windows"`, since a console program would open
+   a console (or Windows Terminal) window at every login. The definitions are generated as
+   text by pure functions and unit-tested on every OS.
+8. **Credentials for the service** are never written into a definition. The watcher gets them
+   from the environment the service manager provides (Windows tasks inherit the user's saved
+   environment variables) or from `--env-file`, a `KEY=VALUE` file the user creates (a warning
+   if it is readable by others on Unix). `service install` says which applies.
+9. **Logging without a terminal.** When stderr isn't a terminal, the watcher logs to
+   `logs/watch.log` in the data directory, rotated at 1 MiB with three old files (if a rename
+   fails because the file is open elsewhere, it is truncated instead), and logs panics there.
+10. **Not yet:** a tray app, a final sync at Windows logoff (the windowless process has no
+    window to receive `WM_ENDSESSION`; the next start uploads what is left), and PCSX2
+    portable installs (cards next to the executable; register them with `card add`).
 
 ## 19. Implementation notes (PCSX2 folder cards)
 

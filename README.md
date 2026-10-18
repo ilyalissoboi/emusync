@@ -8,7 +8,8 @@ Amazon S3 or any S3-compatible service: saves of different games played offline 
 devices merge without conflicts, and every save has its own version history. PCSX2 folder
 cards hold the same saves, so a folder card on one device syncs with a `.ps2` file on another.
 Other card formats sync as whole files (byte-identical mirrors). `emusync watch` keeps
-unmodified PCSX2 in sync with no manual steps.
+unmodified PCSX2 in sync with no manual steps, and `emusync service install` starts it at
+every login.
 
 ## Crates
 
@@ -18,7 +19,7 @@ unmodified PCSX2 in sync with no manual steps.
 | `emusync-formats` | Container format adapters: `ps2.card` (PS2 memory card file system), `ps2.card.folder` (PCSX2 folder cards), `raw` |
 | `emusync-remote` | `Remote` trait, S3 backend (SigV4 + rustls), in-memory remote, conformance suite |
 | `emusync-ffi` | C ABI (stub in M0) |
-| `emusyncd` | The `emusync` command-line tool, including the `emusync watch` sidecar |
+| `emusyncd` | The `emusync` command-line tool, including the `emusync watch` sidecar; `emusyncw`, the same tool without a console window on Windows |
 
 ## Quick start
 
@@ -73,9 +74,55 @@ emusync watch                                                    # leave it runn
   `emusync resolve` instead.
 
 The log (stderr, with UTC times) says what was applied, uploaded or held back; `-v` adds
-debug detail. Stop it with Ctrl+C at any time: card writes are atomic. Don't run `emusync sync`
-against the same data directory while the watcher is running, since it doesn't know the
-emulator is open.
+debug detail. When stderr is not a terminal (as when started at login), the log goes to
+`logs/watch.log` in the data directory instead, rotated at 1 MiB with three old files kept.
+Ctrl+C (or SIGTERM, or `emusync service stop`) finishes the current cycle, then does a final
+sync unless the emulator is running; a second Ctrl+C exits at once. Card writes are atomic, so
+stopping at any point is safe. Only one watcher runs per data directory. Don't run
+`emusync sync` against the same data directory while the watcher is running, since it doesn't
+know the emulator is open.
+
+### Starting at login
+
+```sh
+emusync service install     # start `emusync watch` at every login, and now
+emusync service status      # installed? running? the end of the log
+emusync service stop        # stop after a final sync (until next login or `service start`)
+emusync service start
+emusync service uninstall   # stop and stop starting at login
+```
+
+`service install` registers the watcher for your user only, without admin rights: a Task
+Scheduler logon task named `emusync` on Windows (running `emusyncw.exe`, so no console window
+opens; keep it next to `emusync.exe`), a LaunchAgent
+(`~/Library/LaunchAgents/io.github.ilyalissoboi.emusync.plist`) on macOS, and a systemd user
+unit (`~/.config/systemd/user/emusync.service`) on Linux, including the Steam Deck. It takes
+the options of `emusync watch` (`--profile`, `--policy`, `--no-discover`, …) plus `--no-start`;
+run it again to change them. The data directory is fixed at install time. A watcher that crashes
+is restarted; one that was stopped is not, until the next login.
+
+**Credentials.** A watcher started at login doesn't see variables set in your shell, and
+`service install` never copies your keys anywhere. Either:
+
+- on Windows, save `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` as user environment
+  variables (`setx AWS_ACCESS_KEY_ID …`, or Settings > System > About > Advanced system
+  settings > Environment Variables); the logon task inherits them; or
+- put them in a file only you can read, and pass it to the watcher:
+
+  ```sh
+  mkdir -p ~/.config/emusync
+  touch ~/.config/emusync/credentials.env
+  chmod 600 ~/.config/emusync/credentials.env
+  # then edit it to hold two lines: AWS_ACCESS_KEY_ID=… and AWS_SECRET_ACCESS_KEY=…
+  emusync service install --env-file ~/.config/emusync/credentials.env
+  ```
+
+  The file holds `KEY=VALUE` lines (`#` comments and `export` allowed) and is read at each
+  start, so rotating keys only needs a `service stop` / `service start`. `emusync watch
+  --env-file` works the same in a terminal.
+
+On Windows, logging off ends the watcher without a final sync; anything not yet uploaded is
+uploaded at the next start.
 
 Emulators are described by JSON profiles (`crates/emusyncd/profiles/`): process names, default
 card folders and card file extensions for each OS, plus optional lock files that exist only
