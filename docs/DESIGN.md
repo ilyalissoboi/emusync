@@ -933,26 +933,42 @@ Where the M0 code differs from or pins down the design above:
    `--profile file.json`). Each lists, per OS, process names (matched without regard to case),
    default card folders (`{home}`, `{documents}`, `{config}`, `{data}` placeholders, resolved
    with the `dirs` crate so redirected Documents folders work) and optional lock files, plus the
-   card file extensions the emulator owns. PCSX2 ships built in. A profile must give the current
+   card file extensions the emulator owns and, optionally, a folder card marker: a directory
+   holding a file of that name is one of the emulator's folder cards, whatever its name (PCSX2:
+   `_pcsx2_superblock`, so both `Mcd001` and `Mcd001.ps2` folders). PCSX2 ships built in. A profile must give the current
    OS at least one process name or lock file, or it is rejected: without one the emulator would
    never look busy. Process names are compared with both the reported name and the executable's
    file name, and a 15-byte name (Linux truncates `comm`) also matches a longer profile name it
    starts.
 2. **Busy is per card.** Before every cycle, each container is marked busy (`Engine::set_busy`)
-   if an emulator whose profile claims its extension is running. Cards no profile claims are
+   if an emulator whose profile claims it (by extension or folder card marker) is running.
+   Cards no profile claims are
    busy whenever any watched emulator runs. Busy cards are still snapshotted and uploaded; only
    applies wait in the inbox. Process lists come from `sysinfo` every 2 s, behind a
    `ProcessProbe` trait so tests use a fake.
 3. **Triggers.** File events (`notify`, non-recursive, on the folders holding cards) arm a 2 s
    debounce. When it expires, a cycle runs only if a card's content hash changed, so the
    watcher's own reads and applies don't loop. (Size and mtime are not enough: cards have a
-   fixed size, and coarse mtimes can hide a second write.) Emulator start (poll at once, cards now busy) and
+   fixed size, and coarse mtimes can hide a second write.) A folder card is hashed as its tree
+   image (§19.3), modification times included, and is also watched recursively, since PCSX2
+   writes deep inside save directories. Events on the `.emusync-tmp`, `.emusync-old` and
+   `.emusync-swap` siblings of a directory replace are ignored. A watch follows the directory,
+   not the path (`ReadDirectoryChangesW`, inotify), so after a replace swaps the folder it
+   would report the old one being deleted and miss PCSX2's next writes. The watch is renewed
+   after every apply to a folder card, and when another program creates, removes or renames
+   the folder. Emulator start (poll at once, cards now busy) and
    exit (apply the inbox) each run a cycle. A cycle due while writes are still settling waits
    for them, except on exit. Polls back off from 30 s to 15 min, doubling after a poll with no
    news or with the remote unreachable, and resetting after anything else.
-4. **Discovery.** Card files in the profiles' folders are registered automatically
-   (`--no-discover` turns this off). A file that can't be registered, such as a second
-   `Mcd001.ps2` in another folder, is skipped with one warning.
+4. **Discovery.** Card files in the profiles' folders, and directories in them holding the
+   profile's folder card marker, are registered automatically (`--no-discover` turns this
+   off). emusync's own scratch directories are never registered, though `<card>.emusync-tmp`
+   holds a superblock while a replace runs. PCSX2 creates a folder card's directory before its
+   superblock, and the card folder's flat watch doesn't see the superblock arrive. So a new
+   folder in a card folder arms the debounce, and is checked for the marker at each process
+   probe for a minute, in case the superblock comes after the debounce expires. A file that can't be registered, such as a second
+   `Mcd001.ps2` in another folder, or an `Mcd001` folder card next to an `Mcd001.ps2` file,
+   is skipped with one warning.
 5. **Reporting.** `SyncReport::resolved` lists units the `newest` policy merged, so the log can
    say which saves diverged and where the losing version is kept.
 6. **Not yet:** running as a service or tray app, graceful shutdown with a final sync, and

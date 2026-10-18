@@ -27,6 +27,14 @@ pub fn journal_path(path: &Path) -> PathBuf {
     sibling(path, ".emusync-swap")
 }
 
+/// Whether `path` is one of the siblings above: emusync's own scratch file or directory,
+/// never a container.
+pub fn is_scratch(path: &Path) -> bool {
+    path.file_name()
+        .map(|n| n.to_string_lossy())
+        .is_some_and(|n| [".emusync-tmp", ".emusync-old", ".emusync-swap"].iter().any(|s| n.ends_with(s)))
+}
+
 /// Writes `data` to a temp file next to `path`, fsyncs it, and renames it over `path`.
 /// `rename` is atomic on POSIX; on Windows the standard library uses
 /// `MoveFileExW(MOVEFILE_REPLACE_EXISTING)`, which replaces the file in one step.
@@ -356,5 +364,15 @@ mod tests {
         write_once(&q, b"1").unwrap();
         write_once(&q, b"2").unwrap();
         assert_eq!(fs::read(&q).unwrap(), b"1");
+    }
+
+    #[test]
+    fn scratch_paths() {
+        let card = Path::new("/m/Mcd001");
+        for p in [temp_path(card), old_path(card), journal_path(card), temp_path(&journal_path(card))] {
+            assert!(is_scratch(&p), "{}", p.display());
+        }
+        assert!(!is_scratch(card));
+        assert!(!is_scratch(Path::new("/m/Mcd001.ps2")));
     }
 }
