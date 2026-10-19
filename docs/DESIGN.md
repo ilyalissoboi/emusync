@@ -775,6 +775,7 @@ emusync/
                         versions, `s3 check`)
     emusync-server/     reference server (later)
   include/emusync.h     the C ABI contract (checked in; CI fails if cbindgen output drifts)
+  bindings/cmake/       EmuSyncAndroid.cmake: libemusync.so from an Android CMake build (§21)
   bindings/cpp/         emusync.hpp: RAII wrappers, std::string_view, expected<>
   bindings/android/     Gradle module → AAR (JNI + Kotlin)
   bindings/apple/       SwiftPM package → XCFramework
@@ -1212,7 +1213,7 @@ pins down §3.2, §6.4, §10 and §12:
     `cargo rustc -p emusync-ffi --lib --crate-type cdylib` (CI does this on every OS). Listing
     `cdylib` in `Cargo.toml` would make it collide on Windows with the `emusync` CLI binary,
     both writing `target/*/emusync.pdb` (cargo#6313). The header is still written by hand, not
-    by cbindgen; the layout test keeps the two in step.
+    by cbindgen; the layout test keeps the two in step. The Android build is in §21.
 12. **Tests.** `src/tests.rs` drives the exported functions as a host would, over the
     in-memory remote (attached through a test-only hook; the C API has no memory remote):
     session begin applying before the emulator opens the card, a pull that misses the
@@ -1222,3 +1223,70 @@ pins down §3.2, §6.4, §10 and §12:
     session begin/end → poll events → destroy), a C++11 compile of the header with every
     `ES_*_INIT` macro, and the layout check, each linked against the static library, with
     warnings as errors.
+
+## 21. Implementation notes (Android build)
+
+`libemusync.so` for Android, built the way [the ARMSX2 research](research/armsx2.md) (§4, "Best
+way to link a cargo-ndk Rust library") proposed. This settles its inferred items 2, 3, 5 and 9,
+by building and inspecting the library, with these results:
+
+1. **How it is built.** `cargo rustc -p emusync-ffi --lib --crate-type cdylib --target
+   <triple>`, with the NDK's `clang` as linker (`CARGO_TARGET_<TRIPLE>_LINKER`) and as the cc
+   crate's C compiler (`CC_<triple>`, for ring, the bundled SQLite, zstd and blake3), and
+   `--target=<clang triple><api>` in both the C flags and a link argument. Plain `clang` rather
+   than the NDK's `<triple><api>-clang` wrappers, because those are `.cmd` scripts on Windows. No
+   cargo-ndk. API 26 (ARMSX2's `minSdk`), arm64-v8a and x86_64; armeabi-v7a and x86 are mapped
+   but untested. Two front ends do this: `scripts/build-android.sh` and
+   `bindings/cmake/EmuSyncAndroid.cmake`.
+2. **`cdylib` stays out of `Cargo.toml`** (§20 item 11: the Windows `.pdb` collision), so the
+   research's "add `cdylib` to `crate-type`" became `cargo rustc --crate-type cdylib`, which
+   builds the same library. The static library and its C tests are unchanged.
+3. **Link arguments go after `--`** on the `cargo rustc` command line, so they reach only the
+   final link: unlike `RUSTFLAGS`, changing them does not rebuild the dependencies.
+   - `-Wl,-soname,libemusync.so`. **Confirmed** (research item 3): without it rustc writes no
+     `SONAME`, and a host linked against the library would record its build path. With it, a
+     shared library and an executable built through the CMake module both have
+     `DT_NEEDED libemusync.so`.
+   - `-Wl,-z,max-page-size=16384`. Every `PT_LOAD` is aligned to 16 KB. NDK r30 already does
+     this by default for arm64; the flag keeps it so on older NDKs and x86_64.
+   - `-Wl,--exclude-libs,ALL`. **Needed, which the research did not expect** (item 2): rustc's
+     version script hides every symbol except those it exports, but it exports every
+     `#[no_mangle]` function of *every* crate, not only this one. On arm64, blake3's NEON C code
+     calls back into Rust through one, `blake3_compress_in_place_portable`, which therefore
+     ended up in the dynamic symbol table. `--exclude-libs,ALL` takes the symbols of all archive
+     inputs out of it. Rust dependencies are linked as `.rlib` archives and emusync-ffi's own
+     code as object files, so this leaves exactly the `es_*` functions.
+4. **`-DZSTD_TRACE=0`** in the C flags. zstd otherwise references weak, undefined
+   `ZSTD_trace_*` hooks, which a definition anywhere else in the process (the host's own zstd)
+   would resolve. Without them the dynamic symbol table neither defines nor references any
+   zstd, SQLite, ring or blake3 symbol.
+5. **What it needs.** **Confirmed** (item 5): `DT_NEEDED` is `libc.so`, `libm.so` and
+   `libdl.so` only. No `libc++_shared.so`, and not even `liblog.so`. A release arm64 build is
+   7.2 MB, 5.5 MB stripped (AGP strips it when packaging).
+6. **Exports.** **Confirmed** (item 2): the defined dynamic symbols are exactly the 31
+   functions declared in `include/emusync.h`. `scripts/check-android-so.sh` checks this against
+   the header, along with the soname, `DT_NEEDED`, the absence of bundled C library symbols and
+   the 16 KB alignment.
+7. **The CMake module** follows ARMSX2's librashader build, with two changes. Cargo runs from an
+   `add_custom_target` that always runs, rather than a custom command with a fixed output, so
+   edits to emusync's sources are picked up. A no-op build takes under a second, and the
+   library is a `BYPRODUCT`, so Ninja relinks the host only when it changed. It also needs no
+   `libc++_shared.so` staging. It defines `emusync::emusync` (IMPORTED SHARED, with the header
+   directory), copies the library into `CMAKE_LIBRARY_OUTPUT_DIRECTORY` after each build, and
+   picks the cargo profile from `CMAKE_BUILD_TYPE`. It takes the compiler from
+   `CMAKE_C_COMPILER`, the ABI from `ANDROID_ABI` and the API level from
+   `ANDROID_PLATFORM_LEVEL`. **Item 7:** with no cargo or rustc, or without the Rust target for
+   the ABI (`rustc --print target-libdir` does not exist), it sets `EMUSYNC_ANDROID_FOUND=OFF`,
+   and configuring still succeeds.
+8. **CI** (`android` job, ubuntu-latest, NDK 29.0.14206865 as ARMSX2 pins it). It builds both
+   ABIs with the script and with the module (through `bindings/cmake/android-test`, a shared
+   library and the C smoke test linked against `emusync::emusync`), runs the checks on all four
+   libraries, checks the consumers' `DT_NEEDED`, and configures for armeabi-v7a, which has no
+   Rust target installed, to check that the module switches itself off. It uploads
+   `libemusync.so` for both ABIs with `emusync.h` as the `libemusync-android` artifact. The
+   `android-emulator` job runs the C smoke test (§20 item 12) against the x86_64 library on an
+   API 30 emulator. The runners cannot emulate arm64, so the arm64 library is checked only
+   statically.
+9. **Not verified yet** (the rest of research item 9). Linking into ARMSX2's `emucore`
+   with `-DLTO_PCSX2_CORE=ON`, AGP packaging in a real APK, and `System.loadLibrary` resolving
+   it on an arm64 device all belong to the ARMSX2 integration itself.

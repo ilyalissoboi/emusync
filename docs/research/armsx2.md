@@ -384,6 +384,11 @@ I recommend an **optional `cdylib`**, `libemusync.so`, built by a CMake custom c
 the way librashader is built, and linked into `emucore` as an `IMPORTED` shared target. Each
 point below is **inferred** unless it cites the code.
 
+> **Update:** items 2, 3, 5, 7 and 9 have since been settled by building and inspecting
+> `libemusync.so` in CI. See [DESIGN §21](../DESIGN.md#21-implementation-notes-android-build).
+> The recipe holds, with one addition: `-Wl,--exclude-libs,ALL`, because rustc also exports
+> `#[no_mangle]` functions of dependencies (blake3 has one).
+
 1. **Rust target and toolchain.** `aarch64-linux-android` only, API level 26, the NDK's own
    clang as linker. librashader's CMake passes the right `CARGO_TARGET_*_LINKER`, `CC_*` and
    `AR_*` environment, so `cargo-ndk` is not required. `cargo-ndk` would work in CI as an
@@ -403,18 +408,22 @@ point below is **inferred** unless it cites the code.
    A `cdylib` exports only the `#[no_mangle] extern "C"` symbols (`rustc` passes a version script
    that keeps everything else local), so the C dependencies stay private. Add `cdylib` to
    `crate-type` in the `emusync-ffi` crate. That change is not part of this research.
+   **Confirmed, with a correction** (DESIGN §21): the C dependencies stay private, but rustc
+   also exported blake3's `#[no_mangle]` NEON callback until `-Wl,--exclude-libs,ALL` was added.
+   `cdylib` is built with `cargo rustc --crate-type cdylib` rather than listed in `crate-type`.
 3. **Soname.** `rustc` does not emit a `SONAME` for an Android cdylib. Without one the linker
    records the build-tree path as `DT_NEEDED` and the library fails to load at runtime.
    librashader works around this with
    `RUSTFLAGS="-C link-arg=-Wl,-soname,liblibrashader_capi.so"`. Do the same with
-   `-Wl,-soname,libemusync.so`, plus `-Wl,-z,max-page-size=16384`.
+   `-Wl,-soname,libemusync.so`, plus `-Wl,-z,max-page-size=16384`. **Confirmed** (DESIGN §21).
 4. **Packaging.** AGP only packages `.so` files that CMake itself emits into the per-ABI output
    directory, so copy the cargo output there in a `POST_BUILD` step, as librashader does.
    Otherwise the core links and then dies at runtime with `UnsatisfiedLinkError`.
 5. **No `libc++_shared.so` needed.** librashader needs it only because it pulls in C++
    dependencies (glslang, spirv-cross), which is why its CMake stages `libc++_shared.so`. emusync
    has only C dependencies (SQLite, zstd, ring), so it should link against plain libc, libm, libdl
-   and liblog.
+   and liblog. **Confirmed** (DESIGN §21): `DT_NEEDED` is libc, libm and libdl, without even
+   liblog.
 6. **Both core variants share one copy.** The 4K and 16K cores are separate `emucore` builds. A
    `libemusync.so` in the APK is shared by whichever core loads, and it needs no page-size
    define.
@@ -424,7 +433,9 @@ point below is **inferred** unless it cites the code.
    `CMakeLists.txt:383-396` explains why: release builds compile many sources into a separate
    `PCSX2_LTO` target that only sees `PCSX2_FLAGS`, so a define on `PCSX2` compiles cleanly and
    silently ships the feature stubbed out. `VMManager.cpp` and the `SIO/Memcard` files are core
-   sources, so this applies to the call sites in section 7.
+   sources, so this applies to the call sites in section 7. The emusync side is done:
+   `bindings/cmake/EmuSyncAndroid.cmake` sets `EMUSYNC_ANDROID_FOUND=OFF` without cargo, rustc
+   or the Rust target (DESIGN §21).
 8. **Is a C++ wrapper needed?** No. `emusync.h` already has `extern "C"` guards, so
    `native-lib.cpp` and the core can call `es_*` directly. A thin ARMSX2-side glue file (for
    example `pcsx2/EmuSync/EmuSyncHost.{h,cpp}`) is still worth having, to keep `#ifdef
@@ -433,7 +444,9 @@ point below is **inferred** unless it cites the code.
 9. **A spike to settle the open points.** The soname handling, the symbol-hiding behaviour and
    the absence of `libc++_shared` are all inferred. A half-day spike would settle them: build
    `libemusync.so` with the librashader recipe, link it into `emucore`, and check
-   `llvm-readelf -d` for `DT_NEEDED` and `llvm-nm -D` for exported symbols.
+   `llvm-readelf -d` for `DT_NEEDED` and `llvm-nm -D` for exported symbols. **Done**
+   (DESIGN §21) except for linking the real `emucore`, which a stand-in shared library
+   replaces in CI.
 
 **Other build notes.**
 
