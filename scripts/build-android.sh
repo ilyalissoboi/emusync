@@ -6,7 +6,9 @@
 #
 # Defaults: --target aarch64-linux-android, --api 26, release. Each library lands in
 # <out>/<android abi>/libemusync.so (default out: target/android), next to which the caller puts
-# include/emusync.h. The NDK comes from ANDROID_NDK_HOME, ANDROID_NDK_ROOT or ANDROID_NDK.
+# include/emusync.h. The NDK comes from ANDROID_NDK_HOME, ANDROID_NDK_ROOT or ANDROID_NDK. Cargo
+# builds in CARGO_TARGET_DIR if set, else target/ (passed explicitly, so a build.target-dir in a
+# cargo config does not move the output away from where this script copies it from).
 # Works on Linux, macOS and Windows (Git Bash). bindings/cmake/EmuSyncAndroid.cmake does the same
 # from a CMake build.
 set -euo pipefail
@@ -14,11 +16,12 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 api=26
 profile=release
+target_dir="${CARGO_TARGET_DIR:-$root/target}"
 out="$root/target/android"
 targets=()
 
 usage() {
-    sed -n '2,12p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,14p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 while [ $# -gt 0 ]; do
@@ -76,13 +79,13 @@ for target in "${targets[@]}"; do
         "AR_${under}=$tc/bin/llvm-ar$exe" \
         "RANLIB_${under}=$tc/bin/llvm-ranlib$exe" \
         cargo rustc --locked -p emusync-ffi --lib --crate-type cdylib "${profile_flag[@]}" \
-        --manifest-path "$root/Cargo.toml" --target "$target" -- \
+        --manifest-path "$root/Cargo.toml" --target "$target" --target-dir "$target_dir" -- \
         -C "link-arg=--target=${clang_triple}${api}" \
         -C link-arg=-Wl,-soname,libemusync.so \
         -C link-arg=-Wl,--exclude-libs,ALL \
         -C link-arg=-Wl,-z,max-page-size=16384
 
     mkdir -p "$out/$abi"
-    cp "$root/target/$target/$profile/libemusync.so" "$out/$abi/libemusync.so"
+    cp "$target_dir/$target/$profile/libemusync.so" "$out/$abi/libemusync.so"
     echo "$out/$abi/libemusync.so"
 done
