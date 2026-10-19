@@ -42,8 +42,9 @@ pub const MODE_HIDDEN: u16 = 0x2000;
 pub const MODE_EXISTS: u16 = 0x8000;
 /// Mode of a directory created by the PS2 browser or mymc.
 pub const MODE_DIR_DEFAULT: u16 = MODE_EXISTS | MODE_0400 | MODE_DIR | MODE_READ | MODE_WRITE | MODE_EXECUTE;
-/// Mode of a directory's ".." entry (`0xA426`): hidden, not readable.
-const MODE_DOTDOT: u16 = (MODE_DIR_DEFAULT & !MODE_READ) | MODE_HIDDEN;
+/// Mode of the root directory's ".." entry (`0xA426`): hidden, not readable. A save
+/// directory's ".." entry has the plain directory mode, as the BIOS writes it.
+const MODE_ROOT_DOTDOT: u16 = (MODE_DIR_DEFAULT & !MODE_READ) | MODE_HIDDEN;
 /// Mode of a file created by a typical game (`0x8497`).
 pub const MODE_FILE_DEFAULT: u16 = MODE_EXISTS | MODE_0400 | 0x0080 | MODE_FILE | MODE_READ | MODE_WRITE | MODE_EXECUTE;
 
@@ -84,6 +85,9 @@ pub struct Card {
     ecc: bool,
     alloc_offset: u32,
     alloc_end: u32,
+    /// Allocatable clusters the BIOS actually uses (8,001 on an 8 MB card). Clusters from here
+    /// to `alloc_end` are a reserve the BIOS never allocates, so emusync doesn't either.
+    alloc_limit: u32,
     root_cluster: u32,
     /// Absolute cluster numbers of the FAT clusters, in order.
     fat_clusters: Vec<u32>,
@@ -354,10 +358,18 @@ impl Card {
         let raw = reader.dir_entries(root_cluster, root_len)?;
         let root_dotdot = raw[1];
         let entries = reader.children(&raw, 0)?;
+        // The limit stored in the superblock, or for cards that lack it, the one the BIOS derives.
+        let stored_limit = u32_at(img, 0x170);
+        let alloc_limit = if stored_limit != 0xFFFF_FFFF && stored_limit > 0 {
+            stored_limit.min(alloc_end)
+        } else {
+            bios_alloc_limit(alloc_end)
+        };
         Ok(Card {
             ecc,
             alloc_offset,
             alloc_end,
+            alloc_limit,
             root_cluster,
             fat_clusters,
             has_bad_blocks,
@@ -367,6 +379,16 @@ impl Card {
         })
     }
 
+    /// Creation time of the root directory (its `.` entry): the time the card was formatted.
+    pub fn root_created(&self) -> [u8; 8] {
+        self.root_dot[0x08..0x10].try_into().unwrap()
+    }
+
+    /// Whether the image has ECC spare areas.
+    pub fn has_ecc(&self) -> bool {
+        self.ecc
+    }
+
     /// Modification time of the root directory (its `.` entry).
     pub fn root_time(&self) -> [u8; 8] {
         self.root_dot[0x18..0x20].try_into().unwrap()
@@ -374,11 +396,13 @@ impl Card {
 
     /// Clusters available for entries (root directory included).
     pub fn capacity_clusters(&self) -> u32 {
-        self.alloc_end
+        self.alloc_limit
     }
 
     /// Builds a new image from `original` (the image this card was parsed from) holding
-    /// `entries` at the root, in order.
+    /// `entries` at the root, in order. Everything written follows what the PS2 BIOS writes
+    /// (checked against a card the BIOS formatted and saved to): unused bytes of a cluster are
+    /// `0xFF`, and each save directory's "." and ".." entries carry the BIOS's modes and times.
     pub fn build(&self, original: &[u8], entries: &[Node]) -> Result<Vec<u8>> {
         if self.has_bad_blocks {
             return Err(FormatError::Unsupported("rewriting cards with bad blocks".into()));
@@ -391,10 +415,20 @@ impl Card {
             raw_page: if self.ecc { PAGE + SPARE } else { PAGE },
             ecc: self.ecc,
             alloc_offset: self.alloc_offset,
-            alloc_end: self.alloc_end,
+            limit: self.alloc_limit,
             next: 0,
             fat: vec![FAT_FREE; self.alloc_end as usize],
         };
+        // Cards emusync formatted before this fix lack the superblock's derived fields, which
+        // the BIOS always writes. Fill them in.
+        if w.out[SB_TAIL].iter().all(|&b| b == 0xFF) {
+            let per_block = u32::from(u16_at(original, 0x2C)) / 2;
+            w.out[SB_TAIL].copy_from_slice(&superblock_tail(per_block, self.alloc_end));
+            if self.ecc {
+                let spare = ecc::page_spare(&w.out[..PAGE]);
+                w.out[PAGE..PAGE + SPARE].copy_from_slice(&spare);
+            }
+        }
         for rel in 0..self.alloc_end {
             w.erase_cluster(self.alloc_offset + rel);
         }
@@ -404,8 +438,9 @@ impl Card {
         let mut dot = self.root_dot;
         dot[0x04..0x08].copy_from_slice(&(root_slots as u32).to_le_bytes());
         let mut slots = vec![dot, self.root_dotdot];
+        let root_created: [u8; 8] = self.root_dot[0x08..0x10].try_into().unwrap();
         for (i, node) in entries.iter().enumerate() {
-            slots.push(w.place(node, root_first, i as u32 + 2, 1)?);
+            slots.push(w.place(node, root_first, i as u32 + 2, &root_created, 1)?);
         }
         w.write_dir(root_first, &slots)?;
 
@@ -429,7 +464,8 @@ struct Writer {
     raw_page: usize,
     ecc: bool,
     alloc_offset: u32,
-    alloc_end: u32,
+    /// Clusters [`Self::alloc`] may hand out (see [`Card::alloc_limit`]).
+    limit: u32,
     next: u32,
     fat: Vec<u32>,
 }
@@ -464,7 +500,7 @@ impl Writer {
         if n == 0 {
             return Ok(NO_CLUSTER);
         }
-        if self.next as u64 + n > self.alloc_end as u64 {
+        if self.next as u64 + n > self.limit as u64 {
             return Err(FormatError::NoSpace);
         }
         let first = self.next;
@@ -494,10 +530,11 @@ impl Writer {
         }
     }
 
-    /// Writes data into the chain starting at `first` (contiguous, from [`Self::alloc`]).
+    /// Writes data into the chain starting at `first` (contiguous, from [`Self::alloc`]). The
+    /// rest of the last cluster is `0xFF`, as the BIOS leaves it (an unused directory slot too).
     fn write_chain(&mut self, first: u32, data: &[u8]) {
         for (i, piece) in data.chunks(CLUSTER).enumerate() {
-            let mut buf = [0u8; CLUSTER];
+            let mut buf = [0xFFu8; CLUSTER];
             buf[..piece.len()].copy_from_slice(piece);
             self.write_cluster(self.alloc_offset + first + i as u32, &buf);
         }
@@ -510,8 +547,16 @@ impl Writer {
     }
 
     /// Lays out `node` (and its children), returning its entry for the parent directory.
-    /// `parent_first`/`slot` locate that entry, which a directory's `.` entry points back to.
-    fn place(&mut self, node: &Node, parent_first: u32, slot: u32, depth: usize) -> Result<[u8; ENTRY]> {
+    /// `parent_first`/`slot` locate that entry, which a directory's `.` entry points back to;
+    /// `parent_created` is the parent directory's creation time.
+    fn place(
+        &mut self,
+        node: &Node,
+        parent_first: u32,
+        slot: u32,
+        parent_created: &[u8; 8],
+        depth: usize,
+    ) -> Result<[u8; ENTRY]> {
         check_name(&node.name)?;
         if depth > MAX_DEPTH {
             return Err(invalid("directories nested too deeply"));
@@ -527,16 +572,16 @@ impl Writer {
             NodeKind::Dir(children) => {
                 let count = children.len() as u64 + 2;
                 let first = self.alloc(div_ceil(count, ENTRIES_PER_CLUSTER as u64))?;
-                // As mcman, mymc and PCSX2's folder cards write them: the "." entry is the link
-                // to the parent (the parent directory's first cluster and this directory's slot
-                // in it), which is what `..` path lookups follow; the ".." entry is a hidden
-                // placeholder whose cluster and slot are 0.
+                // As the BIOS writes them. "." links back to the parent (the parent directory's
+                // first cluster and this directory's slot in it) and carries this directory's
+                // creation time as both times. ".." has the plain directory mode, cluster and
+                // slot 0, and the parent's creation time.
                 let mut slots = vec![
-                    dirent(mode, 0, &node.created, parent_first, slot, &node.modified, 0, b"."),
-                    dirent(MODE_DOTDOT, 0, &node.created, 0, 0, &node.modified, 0, b".."),
+                    dirent(mode, 0, &node.created, parent_first, slot, &node.created, 0, b"."),
+                    dirent(MODE_DIR_DEFAULT, 0, parent_created, 0, 0, parent_created, 0, b".."),
                 ];
                 for (i, child) in children.iter().enumerate() {
-                    slots.push(self.place(child, first, i as u32 + 2, depth + 1)?);
+                    slots.push(self.place(child, first, i as u32 + 2, &node.created, depth + 1)?);
                 }
                 self.write_dir(first, &slots)?;
                 Ok(dirent(mode, count as u32, &node.created, first, 0, &node.modified, node.attr, &node.name))
@@ -545,8 +590,43 @@ impl Writer {
     }
 }
 
-/// A freshly formatted, empty card with the standard layout: the geometry, superblock values
-/// and root directory that PCSX2's folder memory cards and mymc produce. Used to format a
+/// Superblock bytes `0x154..0x184`: fields the BIOS derives from the geometry and stores when
+/// it formats a card.
+const SB_TAIL: std::ops::Range<usize> = 0x154..0x184;
+
+/// The allocatable-cluster limit the BIOS derives from `alloc_end`: rounded down to a thousand,
+/// plus one (8,135 → 8,001).
+fn bios_alloc_limit(alloc_end: u32) -> u32 {
+    (alloc_end / 1000 * 1000 + 1).min(alloc_end)
+}
+
+/// The derived superblock fields, in the order the BIOS stores them: cluster size, FAT entries
+/// per cluster, clusters per erase block, card form (-1), three zero words, the allocatable
+/// cluster limit (8,001 on an 8 MB card), two zero words, -1 and a zero word.
+fn superblock_tail(clusters_per_block: u32, alloc_end: u32) -> [u8; 0x30] {
+    let words = [
+        CLUSTER as u32,
+        FAT_PER_CLUSTER,
+        clusters_per_block,
+        0xFFFF_FFFF,
+        0,
+        0,
+        0,
+        bios_alloc_limit(alloc_end),
+        0,
+        0,
+        0xFFFF_FFFF,
+        0,
+    ];
+    let mut out = [0u8; 0x30];
+    for (i, w) in words.iter().enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+    }
+    out
+}
+
+/// A freshly formatted, empty card with the layout the PS2 BIOS gives a card it formats:
+/// geometry, superblock (including its derived fields) and root directory. Used to format a
 /// card file that was never formatted (all `0xFF`), and by tests.
 pub fn blank_card(clusters_per_card: u32, ecc: bool, time: [u8; 8]) -> Vec<u8> {
     let raw_page = if ecc { PAGE + SPARE } else { PAGE };
@@ -556,7 +636,7 @@ pub fn blank_card(clusters_per_card: u32, ecc: bool, time: [u8; 8]) -> Vec<u8> {
         raw_page,
         ecc,
         alloc_offset: 0,
-        alloc_end: 0,
+        limit: 0,
         next: 0,
         fat: Vec::new(),
     };
@@ -595,12 +675,13 @@ pub fn blank_card(clusters_per_card: u32, ecc: bool, time: [u8; 8]) -> Vec<u8> {
     sb[0x150] = 2; // card type: PS2
     sb[0x151] = 0x2B; // flags, as PCSX2's folder memory cards write them (ECC in use)
     sb[0x152..0x154].fill(0);
+    sb[SB_TAIL].copy_from_slice(&superblock_tail(CLUSTERS_PER_BLOCK, alloc_end));
     w.out[..PAGE].copy_from_slice(&sb);
     if ecc {
         w.out[PAGE..PAGE + SPARE].copy_from_slice(&ecc::page_spare(&sb));
     }
 
-    let mut ifc_data = [0u8; CLUSTER];
+    let mut ifc_data = [0xFFu8; CLUSTER];
     for k in 0..n_fat {
         ifc_data[k as usize * 4..k as usize * 4 + 4].copy_from_slice(&(ifc + 1 + k).to_le_bytes());
     }
@@ -621,7 +702,7 @@ pub fn blank_card(clusters_per_card: u32, ecc: bool, time: [u8; 8]) -> Vec<u8> {
         w.write_cluster(ifc + 1 + k, &data);
     }
     let dot = dirent(MODE_DIR_DEFAULT, 2, &time, 0, 0, &time, 0, b".");
-    let dotdot = dirent(MODE_DOTDOT, 0, &time, 0, 0, &time, 0, b"..");
+    let dotdot = dirent(MODE_ROOT_DOTDOT, 0, &time, 0, 0, &time, 0, b"..");
     let mut root = [0u8; CLUSTER];
     root[..ENTRY].copy_from_slice(&dot);
     root[ENTRY..].copy_from_slice(&dotdot);
@@ -664,6 +745,7 @@ mod tests {
         assert!(is_card_size(img.len()));
         let card = Card::parse(&img).unwrap();
         assert_eq!((card.alloc_offset, card.alloc_end), (41, 8135), "matches the standard 8 MB layout");
+        assert_eq!(card.capacity_clusters(), 8001, "the BIOS uses 8,001 of them");
         assert!(card.entries.is_empty());
         let no_ecc = blank_card(8192, false, T);
         assert_eq!(no_ecc.len(), 8_388_608);
@@ -710,7 +792,7 @@ mod tests {
         let save_first = u32_at(&save, 0x10);
         let (save_dot, save_dotdot) = (entry(save_first, 0), entry(save_first, 1));
         assert_eq!((u32_at(&save_dot, 0x10), u32_at(&save_dot, 0x14)), (0, 3), "SAVE is slot 3 of the root");
-        assert_eq!(u16_at(&save_dotdot, 0), 0xA426);
+        assert_eq!(u16_at(&save_dotdot, 0), MODE_DIR_DEFAULT, "the BIOS writes .. with the plain directory mode");
         let sub = entry(save_first, 3);
         assert_eq!(entry_name(&sub), b"sub");
         let sub_dot = entry(u32_at(&sub, 0x10), 0);
@@ -719,6 +801,71 @@ mod tests {
             Card::parse(&out).unwrap().entries[1],
             dir("SAVE", vec![file("f", b"1"), dir("sub", vec![file("x", b"2")])])
         );
+    }
+
+    /// What the BIOS wrote on a real 8 MB card it formatted and saved to (PCSX2, October 2026).
+    #[test]
+    fn layout_matches_the_bios() {
+        let img = blank_card(8192, true, T);
+        // Card type and flags, then the derived fields (bytes 0x150..0x184 of the superblock).
+        assert_eq!(
+            hex(&img[0x150..0x184]),
+            "022b0000000400000001000008000000ffffffff000000000000000000000000411f00000000000000000000ffffffff00000000"
+        );
+        let card = Card::parse(&img).unwrap();
+        // Indirect FAT: the FAT cluster numbers, then 0xFF.
+        let ifc = read_cluster(&img, PAGE + SPARE, 8).unwrap();
+        assert!(ifc[32 * 4..].iter().all(|&b| b == 0xFF));
+
+        let created = [0, 1, 2, 3, 4, 5, 0xE0, 0x07];
+        let modified = [0, 9, 9, 9, 9, 9, 0xE9, 0x07];
+        let save = Node {
+            name: b"BASLUS-20565".to_vec(),
+            mode: MODE_DIR_DEFAULT,
+            attr: 0,
+            created,
+            modified,
+            kind: NodeKind::Dir(vec![file("icon.sys", &[1; 964]), file("odd", b"1234")]),
+        };
+        let out = card.build(&img, &[save]).unwrap();
+        let cluster = |rel: u32| read_cluster(&out, PAGE + SPARE, card.alloc_offset + rel).unwrap();
+        // The root holds ".", ".." and the save: three slots in two clusters.
+        let root: Vec<u8> = cluster(0).into_iter().chain(cluster(1)).collect();
+        let save_entry = &root[2 * ENTRY..3 * ENTRY];
+        let dir = cluster(u32_at(save_entry, 0x10))
+            .into_iter()
+            .chain(cluster(u32_at(save_entry, 0x10) + 1))
+            .collect::<Vec<u8>>();
+        let (dot, dotdot) = (&dir[..ENTRY], &dir[ENTRY..2 * ENTRY]);
+        assert_eq!(u16_at(dot, 0), MODE_DIR_DEFAULT);
+        assert_eq!((&dot[0x08..0x10], &dot[0x18..0x20]), (&created[..], &created[..]), ". has the creation time twice");
+        assert_eq!(u16_at(dotdot, 0), MODE_DIR_DEFAULT);
+        assert_eq!((&dotdot[0x08..0x10], &dotdot[0x18..0x20]), (&T[..], &T[..]), ".. has the parent's creation time");
+        assert_eq!((u32_at(dotdot, 0x10), u32_at(dotdot, 0x14)), (0, 0));
+        // The root's fourth slot is unused: left erased.
+        assert!(root[3 * ENTRY..].iter().all(|&b| b == 0xFF), "unused directory slot is 0xFF");
+        // A short file's cluster is padded with 0xFF.
+        let odd = &dir[3 * ENTRY..4 * ENTRY];
+        let data = cluster(u32_at(odd, 0x10));
+        assert_eq!(&data[..4], b"1234");
+        assert!(data[4..].iter().all(|&b| b == 0xFF));
+    }
+
+    #[test]
+    fn missing_superblock_fields_are_filled_in() {
+        // Cards formatted by earlier emusync builds have 0xFF where the derived fields go.
+        let mut old = blank_card(8192, true, T);
+        old[SB_TAIL].fill(0xFF);
+        let spare = ecc::page_spare(&old[..PAGE]);
+        old[PAGE..PAGE + SPARE].copy_from_slice(&spare);
+        let card = Card::parse(&old).unwrap();
+        let out = card.build(&old, &[file("f", b"x")]).unwrap();
+        assert_eq!(out[SB_TAIL], blank_card(8192, true, T)[SB_TAIL]);
+        assert_eq!(&out[PAGE..PAGE + SPARE], &ecc::page_spare(&out[..PAGE]));
+    }
+
+    fn hex(b: &[u8]) -> String {
+        b.iter().map(|x| format!("{x:02x}")).collect()
     }
 
     #[test]
@@ -743,7 +890,12 @@ mod tests {
         let cap = card.capacity_clusters() as usize;
         // The root (3 entries) and the save directory (3 entries) take two clusters each.
         let fits = vec![dir("SAVE", vec![file("big", &vec![1; (cap - 4) * CLUSTER])])];
-        assert!(card.build(&img, &fits).is_ok());
+        let full = card.build(&img, &fits).unwrap();
+        // The reserve between the BIOS limit and alloc_end stays free.
+        let fat = &card.fat_clusters;
+        let entry = |i: usize| u32_at(&full, fat[i / 256] as usize * CLUSTER + (i % 256) * 4);
+        assert!((0..cap).all(|i| entry(i) & FAT_ALLOCATED != 0));
+        assert!((cap..card.alloc_end as usize).all(|i| entry(i) == FAT_FREE));
         let too_big = vec![dir("SAVE", vec![file("big", &vec![1; (cap - 4) * CLUSTER + 1])])];
         assert!(matches!(card.build(&img, &too_big), Err(FormatError::NoSpace)));
     }

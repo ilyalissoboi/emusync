@@ -889,16 +889,33 @@ Where the M0 code differs from or pins down the design above:
    (§5.1 described first-fit allocation). Entries are laid out contiguously in directory
    order: rebuilt cards are never fragmented, and two cards holding the same saves in the same
    order are byte-identical. Free clusters are erased to `0xFF`. The superblock, indirect FAT
-   and backup blocks are copied unchanged. Changed saves keep their position in the root
-   directory; new ones are appended.
+   and backup blocks are copied unchanged, except that a superblock missing its derived fields
+   (item 5) gets them filled in. Changed saves keep their position in the root directory; new
+   ones are appended. Everything written matches what the PS2 BIOS writes. That was checked
+   byte for byte against a card the BIOS formatted and saved to in PCSX2, with
+   `EMUSYNC_REAL_PS2_CARD` and `crates/emusync-formats/tests/real_card.rs`; only cluster
+   numbers differ. In particular:
+   - a save directory's `.` entry has the directory's mode, its creation time twice, and points
+     to the parent (first cluster, slot);
+   - its `..` entry has the plain directory mode `0x8427`, cluster and slot 0, and the parent's
+     creation time twice (only the root's `..` is hidden, `0xA426`);
+   - the unused rest of a file's last cluster, an unused directory slot and the unused part of
+     the indirect FAT are `0xFF`.
+
+   The first M1 build got these wrong: it wrote `..` as `0xA426` with the directory's own
+   times, `.` with the modification time, and zero padding. In PCSX2, games then found no saves
+   on a card emusync had written.
 4. **ECC** is recomputed for every page written (three bytes per 128-byte chunk, then four
    zero bytes) and is not checked on read: pages that were never written have none, and
    emulators don't check it either.
 5. **Unformatted cards.** PCSX2 creates new card files with every byte `0xFF` and leaves
    formatting to the PS2 BIOS (the cards on the development machine were in this state). An
-   image like that, of a standard size, is an empty card. The first apply formats it with
-   PCSX2's folder-card layout (8 MB: 41 reserved clusters, 8,135 allocatable; card flags
-   `0x2B`), stamped with the first incoming save's creation time. This is what lets a fresh
+   image like that, of a standard size, is an empty card. The first apply formats it as the
+   BIOS does: 8 MB gives 41 reserved clusters and 8,135 allocatable, with card flags `0x2B`.
+   The superblock includes the fields the BIOS derives from the geometry at `0x154..0x184`:
+   cluster size, FAT entries per cluster, clusters per erase block, -1, the allocatable-cluster
+   limit (8,001 on 8 MB) and -1. The card is stamped with the first incoming save's creation
+   time. This is what lets a fresh
    card on a new device receive every save from the cloud.
 6. **Not rewritten.** Cards listing bad blocks, or whose root directory doesn't start at the
    first allocatable cluster, are read and uploaded but never written to. Apply reports them as
