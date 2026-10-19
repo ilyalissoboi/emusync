@@ -438,6 +438,11 @@ impl<P: ProcessProbe> Daemon<P> {
         for path in self.undiscovered() {
             match self.engine.add_container(ContainerDesc { location: path.clone(), ..Default::default() }) {
                 Ok(_) => log::info!("found {}: now syncing it", path.display()),
+                // Registering a folder card reads it, which fails while the emulator has one of
+                // its saves locked. That passes: try again next cycle instead of skipping it.
+                Err(emusync_core::Error::Io(e)) if fsutil::is_locked(&e) => {
+                    log::debug!("found {}, locked: registering it once released", path.display());
+                }
                 Err(e) => {
                     log::warn!("not syncing {}: {e}", path.display());
                     self.skipped.insert(path_key(&path));
@@ -1190,6 +1195,35 @@ mod tests {
             }
             assert!(d.candidates.is_empty());
             assert_eq!(d.engine().containers().unwrap().len(), 3);
+        }
+
+        /// A folder card found while PCSX2 has one of its saves locked can't be read to register
+        /// it yet. It is retried, not skipped for good.
+        #[cfg(windows)]
+        #[test]
+        fn a_folder_card_locked_at_discovery_is_registered_once_released() {
+            use std::os::windows::fs::OpenOptionsExt;
+            let w = World::new();
+            let t0 = Instant::now();
+            let memcards = w.dir.path().join("a").join("memcards");
+            let save = memcards.join("Mcd001").join("BASLUS-20347-SH1-00");
+            std::fs::create_dir_all(&save).unwrap();
+            std::fs::write(memcards.join("Mcd001").join("_pcsx2_superblock"), b"").unwrap();
+            std::fs::write(save.join("data"), b"x").unwrap();
+            let lock =
+                std::fs::OpenOptions::new().read(true).write(true).share_mode(0).open(save.join("data")).unwrap();
+
+            let profiles = vec![profile("pcsx2", "ps2", Some("_pcsx2_superblock"), PCSX2, vec![memcards.clone()])];
+            let mut d = Daemon::new(w.engine("a"), profiles, FakeProbe::default(), Timing::default(), true, t0);
+            let c = d.tick(t0).expect("startup cycle");
+            assert!(!c.failed);
+            assert!(d.engine().containers().unwrap().is_empty(), "can't be registered while locked");
+            assert!(d.skipped.is_empty(), "not skipped for good");
+
+            drop(lock);
+            d.tick(t0 + s(31.0)).expect("poll");
+            let formats: Vec<String> = d.engine().containers().unwrap().into_iter().map(|c| c.format).collect();
+            assert_eq!(formats, ["ps2.card.folder"]);
         }
     }
 }
