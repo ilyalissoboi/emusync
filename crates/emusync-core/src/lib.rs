@@ -23,6 +23,7 @@ pub mod hlc;
 pub mod model;
 mod store;
 
+pub use engine::LOCKED;
 pub use engine::{
     Applied, Blocked, CardStatus, ConflictInfo, ConflictPolicy, ContainerDesc, Engine, EngineOptions, HistoryEntry,
     Resolution, SyncReport, UnitStatus,

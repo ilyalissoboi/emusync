@@ -960,9 +960,22 @@ Where the M0 code differs from or pins down the design above:
 2. **Busy is per card.** Before every cycle, each container is marked busy (`Engine::set_busy`)
    if an emulator whose profile claims it (by extension or folder card marker) is running.
    Cards no profile claims are
-   busy whenever any watched emulator runs. Busy cards are still snapshotted and uploaded; only
-   applies wait in the inbox. Process lists come from `sysinfo` every 2 s, behind a
-   `ProcessProbe` trait so tests use a fake.
+   busy whenever any watched emulator runs. Busy cards are still snapshotted and uploaded where
+   they can be read; only applies wait in the inbox. Process lists come from `sysinfo` every
+   2 s, behind a `ProcessProbe` trait so tests use a fake.
+
+   **Locked cards (Windows).** PCSX2 keeps a card file open without sharing while a game runs.
+   For a folder card, it does this with the files of the saves the game loaded. Nobody else can
+   read them meanwhile (`ERROR_SHARING_VIOLATION`; seen in PCSX2 testing with a folder card;
+   that card files behave the same way is inferred from PCSX2's file API, not observed).
+   - The engine reports such a card as blocked with `LOCKED` (`fsutil::is_locked`) and skips
+     it for that cycle. The rest of the cycle, other cards and downloads included, goes on, as
+     does an apply that finds its target locked; that change waits in the inbox.
+   - The watcher's change check doesn't count a locked card as changed. It logs the lock once
+     per episode (`waiting`, then `released`), not on every poll.
+   - The card is synced by the first cycle after it is released: the change events when PCSX2
+     closes the game, or the exit cycle.
+   - So on Windows, saves upload when the game is closed rather than while it is played.
 3. **Triggers.** File events (`notify`, non-recursive, on the folders holding cards) arm a 2 s
    debounce. When it expires, a cycle runs only if a card's content hash changed, so the
    watcher's own reads and applies don't loop. (Size and mtime are not enough: cards have a

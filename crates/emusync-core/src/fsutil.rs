@@ -13,6 +13,14 @@ fn sibling(path: &Path, suffix: &str) -> PathBuf {
 }
 
 /// Sibling temp path used while replacing `path`: `<name>.emusync-tmp`.
+/// Whether an I/O error means another program has the file open in a way that keeps others
+/// out. On Windows, PCSX2 opens card files, and the files of a folder card's loaded saves,
+/// without sharing for as long as a game runs (`ERROR_SHARING_VIOLATION`,
+/// `ERROR_LOCK_VIOLATION`). Other systems have no such mandatory locks.
+pub fn is_locked(e: &io::Error) -> bool {
+    cfg!(windows) && matches!(e.raw_os_error(), Some(32 | 33))
+}
+
 pub fn temp_path(path: &Path) -> PathBuf {
     sibling(path, ".emusync-tmp")
 }
@@ -273,6 +281,25 @@ pub fn recover_dir_replace(dir: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A file opened without sharing, as PCSX2 opens card files on Windows, can't be read by
+    /// anyone else; reading a folder card that holds one reports it as locked.
+    #[cfg(windows)]
+    #[test]
+    fn files_open_without_sharing_are_locked() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let save = dir.path().join("SAVE");
+        fs::create_dir(&save).unwrap();
+        let file = save.join("data");
+        fs::write(&file, b"x").unwrap();
+        let lock = fs::OpenOptions::new().read(true).write(true).share_mode(0).open(&file).unwrap();
+        assert!(is_locked(&fs::read(&file).unwrap_err()));
+        assert!(is_locked(&read_tree(dir.path()).unwrap_err()));
+        drop(lock);
+        assert!(read_tree(dir.path()).is_ok());
+        assert!(!is_locked(&io::Error::from(io::ErrorKind::NotFound)));
+    }
 
     fn sample() -> Tree {
         let mut t = Tree::default();

@@ -13,7 +13,7 @@
 
 use super::process::ProcessProbe;
 use super::profile::Profile;
-use emusync_core::{fsutil, short_id, split_unit, ContainerDesc, ContainerRow, Engine, SyncReport};
+use emusync_core::{fsutil, short_id, split_unit, ContainerDesc, ContainerRow, Engine, SyncReport, LOCKED};
 use emusync_formats::ContainerKind;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -84,9 +84,13 @@ pub struct Cycle {
 /// modification times included, as the engine reads it.
 type Fingerprint = Option<blake3::Hash>;
 
-fn fingerprint(path: &Path, folder: bool) -> Fingerprint {
+fn read_fingerprint(path: &Path, folder: bool) -> std::io::Result<blake3::Hash> {
     let image = if folder { fsutil::read_tree(path).map(|t| t.encode()) } else { std::fs::read(path) };
-    image.ok().map(|b| blake3::hash(&b))
+    image.map(|b| blake3::hash(&b))
+}
+
+fn fingerprint(path: &Path, folder: bool) -> Fingerprint {
+    read_fingerprint(path, folder).ok()
 }
 
 /// Whether a registered card is a directory (a folder card) rather than a file.
@@ -146,6 +150,8 @@ pub struct Daemon<P> {
     skipped: HashSet<String>,
     /// Units held back by the last cycle (logged once, not on every poll).
     held: HashSet<String>,
+    /// Cards another program had locked in the last cycle (logged once, not on every poll).
+    locked: HashSet<String>,
     offline: bool,
 }
 
@@ -171,6 +177,7 @@ impl<P: ProcessProbe> Daemon<P> {
             candidates: HashMap::new(),
             skipped: HashSet::new(),
             held: HashSet::new(),
+            locked: HashSet::new(),
             offline: false,
         }
     }
@@ -303,8 +310,13 @@ impl<P: ProcessProbe> Daemon<P> {
         if let Some(t) = self.last_change {
             if now.duration_since(t) >= self.timing.debounce {
                 self.last_change = None;
-                if self.local_changed() {
+                let (changed, locked) = self.local_changed();
+                if changed {
                     self.want(Trigger::Changed);
+                } else if let Some(card) = locked {
+                    // Windows: the emulator keeps the card locked while a game runs. The cycle
+                    // that runs once it releases the card (game closed, emulator exited) syncs it.
+                    log::debug!("change events on {card}, which is locked; it syncs once released");
                 } else {
                     log::debug!("change events, but no card file changed");
                 }
@@ -398,18 +410,39 @@ impl<P: ProcessProbe> Daemon<P> {
             .collect()
     }
 
-    fn local_changed(&self) -> bool {
+    /// Whether a card's content changed since the last cycle, and the first card that couldn't
+    /// be read because another program has it locked. A locked card doesn't count as changed:
+    /// it can't be snapshotted until it is released.
+    fn local_changed(&self) -> (bool, Option<String>) {
         let containers = self.engine.containers().unwrap_or_default();
-        containers.iter().any(|c| {
+        let mut locked = None;
+        let mut changed = false;
+        for c in &containers {
             let p = Path::new(&c.location);
-            self.fingerprints.get(&path_key(p)) != Some(&fingerprint(p, is_folder(c)))
-        }) || !self.undiscovered().is_empty()
+            let now = match read_fingerprint(p, is_folder(c)) {
+                Ok(h) => Some(h),
+                Err(e) if fsutil::is_locked(&e) => {
+                    locked.get_or_insert_with(|| c.location.clone());
+                    continue;
+                }
+                Err(_) => None,
+            };
+            if self.fingerprints.get(&path_key(p)) != Some(&now) {
+                changed = true;
+            }
+        }
+        (changed || !self.undiscovered().is_empty(), locked)
     }
 
     fn register_new_cards(&mut self) {
         for path in self.undiscovered() {
             match self.engine.add_container(ContainerDesc { location: path.clone(), ..Default::default() }) {
                 Ok(_) => log::info!("found {}: now syncing it", path.display()),
+                // Registering a folder card reads it, which fails while the emulator has one of
+                // its saves locked. That passes: try again next cycle instead of skipping it.
+                Err(emusync_core::Error::Io(e)) if fsutil::is_locked(&e) => {
+                    log::debug!("found {}, locked: registering it once released", path.display());
+                }
                 Err(e) => {
                     log::warn!("not syncing {}: {e}", path.display());
                     self.skipped.insert(path_key(&path));
@@ -496,9 +529,27 @@ impl<P: ProcessProbe> Daemon<P> {
             log::info!("applied   {} ← {} ({})", crate::target_of(&a.unit), short_id(&a.version), a.location);
         }
         let mut held = HashSet::new();
+        let mut locked = HashSet::new();
         for b in &r.blocked {
             let card = split_unit(&b.unit).map_or(b.unit.as_str(), |(c, _)| c);
-            if b.reason == IN_USE && busy.contains(card) {
+            if b.reason == LOCKED {
+                // Logged once while it lasts: every poll would otherwise repeat it.
+                let first = !self.locked.contains(card);
+                if busy.contains(card) {
+                    let level = if first { log::Level::Info } else { log::Level::Debug };
+                    log::log!(
+                        level,
+                        "waiting   {card}: {} has it open; it syncs when {} closes the game",
+                        self.running_names(),
+                        self.running_names()
+                    );
+                } else if first {
+                    log::warn!("blocked   {card}: locked by another program; it syncs once released");
+                } else {
+                    log::debug!("blocked   {card}: still locked");
+                }
+                locked.insert(card.to_string());
+            } else if b.reason == IN_USE && busy.contains(card) {
                 let level = if self.held.contains(&b.unit) { log::Level::Debug } else { log::Level::Info };
                 log::log!(
                     level,
@@ -536,6 +587,10 @@ impl<P: ProcessProbe> Daemon<P> {
         self.offline = r.offline;
         let held_back = held.len();
         self.held = held;
+        for card in self.locked.difference(&locked) {
+            log::info!("released  {card}");
+        }
+        self.locked = locked;
         let summary = format!(
             "{trigger}: pulled {} version(s), {} new local, uploaded {} version(s){}",
             r.pulled_records,
@@ -713,6 +768,44 @@ mod tests {
         let c = d.tick(t0 + s(45.0)).expect("cycle on exit");
         assert_eq!(c.applied, 0);
         assert_eq!(std::fs::read(&card_a).unwrap(), b"v3 from a");
+    }
+
+    /// On Windows, PCSX2 keeps a card opened without sharing while a game runs, so it can't be
+    /// read. The watcher waits for the card to be released instead of failing cycles or
+    /// warning on every poll, then syncs it.
+    #[cfg(windows)]
+    #[test]
+    fn a_locked_card_syncs_once_released() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let w = World::new();
+        let t0 = Instant::now();
+        let (mut d, probe, card_a) = w.daemon(b"v1", t0);
+        let (mut b, card_b) = w.other(b"v1");
+        probe.set(&[EMU]);
+        d.tick(t0 + s(2.0)).expect("cycle on start");
+
+        // The emulator saves and keeps the card locked.
+        std::fs::write(&card_a, b"v2 from a").unwrap();
+        let lock = std::fs::OpenOptions::new().read(true).write(true).share_mode(0).open(&card_a).unwrap();
+        d.on_event(&card_a, t0 + s(5.0));
+        assert!(d.tick(t0 + s(8.0)).is_none(), "a locked card can't be snapshotted yet");
+
+        // Polls still run and don't fail; the card is reported as locked, not as an error.
+        let c = d.tick(t0 + s(33.0)).expect("poll");
+        assert!(!c.failed);
+        assert_eq!(d.locked.len(), 1);
+        // A quiet poll doubles the interval: the next one is a minute later.
+        let c = d.tick(t0 + s(94.0)).expect("poll");
+        assert!(!c.failed);
+
+        // The game is closed and the emulator exits: the card is read and the save uploaded.
+        drop(lock);
+        probe.set(&[]);
+        let c = d.tick(t0 + s(96.0)).expect("cycle on exit");
+        assert_eq!(c.trigger, Trigger::Exited);
+        assert!(d.locked.is_empty());
+        b.sync().unwrap();
+        assert_eq!(std::fs::read(&card_b).unwrap(), b"v2 from a");
     }
 
     #[test]
@@ -1102,6 +1195,35 @@ mod tests {
             }
             assert!(d.candidates.is_empty());
             assert_eq!(d.engine().containers().unwrap().len(), 3);
+        }
+
+        /// A folder card found while PCSX2 has one of its saves locked can't be read to register
+        /// it yet. It is retried, not skipped for good.
+        #[cfg(windows)]
+        #[test]
+        fn a_folder_card_locked_at_discovery_is_registered_once_released() {
+            use std::os::windows::fs::OpenOptionsExt;
+            let w = World::new();
+            let t0 = Instant::now();
+            let memcards = w.dir.path().join("a").join("memcards");
+            let save = memcards.join("Mcd001").join("BASLUS-20347-SH1-00");
+            std::fs::create_dir_all(&save).unwrap();
+            std::fs::write(memcards.join("Mcd001").join("_pcsx2_superblock"), b"").unwrap();
+            std::fs::write(save.join("data"), b"x").unwrap();
+            let lock =
+                std::fs::OpenOptions::new().read(true).write(true).share_mode(0).open(save.join("data")).unwrap();
+
+            let profiles = vec![profile("pcsx2", "ps2", Some("_pcsx2_superblock"), PCSX2, vec![memcards.clone()])];
+            let mut d = Daemon::new(w.engine("a"), profiles, FakeProbe::default(), Timing::default(), true, t0);
+            let c = d.tick(t0).expect("startup cycle");
+            assert!(!c.failed);
+            assert!(d.engine().containers().unwrap().is_empty(), "can't be registered while locked");
+            assert!(d.skipped.is_empty(), "not skipped for good");
+
+            drop(lock);
+            d.tick(t0 + s(31.0)).expect("poll");
+            let formats: Vec<String> = d.engine().containers().unwrap().into_iter().map(|c| c.format).collect();
+            assert_eq!(formats, ["ps2.card.folder"]);
         }
     }
 }

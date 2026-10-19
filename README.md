@@ -62,7 +62,10 @@ emusync watch                                                    # leave it runn
   on macOS, `~/.config/PCSX2/memcards` or the Flatpak equivalent on Linux). Cards added with
   `emusync card add` are watched too. `--no-discover` limits it to those.
 - **Uploads:** when a card file changes, it syncs once the writes have been quiet for 2 s
-  (`--debounce-ms`), and again when the emulator exits.
+  (`--debounce-ms`), and again when the emulator exits. **On Windows**, PCSX2 locks a card's
+  files while a game runs, so nothing can read them. The watcher logs `waiting   <card>: PCSX2
+  has it open` once, and your saves upload as soon as you close the game or exit PCSX2. On
+  macOS and Linux they upload while you play.
 - **Downloads never touch an open card.** While PCSX2 is running, its cards are left alone:
   newer versions from other devices are fetched and wait (`held back` in the log), then are
   applied as soon as PCSX2 exits. Your own saves still upload while you play.
