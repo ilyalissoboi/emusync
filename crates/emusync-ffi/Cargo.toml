@@ -9,9 +9,10 @@ rust-version.workspace = true
 
 [lib]
 name = "emusync"
-# The shared library is built on demand, `cargo rustc -p emusync-ffi --lib --release --crate-type
-# cdylib`, because listing it here would collide on Windows with the `emusync` CLI binary: both
-# would write target/*/emusync.pdb (cargo#6313).
+# The shared library is a supported output, built on demand with `cargo rustc -p emusync-ffi --lib
+# --release --crate-type cdylib` (as scripts/build-android.sh and
+# bindings/cmake/EmuSyncAndroid.cmake do), because listing it here would collide on Windows with
+# the `emusync` CLI binary: both would write target/*/emusync.pdb (cargo#6313).
 crate-type = ["rlib", "staticlib"]
 
 [dependencies]

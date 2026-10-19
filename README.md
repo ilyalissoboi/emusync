@@ -18,7 +18,7 @@ every login.
 | `emusync-core` | Data model, version DAG, SQLite state, sync engine |
 | `emusync-formats` | Container format adapters: `ps2.card` (PS2 memory card file system), `ps2.card.folder` (PCSX2 folder cards), `raw` |
 | `emusync-remote` | `Remote` trait, S3 backend (SigV4 + rustls), in-memory remote, conformance suite |
-| `emusync-ffi` | C ABI v1 (`include/emusync.h`): static library, or shared with `cargo rustc -p emusync-ffi --lib --crate-type cdylib` |
+| `emusync-ffi` | C ABI v1 (`include/emusync.h`): static library, or shared with `cargo rustc -p emusync-ffi --lib --crate-type cdylib` ([Android](#building-for-android)) |
 | `emusyncd` | The `emusync` command-line tool, including the `emusync watch` sidecar; `emusyncw`, the same tool without a console window on Windows |
 
 ## Quick start
@@ -136,6 +136,45 @@ emulators is running.
 
 For MinIO or other S3-compatible services:
 `s3://<bucket>/<prefix>?endpoint=http://nas.local:9000&path_style=1`.
+
+## Building for Android
+
+The C ABI builds as a shared library, `libemusync.so`, for an Android app's native code to link
+(this is how ARMSX2 is meant to use it). It needs Rust with the Android target and an Android
+NDK; cargo-ndk is not needed.
+
+```sh
+rustup target add aarch64-linux-android        # and x86_64-linux-android for emulators
+export ANDROID_NDK_HOME=~/Android/Sdk/ndk/29.0.14206865
+scripts/build-android.sh                       # --target x86_64-linux-android, --api 26, --debug, --out DIR
+scripts/check-android-so.sh target/android/arm64-v8a/libemusync.so
+```
+
+The library lands in `target/android/<abi>/libemusync.so`; ship it with
+[`include/emusync.h`](include/emusync.h). It is built for API 26 with the NDK's clang, has the
+soname `libemusync.so`, is aligned for 16 KB pages, needs only `libc`, `libm` and `libdl`, and
+exports only the `es_*` functions: the SQLite, zstd and ring code inside it stays private, so it
+cannot clash with the app's own copies. The scripts run on Linux, macOS and Windows (Git Bash).
+
+From an app's CMake build (the Android Gradle Plugin's `externalNativeBuild`), include
+[`bindings/cmake/EmuSyncAndroid.cmake`](bindings/cmake/EmuSyncAndroid.cmake) instead. It runs
+cargo for the ABI being built, defines the imported target `emusync::emusync`, and copies
+`libemusync.so` into the per-ABI library directory so that it is packaged in the APK. Without
+cargo, rustc or the Rust target it sets `EMUSYNC_ANDROID_FOUND` to `OFF` and adds nothing, so the
+app can compile the feature out:
+
+```cmake
+include(${CMAKE_SOURCE_DIR}/3rdparty/emusync/bindings/cmake/EmuSyncAndroid.cmake)
+if(EMUSYNC_ANDROID_FOUND)
+  target_link_libraries(emucore PRIVATE emusync::emusync)
+  target_compile_definitions(emucore PRIVATE HAS_EMUSYNC)
+endif()
+```
+
+[`bindings/cmake/android-test`](bindings/cmake/android-test/CMakeLists.txt) is a complete
+example; CI builds it for arm64-v8a and x86_64, checks the result, runs the C smoke test on an
+x86_64 emulator, and uploads `libemusync.so` and `emusync.h` as the `libemusync-android`
+artifact.
 
 ## Tests
 

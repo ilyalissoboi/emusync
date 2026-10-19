@@ -31,6 +31,96 @@ jobs:
       - name: Build the C ABI as a shared library
         run: cargo rustc -p emusync-ffi --lib --crate-type cdylib
 
+  # libemusync.so for Android, the way ARMSX2 links it (docs/research/armsx2.md §4). The ELF
+  # checks are in scripts/check-android-so.sh.
+  android:
+    name: Android (libemusync.so)
+    runs-on: ubuntu-latest
+    env:
+      NDK_VERSION: 29.0.14206865 # the NDK ARMSX2 pins
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android, x86_64-linux-android
+      - uses: Swatinem/rust-cache@v2
+      - name: Install the Android NDK and Ninja
+        run: |
+          ndk="$ANDROID_HOME/ndk/$NDK_VERSION"
+          if [ ! -d "$ndk" ]; then
+            "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$NDK_VERSION" > /dev/null
+          fi
+          echo "ANDROID_NDK_HOME=$ndk" >> "$GITHUB_ENV"
+          command -v ninja || sudo apt-get install -y ninja-build
+      - name: Build with scripts/build-android.sh
+        run: scripts/build-android.sh --target aarch64-linux-android --target x86_64-linux-android --out dist
+      - name: Check the libraries
+        run: scripts/check-android-so.sh dist/arm64-v8a/libemusync.so dist/x86_64/libemusync.so
+      - name: Build with bindings/cmake/EmuSyncAndroid.cmake
+        run: |
+          for abi in arm64-v8a x86_64; do
+            cmake -S bindings/cmake/android-test -B "build/$abi" -G Ninja \
+              -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" \
+              -DANDROID_ABI=$abi -DANDROID_PLATFORM=android-26 -DCMAKE_BUILD_TYPE=Release \
+              -DEMUSYNC_CARGO_TARGET_DIR="$PWD/target"
+            cmake --build "build/$abi"
+          done
+      - name: Check the CMake build
+        run: |
+          scripts/check-android-so.sh build/arm64-v8a/libs/arm64-v8a/libemusync.so build/x86_64/libs/x86_64/libemusync.so
+          # A host linked against it must record the bare soname, which is what Android looks up.
+          readelf="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+          for f in build/arm64-v8a/libs/arm64-v8a/libemusync_host.so build/arm64-v8a/emusync_smoke; do
+            "$readelf" -d "$f" | grep NEEDED
+            "$readelf" -d "$f" | grep -q 'NEEDED.*\[libemusync\.so\]' || { echo "::error::$f does not need libemusync.so by name"; exit 1; }
+          done
+      - name: The CMake module switches itself off without the Rust target
+        run: |
+          cmake -S bindings/cmake/android-test -B build/off -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=armeabi-v7a -DANDROID_PLATFORM=android-26 -DEMUSYNC_EXPECT_FOUND=OFF | tee off.log
+          grep -q "emusync: Rust target armv7-linux-androideabi not installed -> DISABLED" off.log
+      - name: Stage the artifacts
+        run: |
+          mkdir -p dist/include smoke-x86_64
+          cp include/emusync.h dist/include/
+          cp build/x86_64/libs/x86_64/libemusync.so build/x86_64/emusync_smoke smoke-x86_64/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libemusync-android
+          path: dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-smoke-x86_64
+          path: smoke-x86_64/
+          retention-days: 1
+
+  # The C smoke test against libemusync.so on an x86_64 emulator. An arm64 image cannot run on
+  # x86_64 runners, so the arm64 library is covered by the ELF checks above.
+  android-emulator:
+    name: Android emulator (C smoke test)
+    needs: android
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: android-smoke-x86_64
+          path: smoke
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 30
+          arch: x86_64
+          target: default
+          disable-animations: true
+          emulator-options: -no-window -no-snapshot -noaudio -no-boot-anim -gpu swiftshader_indirect
+          script: bash .github/scripts/android_smoke.sh smoke
+
   s3-moto:
     name: S3 tests (moto)
     runs-on: ubuntu-latest
