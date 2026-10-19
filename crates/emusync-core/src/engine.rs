@@ -50,6 +50,10 @@ fn write_image(path: &Path, fmt: &dyn ContainerFormat, image: &[u8]) -> std::io:
     }
 }
 
+/// Reason reported for a container another program has locked (see [`fsutil::is_locked`]). It is
+/// read again on the next cycle; nothing else in the cycle is affected.
+pub const LOCKED: &str = "locked by another program";
+
 /// What to do when a unit has more than one tip (DESIGN §6.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ConflictPolicy {
@@ -667,6 +671,10 @@ impl Engine {
         // An interrupted replace of a folder card is finished first, unless the emulator has it.
         let image = match read_image(path, fmt, !self.busy.contains(&c.id)) {
             Ok(b) => b,
+            Err(e) if fsutil::is_locked(&e) => {
+                report.blocked.push(Blocked { unit: card_unit, reason: LOCKED.into() });
+                return Ok(None);
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 report.blocked.push(Blocked { unit: card_unit, reason: format!("{} does not exist", c.location) });
                 return Ok(None);
@@ -998,7 +1006,16 @@ impl Engine {
         let path = Path::new(&c.location);
         let fmt = self.format_of(c)?;
         // 1. Read the current container. It must still be what we scanned (and validated).
-        let current = read_image(path, fmt, false)?;
+        let current = match read_image(path, fmt, false) {
+            Ok(b) => b,
+            Err(e) if fsutil::is_locked(&e) => {
+                for (unit, t) in &pending {
+                    self.block(c, unit, &t.rec.id, LOCKED.into(), report)?;
+                }
+                return Ok(());
+            }
+            Err(e) => return Err(e.into()),
+        };
         if content_id(&current) != image_hash {
             for (unit, _) in &pending {
                 report.blocked.push(Blocked {
