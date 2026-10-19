@@ -484,6 +484,14 @@ dependencies = [
 [[package]]
 name = "emusync-ffi"
 version = "0.1.0"
+dependencies = [
+ "cc",
+ "emusync-core",
+ "emusync-formats",
+ "emusync-remote",
+ "log",
+ "tempfile",
+]
 
 [[package]]
 name = "emusync-formats"

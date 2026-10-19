@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Local content hash of a unit that is not on the card (deleted, or not placed yet).
 const ABSENT: &str = "absent";
@@ -74,6 +74,12 @@ pub struct EngineOptions {
     pub policy: ConflictPolicy,
     /// Local snapshot store budget (DESIGN §7). A unit's latest snapshot is never evicted.
     pub snapshot_budget_bytes: u64,
+    /// Whether sync cycles snapshot containers marked busy. The sidecar does: it watches the
+    /// files and debounces changes itself. An embedded host reports its quiet points
+    /// ([`Engine::snapshot_containers`] from `es_container_touched` / `es_container_flushed`)
+    /// and sets this to false, so a cycle never reads a card the emulator may be writing.
+    /// Remote changes for a skipped container still go to the inbox.
+    pub scan_busy: bool,
 }
 
 impl Default for EngineOptions {
@@ -83,6 +89,7 @@ impl Default for EngineOptions {
             emulator_id: "emusync".into(),
             policy: ConflictPolicy::Ask,
             snapshot_budget_bytes: 100 * 1024 * 1024,
+            scan_busy: true,
         }
     }
 }
@@ -104,13 +111,39 @@ pub struct ContainerDesc {
 pub struct Applied {
     pub unit: String,
     pub version: String,
+    pub container: i64,
     pub location: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Blocked {
     pub unit: String,
+    /// The container that couldn't be read or written.
+    pub container: i64,
+    pub kind: BlockKind,
     pub reason: String,
+}
+
+/// Why a container couldn't be synced or a unit couldn't be applied, for hosts that react
+/// differently to each (the C ABI's `ES_EV_APPLY_BLOCKED` status). `reason` has the details.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BlockKind {
+    /// Not enough free space on the card.
+    NoSpace,
+    /// The emulator has the container open ([`Engine::set_busy`]), or another program locked it.
+    Busy,
+    /// The container does not exist.
+    Missing,
+    /// The container, or the incoming content, failed validation; nothing was written.
+    Invalid,
+    /// The content could not be fetched (offline, or missing from the remote).
+    Unavailable,
+    /// The container is read-only, or could not be read or replaced.
+    Io,
+    /// The card's mode needs an adapter this build lacks.
+    Unsupported,
+    /// The container changed while the cycle ran; it is snapshotted next cycle.
+    Changed,
 }
 
 /// Outcome of one sync cycle.
@@ -133,6 +166,8 @@ pub struct SyncReport {
     pub mode_changes: Vec<String>,
     /// `(old, new)` when this installation found its device id in use elsewhere and minted a new one.
     pub reminted: Option<(String, String)>,
+    /// `(unit, version)` for every version uploaded in this cycle.
+    pub uploaded: Vec<(String, String)>,
     /// Log records still waiting to upload.
     pub pending_uploads: usize,
     pub warnings: Vec<String>,
@@ -212,6 +247,13 @@ pub enum Resolution {
     Take(String),
 }
 
+/// What [`Engine::prepare_remote`] found out about a remote.
+#[derive(Debug, Clone)]
+pub struct RemoteSetup {
+    pub uri: String,
+    pub conditional_writes: bool,
+}
+
 #[derive(Serialize, Deserialize)]
 struct PendingSegment {
     body: String,
@@ -224,7 +266,42 @@ pub struct Engine {
     remote: Option<Arc<dyn Remote>>,
     conditional_writes: bool,
     opts: EngineOptions,
-    busy: HashSet<i64>,
+    busy: BusyGate,
+}
+
+/// The containers the emulator has open ([`Engine::set_busy`]), shareable with other threads.
+/// The engine holds the gate while it replaces a container, so once [`BusyGate::set`] marks a
+/// container busy, the engine does not write to it any more.
+#[derive(Clone, Default)]
+pub struct BusyGate(Arc<Mutex<HashSet<i64>>>);
+
+impl BusyGate {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashSet<i64>> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Marks a container as open or closed. Waits for a write to it that is in progress.
+    pub fn set(&self, container: i64, busy: bool) {
+        let mut set = self.lock();
+        if busy {
+            set.insert(container);
+        } else {
+            set.remove(&container);
+        }
+    }
+
+    pub fn contains(&self, container: i64) -> bool {
+        self.lock().contains(&container)
+    }
+
+    /// Runs `write` while holding the gate, unless the container is busy (`None`).
+    fn write_unless_busy<T>(&self, container: i64, write: impl FnOnce() -> T) -> Option<T> {
+        let set = self.lock();
+        if set.contains(&container) {
+            return None;
+        }
+        Some(write())
+    }
 }
 
 fn segment_key(device: &str, seq: u64) -> String {
@@ -287,7 +364,7 @@ impl Engine {
         let me = store.meta("device_id")?.unwrap();
         store.set_device_name(&me, &name)?;
         let conditional_writes = store.meta("conditional_writes")?.as_deref() == Some("1");
-        Ok(Self { dir, store, remote: None, conditional_writes, opts, busy: HashSet::new() })
+        Ok(Self { dir, store, remote: None, conditional_writes, opts, busy: BusyGate::default() })
     }
 
     pub fn device_id(&self) -> Result<String> {
@@ -314,16 +391,28 @@ impl Engine {
     /// describe that repository only. Adding a different remote is refused; use a new data
     /// directory for it. Re-adding the same remote is allowed.
     pub fn add_remote(&mut self, remote: Arc<dyn Remote>) -> Result<bool> {
-        if let Some(existing) = self.store.meta("remote")? {
-            if existing != remote.describe() {
-                return Err(Error::InvalidArg(format!(
-                    "this data directory is already bound to {existing}; use a new data directory for {}",
-                    remote.describe()
-                )));
-            }
+        self.check_remote(&remote.describe())?;
+        let setup = Self::prepare_remote(&*remote)?;
+        self.bind_remote(remote, setup)
+    }
+
+    /// Fails if this data directory is bound to a remote other than `uri` (see
+    /// [`Engine::add_remote`]).
+    pub fn check_remote(&self, uri: &str) -> Result<()> {
+        match self.store.meta("remote")? {
+            Some(existing) if existing != uri => Err(Error::InvalidArg(format!(
+                "this data directory is already bound to {existing}; use a new data directory for {uri}"
+            ))),
+            _ => Ok(()),
         }
+    }
+
+    /// The network half of [`Engine::add_remote`], which needs no engine, so a host can run it
+    /// on another thread: validates access, probes conditional writes, and creates `repo.json`
+    /// if the repository is new. Finish with [`Engine::bind_remote`].
+    pub fn prepare_remote(remote: &dyn Remote) -> Result<RemoteSetup> {
         remote.list_dirs("devices/")?;
-        let cond = probe_conditional_writes(&*remote)?;
+        let cond = probe_conditional_writes(remote)?;
         match remote.get("repo.json")? {
             Some(body) => {
                 let v: serde_json::Value = serde_json::from_slice(&body)?;
@@ -337,10 +426,18 @@ impl Engine {
                     "repo_id": uuid::Uuid::now_v7().to_string(),
                     "encryption": null,
                 });
-                create_only(&*remote, "repo.json", repo.to_string().as_bytes(), cond)?;
+                create_only(remote, "repo.json", repo.to_string().as_bytes(), cond)?;
             }
         }
-        self.store.set_meta("remote", &remote.describe())?;
+        Ok(RemoteSetup { uri: remote.describe(), conditional_writes: cond })
+    }
+
+    /// The local half of [`Engine::add_remote`]: binds this data directory to the remote that
+    /// [`Engine::prepare_remote`] set up. Returns whether it supports conditional writes.
+    pub fn bind_remote(&mut self, remote: Arc<dyn Remote>, setup: RemoteSetup) -> Result<bool> {
+        self.check_remote(&setup.uri)?;
+        let cond = setup.conditional_writes;
+        self.store.set_meta("remote", &setup.uri)?;
         self.store.set_meta("conditional_writes", if cond { "1" } else { "0" })?;
         self.conditional_writes = cond;
         self.remote = Some(remote);
@@ -484,7 +581,7 @@ impl Engine {
                 }
             }
         }
-        if containers.iter().any(|c| self.busy.contains(&c.id)) {
+        if containers.iter().any(|c| self.busy.contains(c.id)) {
             return Err(Error::InvalidArg(format!("card {card_id} is in use")));
         }
         let mut report = SyncReport::default();
@@ -494,8 +591,15 @@ impl Engine {
         self.store.tx(|| self.publish_card(&card_id, mode))
     }
 
-    fn card_mode(&self, card_id: &str) -> Result<CardMode> {
+    /// The mode of a card, by card id (`ps2:Mcd001`). A card the repository doesn't know
+    /// yet is in whole-file mode.
+    pub fn card_mode(&self, card_id: &str) -> Result<CardMode> {
         Ok(self.store.card(card_id)?.map_or(CardMode::WholeFile, |(m, _)| m))
+    }
+
+    /// Every card the repository knows, with its mode.
+    pub fn card_modes(&self) -> Result<Vec<(String, CardMode)>> {
+        self.store.cards()
     }
 
     pub fn remove_container(&mut self, id: i64) -> Result<()> {
@@ -505,11 +609,12 @@ impl Engine {
     /// Marks a container as open by the emulator. Results for busy containers go to the inbox
     /// and are applied by the first sync after it is released.
     pub fn set_busy(&mut self, container: i64, busy: bool) {
-        if busy {
-            self.busy.insert(container);
-        } else {
-            self.busy.remove(&container);
-        }
+        self.busy.set(container, busy);
+    }
+
+    /// A handle on the busy set for other threads (see [`BusyGate`]).
+    pub fn busy_gate(&self) -> BusyGate {
+        self.busy.clone()
     }
 
     pub fn containers(&self) -> Result<Vec<ContainerRow>> {
@@ -602,6 +707,46 @@ impl Engine {
     /// duplicate. Without a reachable remote the local steps still run and versions wait in the
     /// outbox.
     pub fn sync(&mut self) -> Result<SyncReport> {
+        self.cycle(true)
+    }
+
+    /// [`Engine::sync`] without the push: pull, snapshot, reconcile and apply. For a session
+    /// that is about to start, where only the incoming changes matter; local changes wait in
+    /// the outbox for the next push.
+    pub fn pull_and_apply(&mut self) -> Result<SyncReport> {
+        self.cycle(false)
+    }
+
+    /// Quiescent snapshot only (DESIGN §6.4): local changes in `containers` (or every
+    /// container) become versions in the outbox. No network, nothing is written to a container.
+    pub fn snapshot_containers(&mut self, containers: Option<&[i64]>) -> Result<SyncReport> {
+        let mut report = SyncReport::default();
+        for c in self.store.containers()? {
+            if containers.map_or(true, |ids| ids.contains(&c.id)) {
+                self.scan(&c, &mut report)?;
+            }
+        }
+        report.offline = true;
+        report.pending_uploads = self.store.outbox()?.len();
+        Ok(report)
+    }
+
+    /// Uploads the outbox, if a remote is attached and reachable. `offline` in the report is
+    /// set when it isn't; the records stay queued.
+    pub fn push_pending(&mut self) -> Result<SyncReport> {
+        let mut report = SyncReport { offline: true, ..Default::default() };
+        if let Some(r) = self.remote.clone() {
+            match self.push(&*r, &mut report) {
+                Ok(()) => report.offline = false,
+                Err(e) if e.is_offline() => log::info!("push failed, will retry: {e}"),
+                Err(e) => return Err(e),
+            }
+        }
+        report.pending_uploads = self.store.outbox()?.len();
+        Ok(report)
+    }
+
+    fn cycle(&mut self, push: bool) -> Result<SyncReport> {
         let mut report = SyncReport::default();
         let remote = self.remote.clone();
         let mut online = remote.is_some();
@@ -617,6 +762,13 @@ impl Engine {
         let containers = self.store.containers()?;
         let mut scanned = HashMap::new();
         for c in &containers {
+            if !self.opts.scan_busy && self.busy.contains(c.id) {
+                // Not read: reconciled against what the last snapshot recorded. The empty image
+                // hash never matches, so `apply` writes nothing even if the container is no
+                // longer busy by then; changes for it wait in the inbox.
+                scanned.insert(c.id, String::new());
+                continue;
+            }
             if let Some(image_hash) = self.scan(c, &mut report)? {
                 scanned.insert(c.id, image_hash);
             }
@@ -627,7 +779,7 @@ impl Engine {
                 self.reconcile(c, image_hash, online, &mut report)?;
             }
         }
-        if online {
+        if online && push {
             if let Some(r) = &remote {
                 if let Err(e) = self.push(&**r, &mut report) {
                     if !e.is_offline() {
@@ -662,6 +814,8 @@ impl Engine {
         if !self.card_syncable(c)? {
             report.blocked.push(Blocked {
                 unit: card_unit,
+                container: c.id,
+                kind: BlockKind::Unsupported,
                 reason: format!("card syncs per save, which this build can't do for format {:?}", c.format),
             });
             return Ok(None);
@@ -669,25 +823,33 @@ impl Engine {
         let path = Path::new(&c.location);
         let fmt = self.format_of(c)?;
         // An interrupted replace of a folder card is finished first, unless the emulator has it.
-        let image = match read_image(path, fmt, !self.busy.contains(&c.id)) {
+        let image = match read_image(path, fmt, !self.busy.contains(c.id)) {
             Ok(b) => b,
             Err(e) if fsutil::is_locked(&e) => {
-                report.blocked.push(Blocked { unit: card_unit, reason: LOCKED.into() });
+                report.blocked.push(Blocked {
+                    unit: card_unit,
+                    container: c.id,
+                    kind: BlockKind::Busy,
+                    reason: LOCKED.into(),
+                });
                 return Ok(None);
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                report.blocked.push(Blocked { unit: card_unit, reason: format!("{} does not exist", c.location) });
+                let reason = format!("{} does not exist", c.location);
+                report.blocked.push(Blocked { unit: card_unit, container: c.id, kind: BlockKind::Missing, reason });
                 return Ok(None);
             }
             Err(e) if fmt.kind() == ContainerKind::Directory => {
-                report.blocked.push(Blocked { unit: card_unit, reason: format!("cannot read {}: {e}", c.location) });
+                let reason = format!("cannot read {}: {e}", c.location);
+                report.blocked.push(Blocked { unit: card_unit, container: c.id, kind: BlockKind::Io, reason });
                 return Ok(None);
             }
             Err(e) => return Err(e.into()),
         };
         if let Err(e) = fmt.validate(&image) {
             // A container that fails validation is never synced, so corruption doesn't spread.
-            report.blocked.push(Blocked { unit: card_unit, reason: e.to_string() });
+            let reason = e.to_string();
+            report.blocked.push(Blocked { unit: card_unit, container: c.id, kind: BlockKind::Invalid, reason });
             return Ok(None);
         }
         match self.card_mode(&c.card_id)? {
@@ -708,7 +870,13 @@ impl Engine {
                 let units = match fmt.extract_all(&image) {
                     Ok(u) => u,
                     Err(e) => {
-                        report.blocked.push(Blocked { unit: card_unit, reason: e.to_string() });
+                        let reason = e.to_string();
+                        report.blocked.push(Blocked {
+                            unit: card_unit,
+                            container: c.id,
+                            kind: BlockKind::Invalid,
+                            reason,
+                        });
                         return Ok(None);
                     }
                 };
@@ -978,9 +1146,17 @@ impl Engine {
         Ok(StoredVersion { rec, origin: self.device_id()? })
     }
 
-    fn block(&self, c: &ContainerRow, unit: &str, target: &str, reason: String, report: &mut SyncReport) -> Result<()> {
+    fn block(
+        &self,
+        c: &ContainerRow,
+        unit: &str,
+        target: &str,
+        kind: BlockKind,
+        reason: String,
+        report: &mut SyncReport,
+    ) -> Result<()> {
         self.store.inbox_put(unit, c.id, target, &reason)?;
-        report.blocked.push(Blocked { unit: unit.to_string(), reason });
+        report.blocked.push(Blocked { unit: unit.to_string(), container: c.id, kind, reason });
         Ok(())
     }
 
@@ -996,10 +1172,14 @@ impl Engine {
         online: bool,
         report: &mut SyncReport,
     ) -> Result<()> {
-        if c.flags & CF_READ_ONLY != 0 || self.busy.contains(&c.id) {
-            let reason = if c.flags & CF_READ_ONLY != 0 { "container is read-only" } else { "container is in use" };
+        if c.flags & CF_READ_ONLY != 0 || self.busy.contains(c.id) {
+            let (kind, reason) = if c.flags & CF_READ_ONLY != 0 {
+                (BlockKind::Io, "container is read-only")
+            } else {
+                (BlockKind::Busy, "container is in use")
+            };
             for (unit, t) in &pending {
-                self.block(c, unit, &t.rec.id, reason.into(), report)?;
+                self.block(c, unit, &t.rec.id, kind, reason.into(), report)?;
             }
             return Ok(());
         }
@@ -1010,7 +1190,7 @@ impl Engine {
             Ok(b) => b,
             Err(e) if fsutil::is_locked(&e) => {
                 for (unit, t) in &pending {
-                    self.block(c, unit, &t.rec.id, LOCKED.into(), report)?;
+                    self.block(c, unit, &t.rec.id, BlockKind::Busy, LOCKED.into(), report)?;
                 }
                 return Ok(());
             }
@@ -1020,6 +1200,8 @@ impl Engine {
             for (unit, _) in &pending {
                 report.blocked.push(Blocked {
                     unit: unit.clone(),
+                    container: c.id,
+                    kind: BlockKind::Changed,
                     reason: "container changed during sync; it will be snapshotted next cycle".into(),
                 });
             }
@@ -1035,7 +1217,10 @@ impl Engine {
             }
             match self.assemble(&t.rec, online) {
                 Ok(b) => ready.push((unit, t, Some(b))),
-                Err(e) => self.block(c, &unit, &t.rec.id, format!("content not available: {e}"), report)?,
+                Err(e) => {
+                    let reason = format!("content not available: {e}");
+                    self.block(c, &unit, &t.rec.id, BlockKind::Unavailable, reason, report)?
+                }
             }
         }
         if ready.is_empty() {
@@ -1047,7 +1232,8 @@ impl Engine {
                 let (unit, t, content) = ready.pop().expect("whole-file mode has one unit");
                 let content = content.unwrap_or_default();
                 if let Err(e) = fmt.validate(&content) {
-                    return self.block(c, &unit, &t.rec.id, format!("the synced card image is not valid: {e}"), report);
+                    let reason = format!("the synced card image is not valid: {e}");
+                    return self.block(c, &unit, &t.rec.id, BlockKind::Invalid, reason, report);
                 }
                 (content, vec![(unit, t)])
             }
@@ -1077,9 +1263,17 @@ impl Engine {
             }
         }
         // 5. Temp file (or directory), fsync, atomic replace.
-        if let Err(e) = write_image(path, fmt, &image) {
+        // A host thread may have marked the container busy since the check above (a session
+        // that stopped waiting for this cycle). The gate is held across the write, so once
+        // `BusyGate::set` returns nothing writes to the container any more.
+        let failure = match self.busy.write_unless_busy(c.id, || write_image(path, fmt, &image)) {
+            None => Some((BlockKind::Busy, "container is in use".to_string())),
+            Some(Err(e)) => Some((BlockKind::Io, format!("cannot replace {}: {e}", c.location))),
+            Some(Ok(())) => None,
+        };
+        if let Some((kind, reason)) = failure {
             for (unit, t) in &applied {
-                self.block(c, unit, &t.rec.id, format!("cannot replace {}: {e}", c.location), report)?;
+                self.block(c, unit, &t.rec.id, kind, reason.clone(), report)?;
             }
             return Ok(());
         }
@@ -1092,7 +1286,7 @@ impl Engine {
             Ok(())
         })?;
         for (unit, t) in applied {
-            report.applied.push(Applied { unit, version: t.rec.id, location: c.location.clone() });
+            report.applied.push(Applied { unit, version: t.rec.id, container: c.id, location: c.location.clone() });
         }
         Ok(())
     }
@@ -1130,9 +1324,13 @@ impl Engine {
                     applied.push((unit, t));
                 }
                 Err(FormatError::NoSpace) => {
-                    self.block(c, &unit, &t.rec.id, "not enough free space on the card".into(), report)?
+                    let reason = "not enough free space on the card".into();
+                    self.block(c, &unit, &t.rec.id, BlockKind::NoSpace, reason, report)?
                 }
-                Err(e) => self.block(c, &unit, &t.rec.id, format!("cannot write this save: {e}"), report)?,
+                Err(e) => {
+                    let reason = format!("cannot write this save: {e}");
+                    self.block(c, &unit, &t.rec.id, BlockKind::Invalid, reason, report)?
+                }
             }
         }
         Ok((image, applied))
@@ -1213,6 +1411,11 @@ impl Engine {
         Ok(out)
     }
 
+    /// A version's record, if it is known locally.
+    pub fn version(&self, id: &str) -> Result<Option<VersionRecord>> {
+        Ok(self.store.version(id)?.map(|v| v.rec))
+    }
+
     /// Reads a version's content (from local stores or the remote).
     pub fn read_version(&self, id: &str) -> Result<Vec<u8>> {
         let v = self.store.version(id)?.ok_or_else(|| Error::NotFound(id.to_string()))?;
@@ -1238,10 +1441,10 @@ impl Engine {
                 seg
             }
         };
-        let mut versions = 0;
+        let mut units = Vec::new();
         for line in seg.body.lines() {
             if let Ok(Some(LogRecord::Version(v))) = parse_record(line.as_bytes()) {
-                versions += 1;
+                units.push((v.unit.clone(), v.id.clone()));
                 for id in &v.chunks {
                     self.upload_blob(remote, id, report)?;
                 }
@@ -1270,7 +1473,8 @@ impl Engine {
             self.store.set_meta("next_seq", &(seq + 1).to_string())?;
             self.store.delete_meta("pending_segment")
         })?;
-        report.uploaded_versions += versions;
+        report.uploaded_versions += units.len();
+        report.uploaded.extend(units);
         self.clean_staging()?;
         Ok(())
     }

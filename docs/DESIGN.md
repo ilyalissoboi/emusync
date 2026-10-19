@@ -867,7 +867,8 @@ Where the M0 code differs from or pins down the design above:
 8. **Not yet implemented:** compaction snapshots and garbage collection (new devices replay
    full logs), `device.json` last-seen updates (it is written once), sessions and leases
    (`Engine::set_busy` routes results to the inbox instead), the size+mtime fingerprint
-   shortcut (cards are re-hashed each scan), and the FFI beyond version/status functions.
+   shortcut (cards are re-hashed each scan), and the FFI beyond version/status functions (now
+   in §20).
 9. **Platform details.** HTTP is `ureq` 2 with rustls/ring. On Windows the atomic replace is
    `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` (via `std::fs::rename`) rather than `ReplaceFileW`.
    Devices are discovered with one delimiter LIST of `devices/` per cycle. The conditional-write
@@ -1132,3 +1133,92 @@ reasoned from it, not observed in a running PCSX2.
    read a folder card with saves written by PCSX2. The tests build folders from the format
    as read in PCSX2's source. Folder cards larger than 8 MB are read with their own
    superblock's capacity, but an unformatted folder card is always formatted as 8 MB.
+
+## 20. Implementation notes (C ABI v1)
+
+`crates/emusync-ffi` implements `include/emusync.h` (ABI version 1). Where it differs from or
+pins down §3.2, §6.4, §10 and §12:
+
+1. **Threads (§3.2).** No async runtime: one worker thread per client owns the `Engine`, which
+   is synchronous, and runs commands from a queue. `es_remote_add` runs the network half of its
+   setup (`Engine::prepare_remote`: LIST, conditional-write probe, `repo.json`) on a short-lived
+   helper thread, so a slow endpoint doesn't hold up the worker; the result is handed to the
+   worker (`Engine::bind_remote`). An endpoint that is unreachable is attached anyway and set up
+   at the next network cycle. Its URI is reserved meanwhile (in memory), so a second
+   `es_remote_add` for another remote is refused, as for a bound data directory.
+2. **What waits.** Blocking calls with their own deadline: `es_session_begin` (`timeout_ms`,
+   default 3 s), `es_app_suspend` (`budget_ms`), `es_remote_add` (10 s), `es_container_flushed`
+   (2 s for the local snapshot, then `ES_PENDING`) and `es_client_destroy`. Calls that need an
+   answer from the worker (container add/remove, unit history and restore) wait up to 10 s for
+   it to be free and return `ES_TIMEOUT`, having had no effect, if it is stuck in a network
+   operation. Card modes and conflicts are read from a cache the worker refreshes after every
+   command, so `es_card_get_mode`, `es_card_set_mode` (validation) and `es_conflict_get` never
+   wait. `es_container_flushed` and `es_app_suspend` jump the queue.
+3. **Session safety.** `es_session_begin` queues a pull-and-apply cycle (`Engine::pull_and_apply`,
+   no push) and, whatever happened by the deadline, marks the mounted containers busy before it
+   returns. The busy set is now a `BusyGate` the engine shares with other threads and holds
+   across every container write, so once `es_session_begin` returns, a pull that is still
+   running sends its results to the inbox instead of writing to a card the emulator has open
+   (tested with a remote whose LIST stalls past the deadline). Busy marks are counted per
+   session, so a session ending on the worker can't clear the mark of the next one on the same
+   card. A container can be in only one open session (`ES_E_BUSY`), and can't be removed while
+   a session is open or starting with it.
+   A cycle also never *reads* a busy container (`EngineOptions::scan_busy = false`, which the
+   sidecar leaves on): a pull that runs past the deadline would otherwise snapshot a card the
+   emulator is writing. Busy containers are snapshotted only at the host's quiet points
+   (`touched` after the debounce, `flushed`, session end); remote changes for them are still
+   reconciled against the last snapshot and wait in the inbox.
+4. **Session end.** Final snapshot of the mounted containers, clear busy, then one full cycle
+   (pull, apply inbox items, push), rather than snapshot → push → clear → apply. One push
+   instead of two; the result is the same. `played_ms` is not recorded yet.
+5. **Struct versioning (§12).** Output structs carry `struct_size` too (`es_session_info`,
+   `es_conflict_info`, `es_event`, `es_state_info`), set by the host's `ES_*_INIT` macro, so the
+   library knows how much it may write. A struct smaller than the library's is `ES_E_ABI`; a
+   larger one (a newer header) is accepted. `es_version_info` is embedded in `es_conflict_info`
+   and therefore frozen. Version and state ids are 72-byte buffers (`b3:` + 64 hex digits).
+   `es_conflict_info` gained `container` and `unit_id`, and `es_event` gained `unit_id`, so a
+   host can pass them to `es_unit_history` / `es_unit_restore`. `tests/c_abi.rs` compiles a C
+   program that prints every size and offset and compares them with the Rust definitions.
+6. **Events.** Strings of a polled event live in the client, keyed by a token in
+   `_internal`, until `es_event_release`: a double release is harmless and `es_client_destroy`
+   frees any left. `ES_EV_APPLY_BLOCKED` is reported once per unit and cause until it clears (a
+   full card would otherwise repeat every cycle); its status comes from a new
+   `engine::BlockKind` on every `Blocked` entry rather than from the reason text.
+   `ES_EV_UNIT_UPLOADED` uses the new `SyncReport::uploaded`. Not emitted in v1: `PROGRESS`,
+   `LEASE_CHANGED`, `HANDOFF_REQUESTED`, `STATE_AVAILABLE`. The queue holds 4096 events; beyond
+   that the oldest are dropped and an `ES_EV_ERROR` says how many.
+7. **Logging.** Engine code logs through the `log` crate, which has one logger per process. The
+   library installs a router that sends each record to the client whose thread produced it
+   (worker and helper threads, and host threads inside an API call, register their client in a
+   thread-local). A Rust host that installed its own logger first keeps it, and the callback
+   then gets nothing. A read-write "alive" guard ensures no log, wake or credential callback
+   runs after `es_client_destroy` returns, even when the worker outlives its deadline.
+8. **Credentials.** `emusync_remote::CallbackCredentials` wraps the host's provider: it caches
+   the answer, refetches temporary credentials 5 minutes before `expires_unix_ms`, and drops
+   them when the remote answers 401/403, after which `S3Remote` retries the request once
+   (`CredentialProvider::invalidate`). The `es_credentials` buffer is zeroed before the call
+   and wiped after. Only `ES_CRED_S3` is accepted.
+9. **Not implemented, refused with `ES_E_INVALID_ARG`:** custom VFS (`es_config.vfs` must be
+   NULL), `ES_POLICY_PREFER_LOCAL` / `PREFER_REMOTE` (if two devices each prefer their own copy,
+   their automatic merges never converge; needs a design), per-game containers (`title_scope`),
+   `ES_CF_NO_UPLOAD`, encryption (`es_repo_*`), OAuth (`es_oauth_*`) and save states
+   (`es_state_*`, M3). Leases don't exist yet, so `other_device_active` is always empty and
+   `ES_CFG_DISABLE_LEASES` (like the metered-network flags) has no effect. There is no
+   background timer: hosts call `es_sync_now` when they want a cycle; `es_remote_add` doesn't
+   start one.
+10. **One client per data directory** per process (`ES_E_BUSY`), since two engines on one
+    SQLite state would race on its sequence numbers and HLC.
+11. **Build.** `crate-type = ["rlib", "staticlib"]`; the shared library is built with
+    `cargo rustc -p emusync-ffi --lib --crate-type cdylib` (CI does this on every OS). Listing
+    `cdylib` in `Cargo.toml` would make it collide on Windows with the `emusync` CLI binary,
+    both writing `target/*/emusync.pdb` (cargo#6313). The header is still written by hand, not
+    by cbindgen; the layout test keeps the two in step.
+12. **Tests.** `src/tests.rs` drives the exported functions as a host would, over the
+    in-memory remote (attached through a test-only hook; the C API has no memory remote):
+    session begin applying before the emulator opens the card, a pull that misses the
+    deadline, busy cards and inbox, conflicts, history and restore, the debounce, logging and
+    the notifier, credentials, argument and `struct_size` checks. `tests/c_abi.rs` builds with
+    the platform's C compiler (via the `cc` crate) a C smoke test (create → add container →
+    session begin/end → poll events → destroy), a C++11 compile of the header with every
+    `ES_*_INIT` macro, and the layout check, each linked against the static library, with
+    warnings as errors.

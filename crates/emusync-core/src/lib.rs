@@ -25,8 +25,8 @@ mod store;
 
 pub use engine::LOCKED;
 pub use engine::{
-    Applied, Blocked, CardStatus, ConflictInfo, ConflictPolicy, ContainerDesc, Engine, EngineOptions, HistoryEntry,
-    Resolution, SyncReport, UnitStatus,
+    Applied, BlockKind, Blocked, BusyGate, CardStatus, ConflictInfo, ConflictPolicy, ContainerDesc, Engine,
+    EngineOptions, HistoryEntry, RemoteSetup, Resolution, SyncReport, UnitStatus,
 };
 pub use error::{Error, Result};
 pub use model::{short_id, split_unit, unit_id, CardMode, VersionRecord};

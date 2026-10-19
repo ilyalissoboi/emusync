@@ -25,7 +25,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # Includes the C ABI checks (crates/emusync-ffi/tests/c_abi.rs): a C smoke test and a C++
+      # compile of include/emusync.h, built with this runner's C compiler against the static library.
       - run: cargo test --workspace
+      - name: Build the C ABI as a shared library
+        run: cargo rustc -p emusync-ffi --lib --crate-type cdylib
 
   s3-moto:
     name: S3 tests (moto)

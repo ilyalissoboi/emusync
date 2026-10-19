@@ -12,7 +12,10 @@ mod memory;
 mod s3;
 
 pub use memory::{MemoryRemote, MemoryRemoteOptions};
-pub use s3::{CredentialProvider, EnvCredentials, S3Config, S3Credentials, S3Remote, StaticCredentials};
+pub use s3::{
+    CallbackCredentials, CredentialProvider, EnvCredentials, ExpiringCredentials, S3Config, S3Credentials, S3Remote,
+    StaticCredentials,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum RemoteError {
