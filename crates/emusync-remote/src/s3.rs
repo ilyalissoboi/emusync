@@ -111,6 +111,64 @@ impl std::fmt::Debug for S3Credentials {
 /// temporary credentials. Implementations must not persist secrets in the data directory.
 pub trait CredentialProvider: Send + Sync {
     fn credentials(&self) -> Result<S3Credentials>;
+
+    /// The remote rejected the last credentials (HTTP 401/403). Returns true if the provider
+    /// dropped them and may supply different ones, in which case the request is retried once.
+    fn invalidate(&self) -> bool {
+        false
+    }
+}
+
+/// Credentials as a host supplies them: static keys (`expires_unix_ms: None`) or STS
+/// temporary credentials with their expiry.
+#[derive(Clone)]
+pub struct ExpiringCredentials {
+    pub creds: S3Credentials,
+    pub expires_unix_ms: Option<i64>,
+}
+
+type FetchFn = dyn Fn() -> Result<ExpiringCredentials> + Send + Sync;
+
+/// Credentials from a callback (the C ABI's `es_credential_provider`). The callback runs on
+/// first use, again shortly before temporary credentials expire, and after the remote rejects
+/// them; in between, the last answer is reused. Nothing is persisted.
+pub struct CallbackCredentials {
+    fetch: Box<FetchFn>,
+    cache: std::sync::Mutex<Option<ExpiringCredentials>>,
+}
+
+impl CallbackCredentials {
+    /// Temporary credentials are refreshed this long before they expire.
+    pub const REFRESH_MARGIN_MS: i64 = 5 * 60 * 1000;
+
+    pub fn new(fetch: impl Fn() -> Result<ExpiringCredentials> + Send + Sync + 'static) -> Self {
+        Self { fetch: Box::new(fetch), cache: std::sync::Mutex::new(None) }
+    }
+}
+
+fn now_unix_ms() -> i64 {
+    SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
+}
+
+impl CredentialProvider for CallbackCredentials {
+    fn credentials(&self) -> Result<S3Credentials> {
+        let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        let fresh = |c: &ExpiringCredentials| {
+            c.expires_unix_ms.map_or(true, |exp| now_unix_ms() < exp - Self::REFRESH_MARGIN_MS)
+        };
+        if let Some(c) = cache.as_ref().filter(|c| fresh(c)) {
+            return Ok(c.creds.clone());
+        }
+        let c = (self.fetch)()?;
+        let creds = c.creds.clone();
+        *cache = Some(c);
+        Ok(creds)
+    }
+
+    fn invalidate(&self) -> bool {
+        self.cache.lock().unwrap_or_else(|e| e.into_inner()).take();
+        true
+    }
 }
 
 pub struct StaticCredentials(pub S3Credentials);
@@ -162,8 +220,15 @@ impl S3Remote {
     /// Signs and sends one request, retrying transient failures. Returns status and body.
     fn send(&self, method: &str, url: &str, headers: &[(&str, &str)], body: &[u8]) -> Result<(u16, Vec<u8>)> {
         let mut attempt = 0;
+        let mut refreshed = false;
         loop {
             match self.send_once(method, url, headers, body) {
+                // Expired or revoked credentials: ask the provider once for new ones.
+                Ok((401 | 403, _)) if !refreshed && self.creds.invalidate() => {
+                    log::debug!("{method} {url}: credentials rejected, refreshing");
+                    refreshed = true;
+                    continue;
+                }
                 Ok((status, body)) if status >= 500 && attempt < 2 => {
                     log::debug!("{method} {url}: HTTP {status}, retrying");
                     let _ = body;
@@ -482,6 +547,48 @@ mod tests {
         assert_eq!(keys, ["p/a&b", "p/c"]);
         let dirs: Vec<String> = all_tags(xml, "CommonPrefixes").iter().filter_map(|b| first_tag(b, "Prefix")).collect();
         assert_eq!(dirs, ["p/d/"]);
+    }
+
+    #[test]
+    fn callback_credentials_cache_and_refresh() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+        let calls = Arc::new(AtomicU32::new(0));
+        let expires = Arc::new(std::sync::Mutex::new(None));
+        let provider = {
+            let (calls, expires) = (calls.clone(), expires.clone());
+            CallbackCredentials::new(move || {
+                let n = calls.fetch_add(1, Ordering::SeqCst);
+                Ok(ExpiringCredentials {
+                    creds: S3Credentials {
+                        access_key_id: format!("AK{n}"),
+                        secret_access_key: "secret".into(),
+                        session_token: None,
+                    },
+                    expires_unix_ms: *expires.lock().unwrap(),
+                })
+            })
+        };
+        // Static keys are fetched once.
+        assert_eq!(provider.credentials().unwrap().access_key_id, "AK0");
+        assert_eq!(provider.credentials().unwrap().access_key_id, "AK0");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // A 403 drops them.
+        assert!(provider.invalidate());
+        assert_eq!(provider.credentials().unwrap().access_key_id, "AK1");
+        // Temporary credentials inside the refresh margin are fetched again on every use.
+        *expires.lock().unwrap() = Some(now_unix_ms() + 60_000);
+        provider.invalidate();
+        assert_eq!(provider.credentials().unwrap().access_key_id, "AK2");
+        assert_eq!(provider.credentials().unwrap().access_key_id, "AK3");
+        // Ones that expire later are reused.
+        *expires.lock().unwrap() = Some(now_unix_ms() + 3_600_000);
+        provider.invalidate();
+        assert_eq!(provider.credentials().unwrap().access_key_id, "AK4");
+        assert_eq!(provider.credentials().unwrap().access_key_id, "AK4");
+        // A failing callback is passed through.
+        let failing = CallbackCredentials::new(|| Err(RemoteError::Auth("sign in".into())));
+        assert!(matches!(failing.credentials(), Err(RemoteError::Auth(_))));
     }
 
     #[test]

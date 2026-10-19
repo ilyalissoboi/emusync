@@ -9,4 +9,17 @@ rust-version.workspace = true
 
 [lib]
 name = "emusync"
+# The shared library is built on demand, `cargo rustc -p emusync-ffi --lib --release --crate-type
+# cdylib`, because listing it here would collide on Windows with the `emusync` CLI binary: both
+# would write target/*/emusync.pdb (cargo#6313).
 crate-type = ["rlib", "staticlib"]
+
+[dependencies]
+emusync-core.workspace = true
+emusync-formats.workspace = true
+emusync-remote.workspace = true
+log.workspace = true
+
+[dev-dependencies]
+cc = "1"
+tempfile.workspace = true

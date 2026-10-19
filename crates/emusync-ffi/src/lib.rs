@@ -1,8 +1,22 @@
-//! C ABI for emusync (`include/emusync.h`).
+//! C ABI for emusync (`include/emusync.h`, DESIGN §3.2, §6.4, §10, §12).
 //!
-//! M0 stub: only the version and status functions are exported. The client, container,
-//! session and event APIs land with the ABI freeze in M2 (DESIGN §14).
+//! Every exported function checks its pointers and `struct_size` fields, takes UTF-8 strings,
+//! and catches panics, so nothing unwinds into the host. The client itself lives in
+//! [`client`]: a worker thread that owns the engine, fed by a command queue.
 
+pub mod abi;
+mod api;
+mod callbacks;
+mod client;
+mod creds;
+mod events;
+#[cfg(test)]
+mod tests;
+
+pub use api::*;
+pub use client::Client;
+
+use abi::*;
 use std::ffi::c_char;
 
 pub const ES_ABI_VERSION: u32 = 1;
@@ -64,19 +78,20 @@ pub extern "C" fn es_status_str(s: i32) -> *const c_char {
     text.as_ptr().cast()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::ffi::CStr;
-
-    #[test]
-    fn strings() {
-        assert_eq!(es_abi_version(), 1);
-        let v = unsafe { CStr::from_ptr(es_version_string()) }.to_str().unwrap();
-        assert!(v.starts_with(env!("CARGO_PKG_VERSION")));
-        let s = unsafe { CStr::from_ptr(es_status_str(EsStatus::NoSpace as i32)) };
-        assert_eq!(s.to_str().unwrap(), "no space in container");
-        let s = unsafe { CStr::from_ptr(es_status_str(12345)) };
-        assert_eq!(s.to_str().unwrap(), "unknown status");
+/// The `es_status` for an engine error.
+pub(crate) fn status_of(e: &emusync_core::Error) -> i32 {
+    use emusync_core::Error;
+    use emusync_remote::RemoteError;
+    match e {
+        Error::Remote(RemoteError::Network(_)) | Error::NoRemote => ES_OFFLINE,
+        Error::Remote(RemoteError::Auth(_)) => ES_E_AUTH,
+        Error::Remote(RemoteError::InvalidUri(_)) => ES_E_INVALID_ARG,
+        Error::Remote(_) => ES_E_IO,
+        Error::Io(io) if io.kind() == std::io::ErrorKind::NotFound => ES_E_NOT_FOUND,
+        Error::Io(_) | Error::Db(_) | Error::Integrity(_) => ES_E_IO,
+        Error::Format(_) => ES_E_FORMAT,
+        Error::NotFound(_) => ES_E_NOT_FOUND,
+        Error::InvalidArg(_) => ES_E_INVALID_ARG,
+        Error::Json(_) => ES_E_INTERNAL,
     }
 }
