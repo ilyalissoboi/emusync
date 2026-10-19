@@ -160,7 +160,9 @@ write fallback or an `es_vfs` whose `open`/`mkdir` use the Java File API.
 `Mcd001.ps2` are different files. If emusync takes the logical card name from the file stem
 (the header default when `card` is NULL), a phone would sync a card named `mcd001` and the
 desktop a card named `Mcd001`, which would never meet. **Set `es_container_desc.card` explicitly**
-to `"Mcd001"` or `"Mcd002"` from the slot number, not from the filename. DESIGN §2.1 and the
+for the default-name variants (`mcd001.ps2` and `Mcd001.ps2` both become `"Mcd001"`; same for
+slot 2), not from the raw file stem. Cards the user named themselves should keep an identity
+derived from their own name (section 7), not from the slot. DESIGN §2.1 and the
 `card` comment in the header already anticipate "stems differ between emulators"; this is the
 concrete case. It also affects the DESIGN §10.2 sketch, which says "Mcd001.ps2 / Mcd002.ps2 bind
 to logical cards Mcd001 / Mcd002". On Android that binding needs the explicit `card`.
@@ -570,10 +572,24 @@ the top-level container, the EE FPU block and the version.
   anything in `filesDir` is backed up by default. That is exactly the "app backup restored onto a
   second device (cloned device ID)" case in DESIGN §11. `noBackupFilesDir` avoids it, and
   explicit `<exclude>` rules would be belt and braces.
-- **Container paths are native paths.** No `es_vfs` (section 1). Set `format` from
-  `EmuConfig.Mcd[slot].Type` (`"ps2.card"` or `"ps2.card.folder"`), `location` from
-  `EmuConfig.FullpathToMcd(slot)`, `card` to `"Mcd001"` / `"Mcd002"` by slot, and for a
-  serial-named `<serial>.ps2` also `title_scope = <serial>`.
+- **Container paths are native paths.** No `es_vfs` (section 1). `location` comes from
+  `EmuConfig.FullpathToMcd(slot)`. The other fields need more than the slot number:
+  - **`card` (logical identity).** Normalise only the *default-name variants*: a filename that
+    equals `Mcd001.ps2` / `Mcd002.ps2` ignoring case (as the Kotlin per-game check already does)
+    maps to `"Mcd001"` / `"Mcd002"`. A card the user named (`Foo.ps2`, a folder card `Foo/`)
+    keeps an identity from its own name (`"Foo"`), so mounting `Bar.ps2` in the same slot later
+    registers a different logical card and the two never merge. Deriving `card` from the slot
+    would make every card ever mounted in slot 1 the same card. A serial-named `<serial>.ps2`
+    (the `memcard.perGame` layout) is a per-game container: `title_scope = <serial>` and `card`
+    = the slot's shared card (`"Mcd001"`), as the header comment prescribes.
+  - **`format` (adapter).** `EmuConfig.Mcd[slot].Type` only says File or Folder, so it is not
+    enough. Folder: `"ps2.card.folder"`. File: inspect the image before registering. A 128 KiB
+    file with the PS1 `MC` signature (the core's own test is `m_ispsx`, size `0x20000`, and
+    `FileMcd_IsPSX` once open) is `"ps1.card"`; a `.conquestcard` (header `Memory Card for
+    SoulCalibur`, `IsConquestCard`) is `"raw"` or left unregistered; a PS2 image is `"ps2.card"`.
+    Anything that is not recognised is left unregistered rather than guessed. A missing file
+    (the core creates it on first use) can be registered as `"ps2.card"` after it exists, so
+    register on the first `es_container_flushed` or at the next boot.
 - **`es_container_add` is idempotent**, so register in the same hook as `es_session_begin`,
   every boot, after `FileMcd_SetType()` has decided File or Folder.
 - **Skip multitap slots (3-8) and BIOS-only boots in the first version.**
@@ -586,7 +602,7 @@ the top-level container, the EE FPU block and the version.
 | `es_container_add` + **`es_session_begin`** | **`VMManager::UpdateDiscDetails`, immediately before `FileMcd_Reopen(...)` at [`VMManager.cpp:1491`](https://github.com/ARMSX2/ARMSX2/blob/e7235739936c5ad8d09af20bf0fd382624caff8b/pcsx2/VMManager.cpp#L1491)**, guarded by `booting` (equivalently `s_state == VMState::Initializing`). | The serial is set, `FileMcd_SetType()` has not yet run for this boot (it runs inside `FileMcd_Reopen`), so determine File/Folder with `FileSystem::DirectoryExists(EmuConfig.FullpathToMcd(slot))`. The cards are closed here: `Initialize` has not opened them, and nothing has called `FileMcd_EmuOpen`. That is the "MUST be called before the emulator opens mounted containers" condition. |
 | `es_container_touched` | `FileMcd_Save` ([`MemoryCardFile.cpp:834`](https://github.com/ARMSX2/ARMSX2/blob/e7235739936c5ad8d09af20bf0fd382624caff8b/pcsx2/SIO/Memcard/MemoryCardFile.cpp#L834)) after a successful return, using the slot→container-id table. | One call covers file and folder cards and every guest write. It runs on the IOP thread when `IopThread` is enabled; `touched` is "cheap" and thread-safe. For folder cards the bytes reach disk only at `FolderMemoryCard::Flush` (1093), so call `touched` there too. |
 | `es_container_flushed` | (a) `FileMcd_Flush()` ([`689`](https://github.com/ARMSX2/ARMSX2/blob/e7235739936c5ad8d09af20bf0fd382624caff8b/pcsx2/SIO/Memcard/MemoryCardFile.cpp#L689)), for each open slot, after the two `Flush()` calls. (b) `FileMcd_EmuClose()` ([`680`](https://github.com/ARMSX2/ARMSX2/blob/e7235739936c5ad8d09af20bf0fd382624caff8b/pcsx2/SIO/Memcard/MemoryCardFile.cpp#L680)), after `impl.Close()`. (c) The end of `FolderMemoryCard::Flush`. | (a) is hit by `NativeApp.pause()` on every background; (b) by every shutdown, disc change and card change. `flushed` "blocks only for the local extract (ms)", which is acceptable on the CPU thread while the VM is paused or stopping. |
-| **`es_session_end`** | `VMManager::Shutdown`, **after `FileMcd_EmuClose()` at [`VMManager.cpp:2411`](https://github.com/ARMSX2/ARMSX2/blob/e7235739936c5ad8d09af20bf0fd382624caff8b/pcsx2/VMManager.cpp#L2411)**, before `Host::OnVMDestroyed()` (2444). | The header says `es_session_end` also "applies inbox items to now-closed containers", so the cards must already be closed. `played_ms`: measure with a monotonic timer started after `es_session_begin` (the existing `SaveSessionTime` at 2376 is per-serial and persisted, not a session length). **Do not wait for the network here**, see the next section. |
+| **`es_session_end`** | `VMManager::Shutdown`, **after `FileMcd_EmuClose()` at [`VMManager.cpp:2411`](https://github.com/ARMSX2/ARMSX2/blob/e7235739936c5ad8d09af20bf0fd382624caff8b/pcsx2/VMManager.cpp#L2411)**, before `Host::OnVMDestroyed()` (2444). | The header says `es_session_end` also "applies inbox items to now-closed containers", so the cards must already be closed. **Also end the session when `Initialize` fails.** `es_session_begin` runs inside `UpdateDiscDetails` (line 2134), but `Initialize` can still fail afterwards, and then `Shutdown` never runs: the failure path is the `ScopedGuard`s (`close_memcards` at [2136](https://github.com/ARMSX2/ARMSX2/blob/e7235739936c5ad8d09af20bf0fd382624caff8b/pcsx2/VMManager.cpp#L2136) closes the cards, other guards unwind the rest). Keep the session id in glue state and end it from that guard right after `FileMcd_EmuClose`, with `played_ms = 0`, otherwise the lease stays held although no game started. `runVMThread` then reports `@@ANDROID_VM_INIT_FAILED@@`. Make the end idempotent (no-op if no session is open) so both paths can call it. `played_ms`: measure with a monotonic timer started after `es_session_begin` (the existing `SaveSessionTime` at 2376 is per-serial and persisted, not a session length). **Do not wait for the network here**, see the next section. |
 | `es_app_suspend` | Native: in `NativeApp.setAppBackgrounded(true)` ([`native-lib.cpp:4023`](https://github.com/ARMSX2/ARMSX2/blob/e7235739936c5ad8d09af20bf0fd382624caff8b/platforms/android/app/src/main/cpp/native-lib.cpp#L4023)), reached from `onStop` ([line 6006](https://github.com/ARMSX2/ARMSX2/blob/e7235739936c5ad8d09af20bf0fd382624caff8b/platforms/android/app/src/main/java/com/armsx2/runtime/MainActivityRuntime.kt#L6006)). Queue it on the CPU thread **behind** the existing flush task so it runs after `FileMcd_Flush()`. With no VM running, call it directly. | `onPause` is too early: it also fires for split-screen and picture-in-picture, where the app stays visible and running (the existing comment at `MainActivityRuntime.kt:5996-5999` makes the same point for audio). The CPU-thread queue is FIFO, so a task queued from `setAppBackgrounded` runs after the pause task that `onPause` queued. |
 | `es_app_resume`, `es_sync_now` | `onStart` ([6000](https://github.com/ARMSX2/ARMSX2/blob/e7235739936c5ad8d09af20bf0fd382624caff8b/platforms/android/app/src/main/java/com/armsx2/runtime/MainActivityRuntime.kt#L6000)) via JNI. Also `es_sync_now` when the library screen opens or after a game exits. | A warm sync before the user taps a game makes the boot-time `es_session_begin` fast. This matters because that call blocks the emulation thread during boot. |
 | `es_event_poll` / `es_event_set_notifier` | JNI `NativeApp.emusyncPollEvents()` called from a Compose `LaunchedEffect`, with the `wake` notifier posting to the main handler. | Needed for `ES_EV_CONFLICT`, `APPLY_BLOCKED`, `AUTH_REQUIRED`. The in-game overlay already uses Compose `PadModal`s, so conflict UI belongs there. The app bans window dialogs (`checkNoWindowModals` in `build.gradle.kts:369`) so a conflict UI must use `PadModal`. |
