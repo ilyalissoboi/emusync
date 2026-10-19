@@ -105,7 +105,7 @@ impl Dev {
         assert_eq!(unsafe { es_client_create(&cfg, &mut c) }, ES_OK);
         if let Some(r) = remote {
             let client = unsafe { &*c };
-            let status = crate::api::setup_remote(&client.shared, r).unwrap().recv().unwrap();
+            let status = crate::api::setup_remote(&client.shared, r, false).unwrap().recv().unwrap();
             assert_eq!(status, ES_OK);
         }
         let id = add(c, &card, None).unwrap();
@@ -480,21 +480,31 @@ fn a_pull_that_misses_the_deadline_never_writes_to_the_open_card() {
     assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
     assert_eq!(info.remote_reached, 0);
     assert_ne!(info.id, 0);
-    // The emulator now has the card open. The pull goes through after all...
+    // The emulator now has the card open, and writes to it. The pull goes through after all...
     let deadline = Instant::now() + Duration::from_secs(10);
     while slow.stalled.load(Ordering::SeqCst) == 0 {
         assert!(Instant::now() < deadline);
         std::thread::sleep(Duration::from_millis(5));
     }
+    mac.put(RAC, b"rac, being written");
     slow.set_open(true);
     let evs = mac.wait_for("pull", |e| e.kind == ES_EV_SYNC_FINISHED);
-    // ...but its result waits in the inbox.
+    // ...but its result waits in the inbox,
     let blocked = evs.iter().find(|e| e.kind == ES_EV_APPLY_BLOCKED).expect("blocked");
     assert_eq!(blocked.status, ES_E_BUSY);
     assert!(!mac.saves().contains_key(GTA));
+    // and it didn't read the card the emulator is writing: no version of the new save yet.
+    let rac = cstr(RAC);
+    let rc = unsafe { es_unit_history(mac.c, rac.as_ptr(), Some(collect_version), std::ptr::null_mut()) };
+    assert_eq!(rc, ES_E_NOT_FOUND);
     assert_eq!(unsafe { es_session_end(mac.c, info.id, 0) }, ES_PENDING);
     mac.wait_for("session end", |e| e.kind == ES_EV_UNIT_APPLIED);
     assert_eq!(mac.saves().get(GTA).map(Vec::as_slice), Some(&b"gta v1"[..]));
+    // The final snapshot picked the new save up.
+    let mut versions: Vec<(String, String)> = Vec::new();
+    let user = &mut versions as *mut _ as *mut c_void;
+    assert_eq!(unsafe { es_unit_history(mac.c, rac.as_ptr(), Some(collect_version), user) }, ES_OK);
+    assert_eq!(versions.len(), 1);
 }
 
 #[test]
@@ -703,6 +713,9 @@ fn remote_add_uses_the_credential_provider() {
         assert!(CRED_CALLS.load(Ordering::SeqCst) >= 1);
         let failing = es_credential_provider { user: std::ptr::null_mut(), get: Some(needs_sign_in) };
         assert_eq!(es_remote_add(dev.c, uri.as_ptr(), &failing), ES_E_AUTH);
+        // The unreachable remote counts as added: another one is refused.
+        let other = cstr("s3://elsewhere/emusync/v1?endpoint=http://127.0.0.1:1&path_style=1&region=us-east-1");
+        assert_eq!(es_remote_add(dev.c, other.as_ptr(), &creds), ES_E_INVALID_ARG);
         let none = es_credential_provider { user: std::ptr::null_mut(), get: None };
         assert_eq!(es_remote_add(dev.c, uri.as_ptr(), &none), ES_E_INVALID_ARG);
         assert_eq!(es_remote_add(dev.c, cstr("webdav://nas/saves").as_ptr(), &creds), ES_E_INVALID_ARG);

@@ -74,6 +74,12 @@ pub struct EngineOptions {
     pub policy: ConflictPolicy,
     /// Local snapshot store budget (DESIGN §7). A unit's latest snapshot is never evicted.
     pub snapshot_budget_bytes: u64,
+    /// Whether sync cycles snapshot containers marked busy. The sidecar does: it watches the
+    /// files and debounces changes itself. An embedded host reports its quiet points
+    /// ([`Engine::snapshot_containers`] from `es_container_touched` / `es_container_flushed`)
+    /// and sets this to false, so a cycle never reads a card the emulator may be writing.
+    /// Remote changes for a skipped container still go to the inbox.
+    pub scan_busy: bool,
 }
 
 impl Default for EngineOptions {
@@ -83,6 +89,7 @@ impl Default for EngineOptions {
             emulator_id: "emusync".into(),
             policy: ConflictPolicy::Ask,
             snapshot_budget_bytes: 100 * 1024 * 1024,
+            scan_busy: true,
         }
     }
 }
@@ -755,6 +762,13 @@ impl Engine {
         let containers = self.store.containers()?;
         let mut scanned = HashMap::new();
         for c in &containers {
+            if !self.opts.scan_busy && self.busy.contains(c.id) {
+                // Not read: reconciled against what the last snapshot recorded. The empty image
+                // hash never matches, so `apply` writes nothing even if the container is no
+                // longer busy by then; changes for it wait in the inbox.
+                scanned.insert(c.id, String::new());
+                continue;
+            }
             if let Some(image_hash) = self.scan(c, &mut report)? {
                 scanned.insert(c.id, image_hash);
             }

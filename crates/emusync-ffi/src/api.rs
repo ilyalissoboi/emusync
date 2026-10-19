@@ -138,7 +138,8 @@ pub unsafe extern "C" fn es_client_create(cfg: *const es_config, out: *mut *mut 
         if cfg.flags & !ES_CFG_KNOWN_FLAGS != 0 {
             return Err(invalid(format!("unknown es_config flags {:#x}", cfg.flags)));
         }
-        let mut opts = EngineOptions { device_name, policy, ..Default::default() };
+        // Containers in a session are snapshotted only when the host says they are quiet.
+        let mut opts = EngineOptions { device_name, policy, scan_busy: false, ..Default::default() };
         if let Some(id) = emulator_id {
             opts.emulator_id = id;
         }
@@ -172,8 +173,14 @@ pub unsafe extern "C" fn es_client_destroy(c: *mut Client, timeout_ms: u32) {
 // ----------------------------------------------------------------------------------------------
 
 /// Sets a remote up on a helper thread, so the worker isn't held up by the network; the
-/// result goes to the worker as a `BindRemote` command, and to the returned channel.
-pub(crate) fn setup_remote(shared: &Arc<Shared>, remote: Arc<dyn Remote>) -> Result<mpsc::Receiver<i32>, i32> {
+/// result goes to the worker as a `BindRemote` command, and to the returned channel. If the
+/// remote is rejected and `reserved` (this call reserved `pending_remote`), the reservation is
+/// dropped.
+pub(crate) fn setup_remote(
+    shared: &Arc<Shared>,
+    remote: Arc<dyn Remote>,
+    reserved: bool,
+) -> Result<mpsc::Receiver<i32>, i32> {
     let (tx, rx) = mpsc::channel();
     let shared = shared.clone();
     std::thread::Builder::new()
@@ -193,6 +200,13 @@ pub(crate) fn setup_remote(shared: &Arc<Shared>, remote: Arc<dyn Remote>) -> Res
                 }
                 Err(e) => {
                     log::warn!("cannot use {uri}: {e}");
+                    // Rejected (credentials, repository format): not added, so free the slot.
+                    if reserved {
+                        let mut pending = lock(&shared.pending_remote);
+                        if pending.as_deref() == Some(uri.as_str()) {
+                            *pending = None;
+                        }
+                    }
                     status_of(&e)
                 }
             };
@@ -223,15 +237,21 @@ pub unsafe extern "C" fn es_remote_add(
         let cfg = S3Config::parse(&uri).map_err(invalid)?;
         let provider = crate::creds::provider(*creds, &uri, client.shared.cb.clone());
         let remote: Arc<dyn Remote> = Arc::new(S3Remote::new(cfg, Box::new(provider)).map_err(invalid)?);
-        if let Some(bound) = client.shared.cache().remote.clone() {
-            if bound != remote.describe() {
+        let uri = remote.describe();
+        let reserved = {
+            // Reserved first, so a second es_remote_add can't slip in while this one is offline.
+            let mut pending = lock(&client.shared.pending_remote);
+            let bound = client.shared.cache().remote.clone();
+            if let Some(other) = bound.as_ref().or(pending.as_ref()).filter(|b| **b != uri) {
                 return Err(invalid(format!(
-                    "this data directory is bound to {bound}; use a new data directory for {}",
-                    remote.describe()
+                    "this data directory is bound to {other}; use a new data directory for {uri}"
                 )));
             }
-        }
-        let rx = setup_remote(&client.shared, remote)?;
+            let reserved = pending.is_none();
+            *pending = Some(uri);
+            reserved
+        };
+        let rx = setup_remote(&client.shared, remote, reserved)?;
         Ok(rx.recv_timeout(REMOTE_ADD_WAIT).unwrap_or(ES_OFFLINE))
     })
 }
@@ -323,12 +343,20 @@ pub unsafe extern "C" fn es_container_remove(c: *mut Client, id: es_container_id
         if !client.shared.cache().containers.iter().any(|x| x.id == id) {
             return Err(ES_E_NOT_FOUND);
         }
-        if client.shared.is_held(id) {
-            return Err(ES_E_BUSY);
+        {
+            // A session that is still starting isn't holding its containers yet, so check the
+            // registry, and keep new sessions off the container until it is gone.
+            let mut sessions = lock(&client.shared.sessions);
+            if client.shared.is_held(id) || sessions.open.values().any(|s| s.mounted.contains(&id)) {
+                return Err(ES_E_BUSY);
+            }
+            sessions.removing.insert(id);
         }
         let (p, reply) = Pending::new();
         client.shared.queue.push(Cmd::RemoveContainer(id, reply));
-        waited(p.wait(WORKER_WAIT, WaitMode::CancelIfQueued))?;
+        let r = waited(p.wait(WORKER_WAIT, WaitMode::CancelIfQueued));
+        lock(&client.shared.sessions).removing.remove(&id);
+        r?;
         Ok(ES_OK)
     })
 }
@@ -447,11 +475,13 @@ pub unsafe extern "C" fn es_session_begin(
         }
         let session = {
             let mut sessions = lock(&client.shared.sessions);
-            if sessions.values().any(|s| s.mounted.iter().any(|id| mounted.contains(id))) {
+            if sessions.open.values().any(|s| s.mounted.iter().any(|id| mounted.contains(id)))
+                || mounted.iter().any(|id| sessions.removing.contains(id))
+            {
                 return Err(ES_E_BUSY);
             }
             let id = client.shared.next_session.fetch_add(1, Ordering::SeqCst);
-            sessions.insert(id, Session { mounted: mounted.clone() });
+            sessions.open.insert(id, Session { mounted: mounted.clone() });
             id
         };
         let timeout = match args.timeout_ms {
@@ -502,7 +532,7 @@ pub unsafe extern "C" fn es_session_begin(
 #[no_mangle]
 pub unsafe extern "C" fn es_session_end(c: *mut Client, id: es_session_id, _played_ms: u64) -> c_int {
     with_client(c, |client| {
-        let session = lock(&client.shared.sessions).remove(&id).ok_or(ES_E_NOT_FOUND)?;
+        let session = lock(&client.shared.sessions).open.remove(&id).ok_or(ES_E_NOT_FOUND)?;
         client.shared.queue.push(Cmd::SessionEnd { mounted: session.mounted });
         Ok(ES_PENDING)
     })

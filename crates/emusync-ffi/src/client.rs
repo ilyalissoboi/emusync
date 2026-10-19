@@ -230,6 +230,14 @@ pub(crate) struct Session {
     pub mounted: Vec<i64>,
 }
 
+#[derive(Default)]
+pub(crate) struct Sessions {
+    /// Open sessions, from the moment `es_session_begin` registers them.
+    pub open: HashMap<u64, Session>,
+    /// Containers an `es_container_remove` is removing; no session may mount them meanwhile.
+    pub removing: HashSet<i64>,
+}
+
 pub(crate) struct Shared {
     pub queue: Queue,
     pub events: EventQueue,
@@ -237,7 +245,10 @@ pub(crate) struct Shared {
     gate: BusyGate,
     /// Sessions holding each container; it is busy while the count is above zero.
     holds: Mutex<HashMap<i64, usize>>,
-    pub sessions: Mutex<HashMap<u64, Session>>,
+    pub sessions: Mutex<Sessions>,
+    /// The remote `es_remote_add` accepted but couldn't set up yet (unreachable): the data
+    /// directory is bound to it only once it is, but no other remote may be added meanwhile.
+    pub pending_remote: Mutex<Option<String>>,
     pub next_session: AtomicU64,
     pub cache: RwLock<Cache>,
     /// An `es_sync_now` is queued and not started yet (later ones are merged into it).
@@ -323,7 +334,8 @@ impl Client {
             cb,
             gate: engine.busy_gate(),
             holds: Mutex::new(HashMap::new()),
-            sessions: Mutex::new(HashMap::new()),
+            sessions: Mutex::new(Sessions::default()),
+            pending_remote: Mutex::new(None),
             next_session: AtomicU64::new(1),
             cache: RwLock::new(Cache::default()),
             sync_queued: AtomicBool::new(false),

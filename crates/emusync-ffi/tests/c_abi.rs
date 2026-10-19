@@ -1,25 +1,40 @@
 //! The C ABI as a C or C++ host sees it: programs in tests/c/ are compiled with the platform's C
-//! compiler (found by the `cc` crate) against include/emusync.h, linked with the static library
-//! cargo built for these tests, and run.
+//! compiler (found by the `cc` crate) against include/emusync.h, linked with the static library,
+//! and run.
 
 use emusync::abi;
 use std::mem::{offset_of, size_of};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 
 fn crate_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-/// The static library next to this test binary (target/<profile>/), built with the rlib.
-fn static_lib() -> PathBuf {
-    let exe = std::env::current_exe().unwrap();
-    let profile_dir = exe.parent().and_then(Path::parent).unwrap();
-    ["libemusync.a", "emusync.lib"]
-        .iter()
-        .map(|n| profile_dir.join(n))
-        .find(|p| p.exists())
-        .unwrap_or_else(|| panic!("no static library in {}", profile_dir.display()))
+/// The static library, built once per test run. `cargo test` only builds the rlib that the
+/// tests link, so this runs `cargo build` for the library, in a target directory of its own: the
+/// outer cargo still holds the lock on the main one.
+fn static_lib() -> &'static Path {
+    static LIB: OnceLock<PathBuf> = OnceLock::new();
+    LIB.get_or_init(|| {
+        let target_dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("c-abi");
+        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+        let output = Command::new(cargo)
+            .args(["build", "-p", "emusync-ffi", "--lib", "--manifest-path"])
+            .arg(crate_dir().join("Cargo.toml"))
+            .arg("--target-dir")
+            .arg(&target_dir)
+            .output()
+            .expect("cannot run cargo");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "building the static library failed:\n{stderr}");
+        ["libemusync.a", "emusync.lib"]
+            .iter()
+            .map(|n| target_dir.join("debug").join(n))
+            .find(|p| p.exists())
+            .unwrap_or_else(|| panic!("no static library in {}", target_dir.join("debug").display()))
+    })
 }
 
 /// What Rust's standard library needs from the system (`--print native-static-libs`).

@@ -222,7 +222,8 @@ typedef struct es_credential_provider {
    Blocks up to 10 s while it validates access with one LIST, probes conditional-write support
    and creates the repository if it is new. Returns ES_OK, ES_E_AUTH (credentials rejected; the
    remote is not added), or ES_OFFLINE if the endpoint is unreachable or slower than that: the
-   remote is still added, and its setup completes in the background or on the next sync.
+   remote is still added (another remote is refused from then on), and its setup completes in
+   the background or on the next sync.
    Does not start a sync (see es_sync_now). The provider struct is copied. */
 ES_API es_status es_remote_add(es_client* c, const char* remote_uri, const es_credential_provider* creds);
 
@@ -274,7 +275,7 @@ typedef struct es_container_desc {
    else whole-file) unless it already exists, in which case the repository's mode is adopted. */
 ES_API es_status es_container_add(es_client* c, const es_container_desc* d, es_container_id* out);
 /* Unregisters a container (the file is left alone). Waits for the worker. ES_E_BUSY while a
-   session has it mounted, ES_E_NOT_FOUND for an unknown id. */
+   session has it mounted (or is starting with it), ES_E_NOT_FOUND for an unknown id. */
 ES_API es_status es_container_remove(es_client* c, es_container_id id);
 
 /* Logical card sync mode, shared by every device (DESIGN §2.1). */
@@ -366,7 +367,10 @@ ES_API es_status es_session_end(es_client* c, es_session_id id, uint64_t played_
 ES_API es_status es_app_suspend(es_client* c, uint32_t budget_ms);
 ES_API es_status es_app_resume(es_client* c);
 
-/* Full background cycle (pull, snapshot, apply to containers not in a session, push). Returns
+/* Full background cycle (pull, snapshot, apply to containers not in a session, push). Containers
+   in a session are not read by any cycle: they are snapshotted only at es_container_touched (after
+   the debounce), es_container_flushed and es_session_end, and remote changes for them wait in the
+   inbox. Returns
    ES_PENDING; calls made while one is queued are merged into it. The library has no timer of its
    own in ABI version 1: call this when the host wants a sync (e.g. periodically, or from UI). */
 ES_API es_status es_sync_now(es_client* c);

@@ -1144,7 +1144,8 @@ pins down §3.2, §6.4, §10 and §12:
    setup (`Engine::prepare_remote`: LIST, conditional-write probe, `repo.json`) on a short-lived
    helper thread, so a slow endpoint doesn't hold up the worker; the result is handed to the
    worker (`Engine::bind_remote`). An endpoint that is unreachable is attached anyway and set up
-   at the next network cycle.
+   at the next network cycle. Its URI is reserved meanwhile (in memory), so a second
+   `es_remote_add` for another remote is refused, as for a bound data directory.
 2. **What waits.** Blocking calls with their own deadline: `es_session_begin` (`timeout_ms`,
    default 3 s), `es_app_suspend` (`budget_ms`), `es_remote_add` (10 s), `es_container_flushed`
    (2 s for the local snapshot, then `ES_PENDING`) and `es_client_destroy`. Calls that need an
@@ -1160,7 +1161,13 @@ pins down §3.2, §6.4, §10 and §12:
    running sends its results to the inbox instead of writing to a card the emulator has open
    (tested with a remote whose LIST stalls past the deadline). Busy marks are counted per
    session, so a session ending on the worker can't clear the mark of the next one on the same
-   card. A container can be in only one open session (`ES_E_BUSY`).
+   card. A container can be in only one open session (`ES_E_BUSY`), and can't be removed while
+   a session is open or starting with it.
+   A cycle also never *reads* a busy container (`EngineOptions::scan_busy = false`, which the
+   sidecar leaves on): a pull that runs past the deadline would otherwise snapshot a card the
+   emulator is writing. Busy containers are snapshotted only at the host's quiet points
+   (`touched` after the debounce, `flushed`, session end); remote changes for them are still
+   reconciled against the last snapshot and wait in the inbox.
 4. **Session end.** Final snapshot of the mounted containers, clear busy, then one full cycle
    (pull, apply inbox items, push), rather than snapshot → push → clear → apply. One push
    instead of two; the result is the same. `played_ms` is not recorded yet.
