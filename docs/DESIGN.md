@@ -1442,7 +1442,10 @@ The C ABI as a shared library for desktop hosts: `emusync.dll` + `emusync.dll.li
   it gets emusync's SQLite, zstd and ring in its own symbol namespace, next to its own zstd
   (PCSX2, Dolphin and PPSSPP all have one). The shared library exports only the `es_*` functions:
   on Linux rustc's version script plus `--exclude-libs,ALL` (as on Android, §21), on macOS rustc's
-  exported-symbols list, on Windows only what is marked for export. `-DZSTD_TRACE=0` drops zstd's
+  exported-symbols list, on Windows only what is marked for export. rustc's macOS list includes
+  every `#[no_mangle]` function of every crate, and BLAKE3's NEON code calls back into Rust
+  through one (`blake3_compress_in_place_portable`), so Apple targets build BLAKE3 with
+  `no_neon`; Linux and Android keep NEON and hide the callback with `--exclude-libs`. `-DZSTD_TRACE=0` drops zstd's
   weak trace hooks, as on Android. `scripts/check-desktop-lib.sh` verifies the export list
   against `emusync.h` on Linux and macOS.
 - **Loading.** Linux: soname `libemusync.so`, so the host's `DT_NEEDED` is the bare name; the host
