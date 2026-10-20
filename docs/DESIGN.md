@@ -830,7 +830,8 @@ event and released explicitly. `es_abi_version()` lets a host refuse a mismatche
 `libemusync.so` with its CMake module (§21), the ARMSX2 integration (the fork in
 `ilyalissoboi/ARMSX2` embeds `libemusync.so`; two-way sync verified on a real device, an AYN
 Thor, against desktop PCSX2), end-to-end encryption (§22) with passphrase entry in ARMSX2's
-settings, and the desktop build of the shared library (§23). **Open:** the Android AAR with
+settings, the desktop build of the shared library (§23), and host secrets in the system's
+credential store (§24). **Open:** the Android AAR with
 Kotlin bindings and a SAF VFS, the C++ RAII wrapper `bindings/cpp/emusync.hpp`, and a PCSX2
 desktop fork; the roadmap below orders them.
 
@@ -839,7 +840,7 @@ dependencies each item needs placed before it:
 
 1. Desktop build of the shared library, with a CMake module and a package for MSBuild (§23).
 2. Credential storage for hosts on desktop: the OS store (Credential Manager, Keychain, Secret
-   Service) behind the C ABI, so emulators don't each write their own.
+   Service) behind the C ABI, so emulators don't each write their own (§24).
 3. **PCSX2 desktop integration** (a fork with ARMSX2's hooks and a Qt settings page), on Windows,
    macOS and Linux. Removes the sidecar's Windows limitation (uploads wait for the game to close).
 4. GameCube adapters: `gc.card` (raw images) and `gc.gci` (GCI folders).
@@ -1471,3 +1472,50 @@ The C ABI as a shared library for desktop hosts: `emusync.dll` + `emusync.dll.li
   31 `es_*` functions and nothing else; a plain `cl` build against the staged package links and
   runs. CI repeats the CMake build and smoke test on Windows (Visual Studio generator), macOS
   (universal, arm64 runner) and Linux, and the export and loader checks on macOS and Linux.
+
+## 24. Implementation notes (host secrets)
+
+Desktop hosts keep S3 keys and an encryption passphrase between runs. §7 says platform bindings
+keep them in the OS keystore; without help each emulator would write its own code for three
+stores. `emusync_core::secrets` and the C functions `es_secret_set`, `es_secret_get` and
+`es_secret_delete` do it once:
+
+- **Stores.** Windows: Credential Manager, a generic credential of the current user. macOS: the
+  user's Keychain, a generic password. Linux: the Secret Service over D-Bus (GNOME Keyring,
+  KWallet). All three through the `keyring` crate, 3.x (4.x needs Rust 1.88, above this
+  workspace's 1.80), with its pure-Rust D-Bus client on Linux (`zbus`), so the library gains no
+  `libdbus` dependency at build or run time.
+- **Naming.** A secret is `service` (the host, `PCSX2`) plus `name` (the setting,
+  `s3-secret-access-key`): that is the service and account Keychain Access and Credential Manager
+  show the user. Both are limited to 64 letters, digits, spaces, `.`, `_` and `-`, because the
+  fallback below uses them as file names. Values are 1 to 1024 bytes: Credential Manager holds at
+  most 2,560.
+- **Fallback.** Only on Linux, where a Secret Service may not be running (a headless machine, the
+  Steam Deck in game mode, a minimal window manager): if the store is unavailable, the secret
+  goes to `<fallback_dir>/secrets/<service>/<name>`, mode 0600 in 0700 directories, the same
+  protection repository keys get there (§22; the writer is shared, `fsutil::write_private`).
+  A secret set or deleted while the store is away also marks the store's copy, which can't be
+  changed then, as stale (`<fallback_dir>/secrets/.stale/<service>/<name>`; `.stale` can't be a
+  service, which can't start with a dot). The first read that reaches the store again deletes
+  that copy and answers from the file, so neither an old value nor a deleted secret comes back;
+  storing again moves the secret into the store and deletes the file. On Windows and macOS an
+  unreachable store (a keychain the user refused to unlock) is reported as `ES_E_IO`, not
+  silently replaced by a file. A read, write or delete that can't reach the store and has no
+  fallback is `ES_E_IO` too: an unreachable store is never reported as "no secret"
+  (`ES_E_NOT_FOUND`). These paths are tested with an in-memory store that can be switched off.
+- **No client.** The calls are free functions, so a host can read its keys before
+  `es_client_create`, and settings screens can store them without a running sync. They run
+  under the same panic guard as the rest of the ABI. They may block while the system asks the
+  user to unlock the keychain or keyring.
+- **Output buffer.** `es_secret_get` writes the value and a NUL into the caller's buffer and
+  reports the size needed; a buffer that is too small gets `ES_E_NO_SPACE` and an empty string,
+  and `out = NULL, cap = 0` asks for the size only. Values are held in `Zeroizing` buffers inside
+  the library.
+- **Android and iOS** hosts keep secrets in the Android Keystore or the iOS Keychain from their
+  own code (ARMSX2 does, §21); the calls fail there with `ES_E_INVALID_ARG`, and the library
+  doesn't link `keyring` for those targets.
+- **Tests.** Argument checks run everywhere, including the C smoke test, and never reach a
+  store. The round trips through the real store (core and C ABI) write to the machine's
+  credential store, so they run only with `EMUSYNC_TEST_OS_SECRETS=1`; CI sets it, which covers
+  Credential Manager on Windows and the Keychain on macOS, and the fallback file on Linux runners,
+  which have no Secret Service. Not tested: a real Secret Service (GNOME Keyring, KWallet).

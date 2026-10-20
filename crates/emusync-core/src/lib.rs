@@ -23,6 +23,7 @@ pub mod fsutil;
 pub mod hlc;
 mod keystore;
 pub mod model;
+pub mod secrets;
 mod store;
 
 pub use crypto::KdfParams;

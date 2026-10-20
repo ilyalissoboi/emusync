@@ -338,6 +338,94 @@ pub unsafe extern "C" fn es_oauth_complete(
 // Containers and cards
 // ----------------------------------------------------------------------------------------------
 
+/// Runs a call that needs no client: no panic escapes. (Its log records have no callback to go
+/// to.)
+fn guarded(f: impl FnOnce() -> Res) -> i32 {
+    match catch_unwind(AssertUnwindSafe(f)) {
+        Ok(Ok(s) | Err(s)) => s,
+        Err(_) => ES_E_INTERNAL,
+    }
+}
+
+unsafe fn secret_args(
+    service: *const c_char,
+    name: *const c_char,
+    fallback_dir: *const c_char,
+) -> Result<(String, String, Option<PathBuf>), i32> {
+    Ok((
+        req_str(service, "service")?,
+        req_str(name, "name")?,
+        opt_str(fallback_dir, "fallback_dir")?.filter(|d| !d.is_empty()).map(PathBuf::from),
+    ))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn es_secret_set(
+    service: *const c_char,
+    name: *const c_char,
+    value: *const c_char,
+    fallback_dir: *const c_char,
+) -> c_int {
+    guarded(|| {
+        let (service, name, dir) = secret_args(service, name, fallback_dir)?;
+        if value.is_null() {
+            return Err(invalid("value is NULL"));
+        }
+        let Ok(value) = CStr::from_ptr(value).to_str() else { return Err(invalid("value is not valid UTF-8")) };
+        let value = zeroize::Zeroizing::new(value.to_owned());
+        emusync_core::secrets::set(&service, &name, &value, dir.as_deref()).map(|_| ES_OK).map_err(|e| status_of(&e))
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn es_secret_get(
+    service: *const c_char,
+    name: *const c_char,
+    fallback_dir: *const c_char,
+    out: *mut c_char,
+    cap: usize,
+    out_len: *mut usize,
+) -> c_int {
+    if !out.is_null() && cap > 0 {
+        *out = 0;
+    }
+    if !out_len.is_null() {
+        *out_len = 0;
+    }
+    guarded(|| {
+        let (service, name, dir) = secret_args(service, name, fallback_dir)?;
+        if out.is_null() && cap > 0 {
+            return Err(invalid("out is NULL"));
+        }
+        let Some(value) = emusync_core::secrets::get(&service, &name, dir.as_deref()).map_err(|e| status_of(&e))?
+        else {
+            return Err(ES_E_NOT_FOUND);
+        };
+        let needed = value.len() + 1;
+        if !out_len.is_null() {
+            *out_len = needed;
+        }
+        if cap < needed {
+            return Err(ES_E_NO_SPACE);
+        }
+        std::ptr::copy_nonoverlapping(value.as_ptr(), out.cast::<u8>(), value.len());
+        *out.add(value.len()) = 0;
+        Ok(ES_OK)
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn es_secret_delete(
+    service: *const c_char,
+    name: *const c_char,
+    fallback_dir: *const c_char,
+) -> c_int {
+    guarded(|| {
+        let (service, name, dir) = secret_args(service, name, fallback_dir)?;
+        emusync_core::secrets::delete(&service, &name, dir.as_deref()).map(|_| ES_OK).map_err(|e| status_of(&e))
+    })
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn es_container_add(
     c: *mut Client,

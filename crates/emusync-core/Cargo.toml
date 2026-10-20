@@ -26,8 +26,17 @@ zeroize.workspace = true
 zstd.workspace = true
 
 # The local copy of a repository key is protected with DPAPI (DESIGN section 22).
+# Host secrets go to the system's credential store (DESIGN section 24): Credential Manager,
+# the Keychain, the Secret Service (pure-Rust D-Bus, so no libdbus at build or run time).
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
+keyring = { workspace = true, features = ["windows-native"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { workspace = true, features = ["apple-native"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { workspace = true, features = ["async-secret-service", "async-io", "crypto-rust"] }
 
 # On Apple arm64, BLAKE3's NEON code is C that calls back into Rust through a #[no_mangle]
 # function, and rustc exports every #[no_mangle] function from a cdylib on macOS, where no linker

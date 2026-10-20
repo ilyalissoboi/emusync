@@ -117,6 +117,17 @@ int main(int argc, char** argv) {
     CHECK(log_lines > 0);
 
     es_client_destroy(c, 5000);
+
+    /* Host secrets: argument checks only, which fail before any credential store is touched,
+       so this test never writes to (or asks to unlock) the machine's keychain. */
+    {
+        char buf[8] = "x";
+        size_t len = 99;
+        CHECK(es_secret_set(NULL, "name", "value", NULL) == ES_E_INVALID_ARG);
+        CHECK(es_secret_get("emusync-test", "../name", NULL, buf, sizeof buf, &len) == ES_E_INVALID_ARG);
+        CHECK(buf[0] == 0 && len == 0);
+        CHECK(es_secret_delete("emusync-test", "", NULL) == ES_E_INVALID_ARG);
+    }
     printf("ok: %d sync cycles, %d log lines\n", finished, log_lines);
     return 0;
 }

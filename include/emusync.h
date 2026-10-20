@@ -266,6 +266,37 @@ ES_API es_status es_remote_add(es_client* c, const char* remote_uri, const es_cr
 ES_API es_status es_repo_create_encrypted(es_client* c, const char* passphrase);
 ES_API es_status es_repo_unlock(es_client* c, const char* passphrase);
 
+/* Secrets of the host: S3 access keys, an encryption passphrase, kept in the system's
+   credential store so that desktop hosts don't each write their own (docs/DESIGN.md §24):
+   Credential Manager on Windows, the Keychain on macOS, the Secret Service (GNOME Keyring,
+   KWallet) on Linux. On Linux without a running Secret Service (a headless machine, the Steam
+   Deck in game mode) the secret goes to a file only the user can read under fallback_dir
+   (<fallback_dir>/secrets/<service>/<name>), if one is given. They need no client, so a host can
+   read its keys before es_client_create. They may block while the system asks the user to unlock
+   the keychain or keyring: don't call them on a UI thread.
+
+   service names the host ("PCSX2"), name the setting ("s3-secret-access-key"); both 1 to 64
+   letters, digits, spaces, '.', '_' or '-', not starting with '.'. That is also what Keychain
+   Access or Credential Manager shows. value: 1 to 1024 bytes of UTF-8. fallback_dir: NULL or ""
+   for none (Linux without a Secret Service then fails with ES_E_IO).
+
+   es_secret_set: stores value, replacing an earlier one (and a fallback copy, once the store is
+   back). es_secret_get: writes the value and a NUL into out (cap bytes); *out_len (if not NULL)
+   gets the size needed including the NUL. ES_E_NOT_FOUND if there is none; ES_E_NO_SPACE if cap
+   is too small (call again with *out_len bytes; out may be NULL with cap 0 to ask for the size
+   only). out is "" on any error. es_secret_delete: removes
+   the secret from the store and the fallback file; ES_OK if there was none.
+   Errors: ES_E_INVALID_ARG for bad arguments, and on Android and iOS, whose hosts use the
+   platform keystore (Android Keystore, iOS Keychain) themselves; ES_E_IO when the store can't be
+   reached (a locked keychain the user didn't unlock, no Secret Service and no fallback_dir),
+   never ES_E_NOT_FOUND: that means there is no secret. A secret set or deleted on Linux while the
+   Secret Service is away stays that way when it is back: the store's old copy is deleted on the
+   first read that reaches it. */
+ES_API es_status es_secret_set(const char* service, const char* name, const char* value, const char* fallback_dir);
+ES_API es_status es_secret_get(const char* service, const char* name, const char* fallback_dir,
+                               char* out, size_t cap, size_t* out_len);
+ES_API es_status es_secret_delete(const char* service, const char* name, const char* fallback_dir);
+
 /* OAuth PKCE helpers for later backends (not used by S3). begin writes an authorization URL
    for the host to open. Return ES_E_INVALID_ARG until such a backend exists (begin writes "" to
    out_url if cap > 0). */

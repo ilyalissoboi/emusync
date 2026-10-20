@@ -31,6 +31,8 @@ dirs = "6"
 fastcdc = "3"
 getrandom = "0.4"
 hex = "0.4"
+# 3.x: 4.x needs Rust 1.88. No default features; each platform picks its store (emusync-core).
+keyring = { version = "3.6", default-features = false }
 log = "0.4"
 notify = "8"
 rpassword = "7"

@@ -220,6 +220,29 @@ example; CI builds it on Windows (Visual Studio generator), macOS (universal) an
 smoke test against the deployed library, checks it, and uploads each package as a
 `libemusync-desktop-<os>` artifact.
 
+## Keeping an emulator's keys in the system's credential store
+
+An emulator that embeds emusync has S3 keys, and maybe an encryption passphrase, to keep between
+runs. Instead of each emulator writing its own storage, the C ABI keeps them in the system's
+credential store: Credential Manager on Windows, the Keychain on macOS, the Secret Service
+(GNOME Keyring, KWallet) on Linux.
+
+```c
+es_secret_set("PCSX2", "s3-secret-access-key", secret, config_dir);
+
+char buf[1024];
+size_t len;
+if (es_secret_get("PCSX2", "s3-secret-access-key", config_dir, buf, sizeof buf, &len) == ES_OK)
+    /* use buf */;
+```
+
+They need no client, so the keys can be read before sync starts, and they may block while the
+system asks the user to unlock the keychain: call them off the UI thread. On Linux without a
+running Secret Service (a headless machine, the Steam Deck in game mode) the secret goes to a
+file only the user can read under the directory passed last (`<dir>/secrets/<service>/<name>`).
+Android and iOS apps use their platform keystore themselves; there the calls fail with
+`ES_E_INVALID_ARG`. Details are in [`include/emusync.h`](include/emusync.h).
+
 ## Building for Android
 
 The C ABI builds as a shared library, `libemusync.so`, for an Android app's native code to link
