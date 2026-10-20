@@ -175,9 +175,9 @@ pub unsafe extern "C" fn es_client_destroy(c: *mut Client, timeout_ms: u32) {
 // ----------------------------------------------------------------------------------------------
 
 /// Sets a remote up on a helper thread, so the worker isn't held up by the network; the
-/// result goes to the worker as a `BindRemote` command, and to the returned channel. If the
-/// remote is rejected and `reserved` (this call reserved `pending_remote`), the reservation is
-/// dropped.
+/// result goes to the worker as a `BindRemote` command, and the outcome of binding it (or of
+/// the setup, if that failed) to the returned channel. If the remote is rejected and
+/// `reserved` (this call reserved `pending_remote`), the reservation is dropped.
 ///
 /// With `passphrase` (from `es_repo_create_encrypted`), a new repository is created encrypted
 /// and an existing encrypted one unlocked. Without, an encrypted repository whose key this data
@@ -201,34 +201,31 @@ pub(crate) fn setup_remote(
             };
             let status = match prepared {
                 Ok(setup) => {
-                    let locked = setup.locked_in(&shared.data_dir).unwrap_or(true);
-                    if locked {
-                        log::info!("{uri} is encrypted; unlock it with es_repo_unlock");
-                    }
-                    shared.queue.push(Cmd::BindRemote(remote, Some(setup), None));
-                    if locked {
-                        ES_E_LOCKED
-                    } else {
-                        ES_OK
-                    }
+                    // Ahead of queued work, and answered once the data directory is bound (or
+                    // binding failed, e.g. the key couldn't be stored), so the caller learns the
+                    // real outcome. A dropped reply means the client is shutting down.
+                    let (bound_tx, bound_rx) = mpsc::channel();
+                    shared.queue.push_urgent(Cmd::BindRemote(remote, Some(setup), None, Some(bound_tx)));
+                    bound_rx.recv().unwrap_or(ES_E_INTERNAL)
                 }
                 Err(e) if e.is_offline() => {
                     log::info!("{uri} is unreachable; it is set up once it can be reached: {e}");
-                    shared.queue.push(Cmd::BindRemote(remote, None, passphrase));
+                    shared.queue.push(Cmd::BindRemote(remote, None, passphrase, None));
                     ES_OFFLINE
                 }
                 Err(e) => {
                     log::warn!("cannot use {uri}: {e}");
-                    // Rejected (credentials, repository format): not added, so free the slot.
-                    if reserved {
-                        let mut pending = lock(&shared.pending_remote);
-                        if pending.as_deref() == Some(uri.as_str()) {
-                            *pending = None;
-                        }
-                    }
                     status_of(&e)
                 }
             };
+            if status < 0 && status != ES_E_LOCKED && reserved {
+                // Rejected (credentials, repository format, binding failed): not added, so free
+                // the slot.
+                let mut pending = lock(&shared.pending_remote);
+                if pending.as_deref() == Some(uri.as_str()) {
+                    *pending = None;
+                }
+            }
             if tx.send(status).is_err() && status < 0 {
                 // The caller stopped waiting; tell the host another way.
                 let kind = if status == ES_E_AUTH { ES_EV_AUTH_REQUIRED } else { ES_EV_ERROR };

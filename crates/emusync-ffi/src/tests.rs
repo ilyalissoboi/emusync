@@ -229,12 +229,7 @@ impl Dev {
 fn attach(c: *mut Client, r: Arc<dyn Remote>) -> i32 {
     let client = unsafe { &*c };
     let passphrase = crate::client::lock(&client.shared.create_passphrase).take();
-    let status = crate::api::setup_remote(&client.shared, r, false, passphrase).unwrap().recv().unwrap();
-    // Wait for the worker to bind it.
-    let (p, reply) = crate::client::Pending::new();
-    client.shared.queue.push(crate::client::Cmd::History("none".into(), reply));
-    let _ = p.wait(Duration::from_secs(10), crate::client::WaitMode::Deadline);
-    status
+    crate::api::setup_remote(&client.shared, r, false, passphrase).unwrap().recv().unwrap()
 }
 
 fn contains(hay: &[u8], needle: &[u8]) -> bool {
@@ -878,5 +873,18 @@ fn encryption_errors() {
         // With the right one it is added and unlocked.
         assert_eq!(es_repo_create_encrypted(s.c, cstr("right").as_ptr()), ES_OK);
         assert_eq!(attach(s.c, enc.clone()), ES_OK);
+
+        // Binding fails after the setup succeeded (the key can't be stored): es_remote_add says
+        // so, rather than ES_OK, and the remote is not added.
+        let t = Dev::new("c", None, ES_POLICY_ASK);
+        let keys = t._dir.path().join("data").join("keys");
+        std::fs::write(&keys, b"not a directory").unwrap();
+        assert_eq!(es_repo_create_encrypted(t.c, cstr("right").as_ptr()), ES_OK);
+        assert_eq!(attach(t.c, enc.clone()), ES_E_IO);
+        assert!((*t.c).shared.cache().remote.is_none());
+        std::fs::remove_file(&keys).unwrap();
+        assert_eq!(es_repo_create_encrypted(t.c, cstr("right").as_ptr()), ES_OK);
+        assert_eq!(attach(t.c, enc.clone()), ES_OK);
+        assert!((*t.c).shared.cache().remote.is_some());
     }
 }

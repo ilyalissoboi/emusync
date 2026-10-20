@@ -50,10 +50,20 @@ impl Default for KdfParams {
 }
 
 impl KdfParams {
-    /// Parameters a repository may ask for. A `repo.json` beyond these is refused rather than
-    /// letting whoever can write the bucket make every device allocate gigabytes.
+    /// Parameters a repository may ask for. `repo.json` is not authenticated, so whoever can
+    /// write the bucket chooses them: a repository beyond these is refused, rather than letting
+    /// it make a phone allocate a lot of memory or spend seconds per unlock. The limits allow
+    /// at most 4 times the work of the defaults (256 MiB, or 64 MiB × 12 passes).
     fn check(&self) -> Result<argon2::Params> {
-        if self.m_kib > 1024 * 1024 || self.t == 0 || self.t > 64 || self.p == 0 || self.p > 16 {
+        const MAX_M_KIB: u32 = 256 * 1024;
+        const MAX_WORK: u64 = 4 * 64 * 1024 * 3;
+        if self.m_kib > MAX_M_KIB
+            || self.t == 0
+            || self.t > 12
+            || self.p == 0
+            || self.p > 4
+            || self.m_kib as u64 * self.t as u64 > MAX_WORK
+        {
             return Err(Error::Incompatible(format!("unsupported key derivation parameters {self:?}")));
         }
         argon2::Params::new(self.m_kib, self.t, self.p, Some(KEY_LEN))

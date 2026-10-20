@@ -394,3 +394,57 @@ fn default_key_derivation() {
     b.engine.unlock(PASS).unwrap();
     assert_eq!(b.engine.sync().unwrap().pulled_records, 1);
 }
+
+#[test]
+fn a_rewritten_repo_json_is_refused_on_rebind() {
+    let remote = Arc::new(MemoryRemote::default());
+    let mut a = Device::encrypted(&remote, "a", &card_image(80));
+    a.engine.sync().unwrap();
+    let original = remote.raw_get("repo.json").unwrap();
+    let id = repo_json(&remote)["repo_id"].clone();
+
+    // Someone with write access to the bucket swaps in an unencrypted repo.json with the same
+    // id. Adding the remote again (as a host does on every start) must not adopt it.
+    let plain = serde_json::json!({ "format": 1, "repo_id": id, "encryption": null });
+    remote.raw_put("repo.json", plain.to_string().as_bytes());
+    let e = a.engine.add_remote(remote.clone()).unwrap_err();
+    assert!(matches!(e, Error::Incompatible(_)), "{e}");
+    assert!(e.to_string().contains("now says it is not"), "{e}");
+    assert_eq!(a.engine.encryption(), Encryption::Unlocked);
+    // A different encryption header with the same id is refused too.
+    let mut other: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    other["encryption"]["kdf"]["salt"] = "00".repeat(16).into();
+    remote.raw_put("repo.json", other.to_string().as_bytes());
+    assert!(matches!(a.engine.add_remote(remote.clone()), Err(Error::Incompatible(_))));
+
+    // What is bound stays as it was: the next upload is still encrypted.
+    a.restart(&remote);
+    assert_eq!(a.engine.encryption(), Encryption::Unlocked);
+    a.write(&card_image(81));
+    a.engine.sync().unwrap();
+    for key in remote.keys().into_iter().filter(|k| k.ends_with(".ndjson")) {
+        assert!(!contains(&remote.raw_get(&key).unwrap(), b"\"op\""), "{key} is plaintext");
+    }
+}
+
+#[test]
+fn key_derivation_costs_are_bounded() {
+    // repo.json isn't authenticated, so its Argon2id costs are capped at 4x the defaults.
+    let remote = Arc::new(MemoryRemote::default());
+    Device::encrypted(&remote, "a", b"x");
+    for (m_kib, t, p) in [(512 * 1024, 1, 1), (64 * 1024, 13, 1), (256 * 1024, 4, 1), (64 * 1024, 3, 5), (1024, 0, 1)] {
+        let mut repo = repo_json(&remote);
+        repo["encryption"]["kdf"]["m_kib"] = m_kib.into();
+        repo["encryption"]["kdf"]["t"] = t.into();
+        repo["encryption"]["kdf"]["p"] = p.into();
+        let hostile = Arc::new(MemoryRemote::default());
+        hostile.raw_put("repo.json", repo.to_string().as_bytes());
+        let mut d = Device::bare("d");
+        let e = d.engine.add_remote(hostile).unwrap_err();
+        assert!(matches!(e, Error::Incompatible(_)), "{m_kib} KiB x {t}: {e}");
+    }
+    // The largest allowed (256 MiB x 3, 64 MiB x 12) are accepted.
+    let remote = Arc::new(MemoryRemote::default());
+    let mut d = Device::new("d", b"x");
+    d.engine.add_remote_encrypted(remote, PASS, KdfParams { m_kib: 64 * 1024, t: 12, p: 1 }).unwrap();
+}

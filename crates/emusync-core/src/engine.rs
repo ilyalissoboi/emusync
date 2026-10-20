@@ -263,18 +263,6 @@ pub struct RemoteSetup {
     pub key: Option<RepoKey>,
 }
 
-impl RemoteSetup {
-    /// Whether binding this setup in `data_dir` leaves the repository locked: it is encrypted,
-    /// the setup has no key, and none was kept there earlier. Lets a host that runs
-    /// [`Engine::prepare_remote`] on another thread ask for the passphrase straight away.
-    pub fn locked_in(&self, data_dir: &Path) -> Result<bool> {
-        match (&self.encryption, &self.key, &self.repo_id) {
-            (Some(_), None, Some(id)) => Ok(keystore::load(data_dir, id)?.is_none()),
-            _ => Ok(false),
-        }
-    }
-}
-
 /// Whether the bound repository is encrypted, and whether this device can read it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Encryption {
@@ -574,6 +562,20 @@ impl Engine {
                 return Err(Error::Incompatible(format!(
                     "the repository at {} was replaced by another one (id {new}, was {old}); use a new data \
                      directory for it",
+                    setup.uri
+                )));
+            }
+            // repo.json is create-only, so its encryption never changes. If it reads differently
+            // now, someone rewrote it (to make this device upload plaintext, say): refuse it and
+            // keep what was bound.
+            if setup.encryption != self.encryption {
+                let change = match (&self.encryption, &setup.encryption) {
+                    (Some(_), None) => "it was encrypted and now says it is not",
+                    (None, Some(_)) => "it was not encrypted and now says it is",
+                    _ => "its encryption header is different",
+                };
+                return Err(Error::Incompatible(format!(
+                    "repo.json at {} changed since this data directory was bound to it ({change}); refusing it",
                     setup.uri
                 )));
             }

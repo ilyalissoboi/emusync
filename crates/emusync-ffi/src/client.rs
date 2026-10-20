@@ -12,8 +12,8 @@ use crate::callbacks::{route_logs, Callbacks};
 use crate::events::{Event, EventQueue};
 use crate::status_of;
 use emusync_core::{
-    BlockKind, BusyGate, CardMode, ConflictInfo, ContainerDesc, ContainerRow, Engine, EngineOptions, HistoryEntry,
-    KdfParams, RemoteSetup, Resolution, SyncReport,
+    BlockKind, BusyGate, CardMode, ConflictInfo, ContainerDesc, ContainerRow, Encryption, Engine, EngineOptions,
+    HistoryEntry, KdfParams, RemoteSetup, Resolution, SyncReport,
 };
 use emusync_remote::Remote;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -161,7 +161,8 @@ pub(crate) enum Cmd {
     SetMode(String, CardMode),
     /// A remote that `es_remote_add` set up (`Some`), or could not reach (`None`: attached, set
     /// up on the next network cycle, with the `es_repo_create_encrypted` passphrase if any).
-    BindRemote(Arc<dyn Remote>, Option<RemoteSetup>, Option<Passphrase>),
+    /// The sender gets the outcome of binding it: `ES_OK`, `ES_E_LOCKED`, or an error.
+    BindRemote(Arc<dyn Remote>, Option<RemoteSetup>, Option<Passphrase>, Option<mpsc::Sender<i32>>),
     /// `es_repo_unlock`; replies with a status.
     Unlock(Passphrase, Reply<i32>),
     SessionBegin {
@@ -256,8 +257,6 @@ pub(crate) struct Shared {
     pub pending_remote: Mutex<Option<String>>,
     /// From `es_repo_create_encrypted`, for the next `es_remote_add`.
     pub create_passphrase: Mutex<Option<Passphrase>>,
-    /// The data directory (canonical), where an encrypted repository's key is kept.
-    pub data_dir: PathBuf,
     pub next_session: AtomicU64,
     pub cache: RwLock<Cache>,
     /// An `es_sync_now` is queued and not started yet (later ones are merged into it).
@@ -346,7 +345,6 @@ impl Client {
             sessions: Mutex::new(Sessions::default()),
             pending_remote: Mutex::new(None),
             create_passphrase: Mutex::new(None),
-            data_dir: dir.clone(),
             next_session: AtomicU64::new(1),
             cache: RwLock::new(Cache::default()),
             sync_queued: AtomicBool::new(false),
@@ -501,11 +499,22 @@ impl Worker {
                     self.shared.emit(Event::new(ES_EV_ERROR, status).message(format!("{card}: {e}")));
                 }
             },
-            Cmd::BindRemote(remote, setup, passphrase) => match setup {
+            Cmd::BindRemote(remote, setup, passphrase, done) => match setup {
                 Some(setup) => {
-                    if let Err(e) = self.engine.bind_remote(remote, setup) {
-                        let status = self.local_error("adding the remote", &e);
-                        self.shared.emit(Event::new(ES_EV_ERROR, status).message(e.to_string()));
+                    let uri = setup.uri.clone();
+                    let status = match self.engine.bind_remote(remote, setup) {
+                        Ok(_) if self.engine.encryption() == Encryption::Locked => {
+                            log::info!("{uri} is encrypted; unlock it with es_repo_unlock");
+                            ES_E_LOCKED
+                        }
+                        Ok(_) => ES_OK,
+                        Err(e) => self.local_error("adding the remote", &e),
+                    };
+                    self.refresh();
+                    // The setup thread passes it on, or reports it as an event if es_remote_add
+                    // stopped waiting.
+                    if let Some(done) = done {
+                        let _ = done.send(status);
                     }
                 }
                 None => {

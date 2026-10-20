@@ -1310,7 +1310,11 @@ engine), the C ABI (`es_repo_create_encrypted`, `es_repo_unlock`) and the CLI (`
 add --encrypt`, `remote unlock`, `remote lock`). Where it differs from or pins down §6.1 and §7:
 
 1. **Chosen at creation.** A repository is encrypted or not for its whole life: `repo.json` is
-   create-only, so it can't change later. Asking for encryption on an existing unencrypted
+   create-only, so it can't change later. A data directory therefore remembers the
+   `repo_id` and encryption header it was bound with, and refuses the remote if `repo.json`
+   later reads differently: someone with write access to the bucket could otherwise swap in a
+   format-1 `repo.json` with the same id and get a bound device to upload plaintext. Asking
+   for encryption on an existing unencrypted
    repository is refused (`Error::Incompatible`, `ES_E_INCOMPATIBLE`); switching means a new
    prefix and a new data directory on each device. Unencrypted repositories are unchanged in
    every byte: `repo.json` format 1 with `"encryption": null`, blobs at
@@ -1331,8 +1335,10 @@ add --encrypt`, `remote unlock`, `remote lock`). Where it differs from or pins d
    wrapped key can't be moved to another repository. A wrong passphrase fails the tag check:
    `Error::WrongPassphrase` / `ES_E_PASSPHRASE`. Two subkeys are derived from the repository
    key with BLAKE3's key derivation mode: a data key and an address key. The KDF parameters a
-   `repo.json` may ask for are bounded (at most 1 GiB, 64 passes, 16 lanes), so whoever can
-   write the bucket can't make every device allocate gigabytes. Changing the passphrase is not
+   `repo.json` may ask for are bounded, because `repo.json` isn't authenticated: at most
+   256 MiB, 12 passes and 4 lanes, and at most 4 times the work of the defaults (memory ×
+   passes), so whoever can write the bucket can't make a phone run out of memory or spend
+   long on an unlock. Changing the passphrase is not
    implemented: it needs a second wrapped-key object, since `repo.json` can't be rewritten.
 4. **Objects.** Every object a device writes besides `repo.json` (blobs, log segments,
    `device.json`) is `0x01 ‖ 24-byte random nonce ‖ XChaCha20-Poly1305(data key, plaintext)`,
@@ -1375,7 +1381,9 @@ add --encrypt`, `remote unlock`, `remote lock`). Where it differs from or pins d
    which creates the repository encrypted or unlocks an existing encrypted one. If that remote
    is unreachable, the passphrase waits with it for the deferred setup (§20 item 1). Without a
    passphrase, `es_remote_add` returns `ES_E_LOCKED` for an encrypted repository whose key the
-   data directory doesn't have (the setup thread checks the key file). `es_repo_unlock` runs
+   data directory doesn't have. Once the setup succeeds, the setup thread hands it to the
+   worker ahead of queued work and returns the outcome of binding it, so a failure there (the
+   key can't be stored, say) is returned as an error rather than `ES_OK`. `es_repo_unlock` runs
    on the worker and waits for it. Passphrases are held in `Zeroizing` buffers and never
    logged.
 9. **CLI.** A passphrase is read from the terminal without echo (`rpassword`), or as the first

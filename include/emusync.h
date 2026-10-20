@@ -231,7 +231,10 @@ typedef struct es_credential_provider {
    yet (the remote is added; call es_repo_unlock), and with a passphrase from
    es_repo_create_encrypted, ES_E_PASSPHRASE if it is wrong, or ES_E_INCOMPATIBLE if the
    repository exists and is not encrypted (in both cases the remote is not added).
-   ES_E_INCOMPATIBLE also for a repository made by a newer emusync.
+   ES_E_INCOMPATIBLE also for a repository made by a newer emusync, or one whose repo.json
+   changed since this data_dir was bound to it (e.g. no longer encrypted). If the data_dir
+   can't record the remote (e.g. the key can't be stored), that error (ES_E_IO) is returned
+   and the remote is not added.
    Does not start a sync (see es_sync_now). The provider struct is copied. */
 ES_API es_status es_remote_add(es_client* c, const char* remote_uri, const es_credential_provider* creds);
 
