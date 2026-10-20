@@ -1426,10 +1426,15 @@ stores. `emusync_core::secrets` and the C functions `es_secret_set`, `es_secret_
   Steam Deck in game mode, a minimal window manager): if the store is unavailable, the secret
   goes to `<fallback_dir>/secrets/<service>/<name>`, mode 0600 in 0700 directories, the same
   protection repository keys get there (§22; the writer is shared, `fsutil::write_private`).
-  Reads check the store first, then the file; storing again once the store is back moves the
-  secret into it and deletes the file. On Windows and macOS an unreachable store (a keychain the
-  user refused to unlock) is reported as `ES_E_IO`, not silently replaced by a file. Without a
-  `fallback_dir` the Linux case is `ES_E_IO` too.
+  A secret set or deleted while the store is away also marks the store's copy, which can't be
+  changed then, as stale (`<fallback_dir>/secrets/.stale/<service>/<name>`; `.stale` can't be a
+  service, which can't start with a dot). The first read that reaches the store again deletes
+  that copy and answers from the file, so neither an old value nor a deleted secret comes back;
+  storing again moves the secret into the store and deletes the file. On Windows and macOS an
+  unreachable store (a keychain the user refused to unlock) is reported as `ES_E_IO`, not
+  silently replaced by a file. A read, write or delete that can't reach the store and has no
+  fallback is `ES_E_IO` too: an unreachable store is never reported as "no secret"
+  (`ES_E_NOT_FOUND`). These paths are tested with an in-memory store that can be switched off.
 - **No client.** The calls are free functions, so a host can read its keys before
   `es_client_create`, and settings screens can store them without a running sync. They run
   under the same panic guard as the rest of the ABI. They may block while the system asks the

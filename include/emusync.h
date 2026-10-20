@@ -288,7 +288,10 @@ ES_API es_status es_repo_unlock(es_client* c, const char* passphrase);
    the secret from the store and the fallback file; ES_OK if there was none.
    Errors: ES_E_INVALID_ARG for bad arguments, and on Android and iOS, whose hosts use the
    platform keystore (Android Keystore, iOS Keychain) themselves; ES_E_IO when the store can't be
-   reached (a locked keychain the user didn't unlock, no Secret Service and no fallback_dir). */
+   reached (a locked keychain the user didn't unlock, no Secret Service and no fallback_dir),
+   never ES_E_NOT_FOUND: that means there is no secret. A secret set or deleted on Linux while the
+   Secret Service is away stays that way when it is back: the store's old copy is deleted on the
+   first read that reaches it. */
 ES_API es_status es_secret_set(const char* service, const char* name, const char* value, const char* fallback_dir);
 ES_API es_status es_secret_get(const char* service, const char* name, const char* fallback_dir,
                                char* out, size_t cap, size_t* out_len);
