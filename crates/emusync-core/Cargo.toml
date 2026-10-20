@@ -29,5 +29,13 @@ zstd.workspace = true
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
 
+# On Apple arm64, BLAKE3's NEON code is C that calls back into Rust through a #[no_mangle]
+# function, and rustc exports every #[no_mangle] function from a cdylib on macOS, where no linker
+# option takes one back out of its export list. The portable code keeps libemusync.dylib's exports
+# to the es_* functions (scripts/check-desktop-lib.sh); hashing save-sized data is no slower in
+# any way that matters. Elsewhere the symbol stays hidden: --exclude-libs on Linux and Android.
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+blake3 = { workspace = true, features = ["no_neon"] }
+
 [dev-dependencies]
 tempfile.workspace = true

@@ -822,16 +822,44 @@ event and released explicitly. `es_abi_version()` lets a host refuse a mismatche
 | **M1: PS2** | `ps2.card` + `ps2.card.folder` adapters with full round-trip and fuzz coverage, making unit mode the default for PS2 cards. `emusyncd` with a PCSX2 profile for Windows/macOS/Linux. |
 | **M2: Embedded + mobile** | C ABI freeze (v1), C++ header, Android AAR with SAF VFS and keystore-backed S3 credentials. ARMSX2 fork and PCSX2 fork integrations. E2E encryption. |
 
+| **M3: States + more backends** | Save states with compat keys, links, and the `resume` slot. STS temporary credentials. Further backends (WebDAV, Dropbox, Google Drive) on the same layout. Reference server with push, leases and handoff if the hosted question (§15) is answered yes. |
+| **M4: More platforms** | PS1 (DuckStation, SwanStation/Beetle in RetroArch), GameCube (Dolphin), cartridge SRAM normalisation, PSP. RetroArch frontend integration. |
+
 **Status (October 2026).** M0 and M1 are done. M2: **done** are the C ABI v1 freeze
 (`include/emusync.h`, §20, with a C++ compile check of the header), the Android build of
 `libemusync.so` with its CMake module (§21), the ARMSX2 integration (the fork in
 `ilyalissoboi/ARMSX2` embeds `libemusync.so`; two-way sync verified on a real device, an AYN
-Thor, against desktop PCSX2), and end-to-end encryption (§22). **Open:** passphrase entry in
-ARMSX2's settings, the Android AAR with Kotlin bindings and a SAF VFS (ARMSX2 links the
-library directly and needs neither), the C++ RAII wrapper `bindings/cpp/emusync.hpp`, and a
-PCSX2 desktop fork (desktop PCSX2 is covered by the `emusync watch` sidecar).
-| **M3: States + more backends** | Save states with compat keys, links, and the `resume` slot. STS temporary credentials. Further backends (WebDAV, Dropbox, Google Drive) on the same layout. Reference server with push, leases and handoff if the hosted question (§15) is answered yes. |
-| **M4: More platforms** | PS1 (DuckStation, SwanStation/Beetle in RetroArch), GameCube (Dolphin), cartridge SRAM normalisation, PSP. RetroArch frontend integration. |
+Thor, against desktop PCSX2), end-to-end encryption (§22) with passphrase entry in ARMSX2's
+settings, and the desktop build of the shared library (§23). **Open:** the Android AAR with
+Kotlin bindings and a SAF VFS, the C++ RAII wrapper `bindings/cpp/emusync.hpp`, and a PCSX2
+desktop fork; the roadmap below orders them.
+
+**Roadmap (October 2026).** Memory cards come before save states (M3). In this order, with the
+dependencies each item needs placed before it:
+
+1. Desktop build of the shared library, with a CMake module and a package for MSBuild (§23).
+2. Credential storage for hosts on desktop: the OS store (Credential Manager, Keychain, Secret
+   Service) behind the C ABI, so emulators don't each write their own.
+3. **PCSX2 desktop integration** (a fork with ARMSX2's hooks and a Qt settings page), on Windows,
+   macOS and Linux. Removes the sidecar's Windows limitation (uploads wait for the game to close).
+4. GameCube adapters: `gc.card` (raw images) and `gc.gci` (GCI folders).
+5. The Android AAR: Kotlin API, Keystore-backed settings, lifecycle hooks, shared by the Android
+   integrations below instead of each copying ARMSX2's.
+6. **Dolphin integration**, desktop and Android (one codebase; Android keeps its data in
+   app-specific storage, so no SAF).
+7. PSP: a `SAVEDATA` adapter, one unit per save directory.
+8. The SAF VFS (`es_vfs`): PPSSPP's Android memory stick can be a user-picked `content://` folder.
+9. **PPSSPP integration**, desktop and Android.
+10. PS1: the `ps1.card` adapter.
+11. **DuckStation on desktop** through the sidecar (a `duckstation` profile). DuckStation is
+    CC BY-NC-ND 4.0, which forbids distributing modified versions, so it can't embed the library.
+12. **DuckStation on Android**: undecided. The app is closed source; options are a standalone
+    emusync companion app syncing its card folder, another PS1 emulator, or none.
+13. **Finishing uploads after the app is closed**, as a library feature: WorkManager through the
+    AAR on Android (ARMSX2 moves to the AAR), and a hand-off to a helper process on desktop.
+14. Everything else (leases, retention and garbage collection, per-game cards, other backends,
+    metered networks, guided S3 setup, conflict and history UI on Android, …), to be
+    prioritised later.
 
 ## 15. Open questions
 
@@ -1404,3 +1432,42 @@ add --encrypt`, `remote unlock`, `remote lock`). Where it differs from or pins d
     runs against moto in CI (the `s3-moto` job). Argon2 and BLAKE2 are built with
     `opt-level = 3` in the dev profile, so debug builds and tests don't spend seconds on each
     key derivation.
+
+## 23. Implementation notes (desktop build)
+
+The C ABI as a shared library for desktop hosts: `emusync.dll` + `emusync.dll.lib` (Windows,
+`*-pc-windows-msvc`), `libemusync.dylib` (macOS, optionally universal), `libemusync.so` (Linux).
+
+- **Shared, not static.** The static library is fine for Rust-free tests, but a host that links
+  it gets emusync's SQLite, zstd and ring in its own symbol namespace, next to its own zstd
+  (PCSX2, Dolphin and PPSSPP all have one). The shared library exports only the `es_*` functions:
+  on Linux rustc's version script plus `--exclude-libs,ALL` (as on Android, §21), on macOS rustc's
+  exported-symbols list, on Windows only what is marked for export. rustc's macOS list includes
+  every `#[no_mangle]` function of every crate, and BLAKE3's NEON code calls back into Rust
+  through one (`blake3_compress_in_place_portable`), so Apple targets build BLAKE3 with
+  `no_neon`; Linux and Android keep NEON and hide the callback with `--exclude-libs`. `-DZSTD_TRACE=0` drops zstd's
+  weak trace hooks, as on Android. `scripts/check-desktop-lib.sh` verifies the export list
+  against `emusync.h` on Linux and macOS.
+- **Loading.** Linux: soname `libemusync.so`, so the host's `DT_NEEDED` is the bare name; the host
+  ships the library next to its executable with an `$ORIGIN` rpath. macOS: install name
+  `@rpath/libemusync.dylib`; an app bundle puts it in `Contents/Frameworks` with an
+  `@executable_path/../Frameworks` rpath. Windows: the DLL next to the executable. It depends
+  only on system DLLs and the Visual C++ runtime (`VCRUNTIME140.dll` and the UCRT), which the
+  emulators already ship.
+- **`bindings/cmake/EmuSync.cmake`** derives the Rust target from the platform
+  (`CMAKE_OSX_ARCHITECTURES`, the Visual Studio generator platform, or the processor;
+  `EMUSYNC_RUST_TARGET` overrides it), builds each with `cargo rustc --crate-type cdylib`, joins
+  two macOS architectures with `lipo`, and defines `emusync::emusync` (with `IMPORTED_IMPLIB` on
+  Windows). Multi-config generators get the release library for every configuration.
+  `emusync_deploy_runtime()` copies the library next to a target after each build and adds the
+  rpath. On Android it hands over to `EmuSyncAndroid.cmake`, so one include serves projects that
+  build both from one tree. MinGW is not supported (the GNU Windows target would need its own
+  import library handling, and none of the target emulators build with it).
+- **`scripts/build-desktop.sh`** stages the same library with the header as a package for builds
+  that don't use CMake: PCSX2's Windows release builds use MSBuild. The import library is renamed
+  to `emusync.lib`, the usual name in `AdditionalDependencies`.
+- **Verified:** on Windows 11 with MSVC (Visual Studio 18, Ninja), the CMake test project builds
+  `emusync.dll`, links the C smoke test and runs it from its build directory; the DLL exports the
+  31 `es_*` functions and nothing else; a plain `cl` build against the staged package links and
+  runs. CI repeats the CMake build and smoke test on Windows (Visual Studio generator), macOS
+  (universal, arm64 runner) and Linux, and the export and loader checks on macOS and Linux.
