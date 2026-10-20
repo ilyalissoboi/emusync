@@ -27,6 +27,8 @@ pub const ES_E_QUOTA: i32 = -7;
 pub const ES_E_INCOMPATIBLE: i32 = -8;
 pub const ES_E_NOT_FOUND: i32 = -9;
 pub const ES_E_ABI: i32 = -10;
+pub const ES_E_LOCKED: i32 = -11;
+pub const ES_E_PASSPHRASE: i32 = -12;
 pub const ES_E_INTERNAL: i32 = -100;
 
 pub const ES_LOG_ERROR: i32 = 0;

@@ -20,6 +20,7 @@ emusync-core.workspace = true
 emusync-formats.workspace = true
 emusync-remote.workspace = true
 log.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 cc = "1"

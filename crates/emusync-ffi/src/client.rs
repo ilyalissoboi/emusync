@@ -12,8 +12,8 @@ use crate::callbacks::{route_logs, Callbacks};
 use crate::events::{Event, EventQueue};
 use crate::status_of;
 use emusync_core::{
-    BlockKind, BusyGate, CardMode, ConflictInfo, ContainerDesc, ContainerRow, Engine, EngineOptions, HistoryEntry,
-    RemoteSetup, Resolution, SyncReport,
+    BlockKind, BusyGate, CardMode, ConflictInfo, ContainerDesc, ContainerRow, Encryption, Engine, EngineOptions,
+    HistoryEntry, KdfParams, RemoteSetup, Resolution, SyncReport,
 };
 use emusync_remote::Remote;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -28,6 +28,9 @@ pub(crate) const DEBOUNCE: Duration = Duration::from_secs(2);
 /// How long calls that need an answer from the worker (adding a container, history, ...)
 /// wait for it to become free.
 pub(crate) const WORKER_WAIT: Duration = Duration::from_secs(10);
+
+/// A passphrase, wiped from memory when dropped.
+pub(crate) type Passphrase = zeroize::Zeroizing<String>;
 
 pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -157,8 +160,11 @@ pub(crate) enum Cmd {
     Flushed(i64, Reply<i32>),
     SetMode(String, CardMode),
     /// A remote that `es_remote_add` set up (`Some`), or could not reach (`None`: attached, set
-    /// up on the next network cycle).
-    BindRemote(Arc<dyn Remote>, Option<RemoteSetup>),
+    /// up on the next network cycle, with the `es_repo_create_encrypted` passphrase if any).
+    /// The sender gets the outcome of binding it: `ES_OK`, `ES_E_LOCKED`, or an error.
+    BindRemote(Arc<dyn Remote>, Option<RemoteSetup>, Option<Passphrase>, Option<mpsc::Sender<i32>>),
+    /// `es_repo_unlock`; replies with a status.
+    Unlock(Passphrase, Reply<i32>),
     SessionBegin {
         mounted: Vec<i64>,
         reply: Reply<BeginOutcome>,
@@ -249,6 +255,8 @@ pub(crate) struct Shared {
     /// The remote `es_remote_add` accepted but couldn't set up yet (unreachable): the data
     /// directory is bound to it only once it is, but no other remote may be added meanwhile.
     pub pending_remote: Mutex<Option<String>>,
+    /// From `es_repo_create_encrypted`, for the next `es_remote_add`.
+    pub create_passphrase: Mutex<Option<Passphrase>>,
     pub next_session: AtomicU64,
     pub cache: RwLock<Cache>,
     /// An `es_sync_now` is queued and not started yet (later ones are merged into it).
@@ -336,6 +344,7 @@ impl Client {
             holds: Mutex::new(HashMap::new()),
             sessions: Mutex::new(Sessions::default()),
             pending_remote: Mutex::new(None),
+            create_passphrase: Mutex::new(None),
             next_session: AtomicU64::new(1),
             cache: RwLock::new(Cache::default()),
             sync_queued: AtomicBool::new(false),
@@ -404,8 +413,9 @@ struct Worker {
     dirty: HashMap<i64, Instant>,
     /// When to push the outbox (after a snapshot found new versions).
     push_due: Option<Instant>,
-    /// Attached while unreachable at `es_remote_add`; set up on the next network cycle.
-    unsetup_remote: Option<Arc<dyn Remote>>,
+    /// Attached while unreachable at `es_remote_add`; set up on the next network cycle (with
+    /// the passphrase for a new encrypted repository, if one was given).
+    unsetup_remote: Option<(Arc<dyn Remote>, Option<Passphrase>)>,
     /// Conflicts already reported with ES_EV_CONFLICT.
     announced: HashSet<i64>,
     /// Blocked units already reported, per container, so a unit that stays blocked (a card
@@ -489,18 +499,36 @@ impl Worker {
                     self.shared.emit(Event::new(ES_EV_ERROR, status).message(format!("{card}: {e}")));
                 }
             },
-            Cmd::BindRemote(remote, setup) => match setup {
+            Cmd::BindRemote(remote, setup, passphrase, done) => match setup {
                 Some(setup) => {
-                    if let Err(e) = self.engine.bind_remote(remote, setup) {
-                        let status = self.local_error("adding the remote", &e);
-                        self.shared.emit(Event::new(ES_EV_ERROR, status).message(e.to_string()));
+                    let uri = setup.uri.clone();
+                    let status = match self.engine.bind_remote(remote, setup) {
+                        Ok(_) if self.engine.encryption() == Encryption::Locked => {
+                            log::info!("{uri} is encrypted; unlock it with es_repo_unlock");
+                            ES_E_LOCKED
+                        }
+                        Ok(_) => ES_OK,
+                        Err(e) => self.local_error("adding the remote", &e),
+                    };
+                    self.refresh();
+                    // The setup thread passes it on, or reports it as an event if es_remote_add
+                    // stopped waiting.
+                    if let Some(done) = done {
+                        let _ = done.send(status);
                     }
                 }
                 None => {
                     self.engine.attach_remote(remote.clone());
-                    self.unsetup_remote = Some(remote);
+                    self.unsetup_remote = Some((remote, passphrase));
                 }
             },
+            Cmd::Unlock(passphrase, reply) => {
+                if reply.start() {
+                    let status = self.unlock(&passphrase);
+                    self.refresh();
+                    reply.finish(status);
+                }
+            }
             Cmd::SessionBegin { mounted, reply } => {
                 reply.start();
                 let (report, _) = self.cycle(Cycle::PullApply);
@@ -618,19 +646,42 @@ impl Worker {
         }
     }
 
+    /// Sets up a remote `es_remote_add` couldn't reach. `Err` with the status if it still can't
+    /// be (`ES_OFFLINE`) or was rejected (reported, and dropped).
+    fn setup_pending_remote(&mut self) -> Result<(), i32> {
+        let Some((remote, passphrase)) = self.unsetup_remote.take() else { return Ok(()) };
+        let r = match &passphrase {
+            Some(p) => self.engine.add_remote_encrypted(remote.clone(), p, KdfParams::default()),
+            None => self.engine.add_remote(remote.clone()),
+        };
+        match r {
+            Ok(_) => Ok(()),
+            Err(e) if e.is_offline() => {
+                self.unsetup_remote = Some((remote, passphrase));
+                Err(ES_OFFLINE)
+            }
+            Err(e) => Err(self.report_error(&e)),
+        }
+    }
+
+    /// `es_repo_unlock`.
+    fn unlock(&mut self, passphrase: &str) -> i32 {
+        if let Err(status) = self.setup_pending_remote() {
+            return status;
+        }
+        match self.engine.unlock(passphrase) {
+            Ok(()) => {
+                log::info!("the repository is unlocked; its key is kept in the data directory");
+                ES_OK
+            }
+            Err(e) => self.local_error("unlocking the repository", &e),
+        }
+    }
+
     /// A cycle that may use the network, framed by SYNC_STARTED and SYNC_FINISHED.
     fn cycle(&mut self, kind: Cycle) -> (Option<SyncReport>, i32) {
         self.shared.emit(Event::new(ES_EV_SYNC_STARTED, ES_OK));
-        if let Some(remote) = self.unsetup_remote.clone() {
-            match self.engine.add_remote(remote) {
-                Ok(_) => self.unsetup_remote = None,
-                Err(e) if e.is_offline() => {}
-                Err(e) => {
-                    self.unsetup_remote = None;
-                    self.report_error(&e);
-                }
-            }
-        }
+        let _ = self.setup_pending_remote();
         let r = match kind {
             Cycle::Full => self.engine.sync(),
             Cycle::PullApply => self.engine.pull_and_apply(),

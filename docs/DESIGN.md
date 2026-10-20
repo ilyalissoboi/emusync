@@ -164,8 +164,8 @@ Each format adapter turns a unit into a **canonical form**:
   RTC footer or RetroArch's rounding to a power of two). The trailers are kept as metadata so
   they can be restored on the same emulator.
 
-`content_hash = BLAKE3(canonical_bytes)`. When end-to-end encryption is on, the hash is keyed
-(see §7).
+`content_hash = BLAKE3(canonical_bytes)`. When end-to-end encryption is on, the names the
+storage provider sees are keyed hashes of it (see §7, §22).
 
 ---
 
@@ -597,6 +597,9 @@ data.
   - Chunks are encrypted with XChaCha20-Poly1305. Content addresses use keyed BLAKE3, so the
     storage provider can't confirm "this user has save X".
   - Log segments are encrypted as well. Only file names and sizes are visible to the provider.
+  - Implemented as described in §22, with one refinement: content hashes stay plain BLAKE3
+    inside the (encrypted) logs and the local state, and only the blob *names* the provider
+    sees are keyed.
 - **Credentials:** the library never shows UI. Every backend gets credentials from a
   host-supplied **credential provider callback**. For S3, the callback returns access keys or
   temporary STS credentials (§6.2). For OAuth backends added later (Dropbox, Drive, OneDrive),
@@ -818,6 +821,15 @@ event and released explicitly. `es_abi_version()` lets a host refuse a mismatche
 | **M0: Core + S3** | Data model, DAG reconciliation, SQLite state, outbox/inbox, **S3 backend** (AWS + MinIO), `raw` adapter, logical cards with **whole-file mode**, CLI. Already useful: `Mcd001.ps2` syncs between machines as a whole file. |
 | **M1: PS2** | `ps2.card` + `ps2.card.folder` adapters with full round-trip and fuzz coverage, making unit mode the default for PS2 cards. `emusyncd` with a PCSX2 profile for Windows/macOS/Linux. |
 | **M2: Embedded + mobile** | C ABI freeze (v1), C++ header, Android AAR with SAF VFS and keystore-backed S3 credentials. ARMSX2 fork and PCSX2 fork integrations. E2E encryption. |
+
+**Status (October 2026).** M0 and M1 are done. M2: **done** are the C ABI v1 freeze
+(`include/emusync.h`, §20, with a C++ compile check of the header), the Android build of
+`libemusync.so` with its CMake module (§21), the ARMSX2 integration (the fork in
+`ilyalissoboi/ARMSX2` embeds `libemusync.so`; two-way sync verified on a real device, an AYN
+Thor, against desktop PCSX2), and end-to-end encryption (§22). **Open:** passphrase entry in
+ARMSX2's settings, the Android AAR with Kotlin bindings and a SAF VFS (ARMSX2 links the
+library directly and needs neither), the C++ RAII wrapper `bindings/cpp/emusync.hpp`, and a
+PCSX2 desktop fork (desktop PCSX2 is covered by the `emusync watch` sidecar).
 | **M3: States + more backends** | Save states with compat keys, links, and the `resume` slot. STS temporary credentials. Further backends (WebDAV, Dropbox, Google Drive) on the same layout. Reference server with push, leases and handoff if the hosted question (§15) is answered yes. |
 | **M4: More platforms** | PS1 (DuckStation, SwanStation/Beetle in RetroArch), GameCube (Dolphin), cartridge SRAM normalisation, PSP. RetroArch frontend integration. |
 
@@ -1202,7 +1214,7 @@ pins down §3.2, §6.4, §10 and §12:
 9. **Not implemented, refused with `ES_E_INVALID_ARG`:** custom VFS (`es_config.vfs` must be
    NULL), `ES_POLICY_PREFER_LOCAL` / `PREFER_REMOTE` (if two devices each prefer their own copy,
    their automatic merges never converge; needs a design), per-game containers (`title_scope`),
-   `ES_CF_NO_UPLOAD`, encryption (`es_repo_*`), OAuth (`es_oauth_*`) and save states
+   `ES_CF_NO_UPLOAD`, OAuth (`es_oauth_*`) and save states
    (`es_state_*`, M3). Leases don't exist yet, so `other_device_active` is always empty and
    `ES_CFG_DISABLE_LEASES` (like the metered-network flags) has no effect. There is no
    background timer: hosts call `es_sync_now` when they want a cycle; `es_remote_add` doesn't
@@ -1290,3 +1302,105 @@ by building and inspecting the library, with these results:
 9. **Not verified yet** (the rest of research item 9). Linking into ARMSX2's `emucore`
    with `-DLTO_PCSX2_CORE=ON`, AGP packaging in a real APK, and `System.loadLibrary` resolving
    it on an arm64 device all belong to the ARMSX2 integration itself.
+
+## 22. Implementation notes (end-to-end encryption)
+
+Optional encryption of a repository (§7), in `emusync-core` (`crypto.rs`, `keystore.rs` and the
+engine), the C ABI (`es_repo_create_encrypted`, `es_repo_unlock`) and the CLI (`emusync remote
+add --encrypt`, `remote unlock`, `remote lock`). Where it differs from or pins down §6.1 and §7:
+
+1. **Chosen at creation.** A repository is encrypted or not for its whole life: `repo.json` is
+   create-only, so it can't change later. A data directory therefore remembers the
+   `repo_id` and encryption header it was bound with, and refuses the remote if `repo.json`
+   later reads differently: someone with write access to the bucket could otherwise swap in a
+   format-1 `repo.json` with the same id and get a bound device to upload plaintext. Asking
+   for encryption on an existing unencrypted
+   repository is refused (`Error::Incompatible`, `ES_E_INCOMPATIBLE`); switching means a new
+   prefix and a new data directory on each device. Unencrypted repositories are unchanged in
+   every byte: `repo.json` format 1 with `"encryption": null`, blobs at
+   `blobs/<hh>/<content hash>`, plaintext log segments and `device.json`
+   (`tests/encryption.rs` checks this).
+2. **`repo.json` format 2.** An encrypted repository has
+   `{"format": 2, "repo_id": "<uuid>", "encryption": {"scheme": "xchacha20poly1305-blake3",
+   "kdf": {"alg": "argon2id", "m_kib": 65536, "t": 3, "p": 1, "salt": "<hex>"},
+   "wrapped_key": "<hex>"}}`. The version bump is what stops an **older client**: every
+   release before this one refuses any format but 1 when the remote is added ("unsupported
+   repository format in repo.json", `ES_E_INVALID_ARG` through the C ABI), so it never writes
+   plaintext into an encrypted repository. This was checked against the CLI built from `main`.
+   A format above 2 is refused with "newer than this version of emusync supports; update
+   emusync" (`ES_E_INCOMPATIBLE`).
+3. **Keys.** A random 256-bit repository key is wrapped with XChaCha20-Poly1305 under an
+   Argon2id key from the passphrase (64 MiB, 3 passes, 1 lane, 16-byte random salt; 88 ms
+   on a desktop CPU, not yet measured on a phone), with `emusync repository key <repo_id>` as associated data so a
+   wrapped key can't be moved to another repository. A wrong passphrase fails the tag check:
+   `Error::WrongPassphrase` / `ES_E_PASSPHRASE`. Two subkeys are derived from the repository
+   key with BLAKE3's key derivation mode: a data key and an address key. The KDF parameters a
+   `repo.json` may ask for are bounded, because `repo.json` isn't authenticated: at most
+   256 MiB, 12 passes and 4 lanes, and at most 4 times the work of the defaults (memory ×
+   passes), so whoever can write the bucket can't make a phone run out of memory or spend
+   long on an unlock. Changing the passphrase is not
+   implemented: it needs a second wrapped-key object, since `repo.json` can't be rewritten.
+4. **Objects.** Every object a device writes besides `repo.json` (blobs, log segments,
+   `device.json`) is `0x01 ‖ 24-byte random nonce ‖ XChaCha20-Poly1305(data key, plaintext)`,
+   with the object's key in the repository as associated data, so the provider can't pass one
+   object off as another. A blob's plaintext is the §16 blob encoding (format byte, zstd); a
+   segment's is the NDJSON of §6.1. Random nonces make a retry write different bytes, so the
+   lost-response check of §16 item 7 decrypts the existing segment and compares plaintexts. A
+   segment that doesn't decrypt is skipped with a warning, like a malformed record, and nothing
+   in it is used; a plaintext segment planted in an encrypted repository is therefore ignored.
+5. **Content addresses.** §7 says content addresses use keyed BLAKE3. What is keyed is what the
+   provider sees: a blob lives at `blobs/<hh>/<BLAKE3, keyed with the address key, of the
+   chunk's "b3:…" id>`. Content hashes and version ids stay plain BLAKE3 everywhere else: in
+   the logs, which are encrypted, and in the local state. That keeps a data directory's
+   history independent of its remote. Versions snapshotted before an encrypted remote was
+   added upload as they are, rather than needing their whole DAG rehashed, and nothing
+   changes for unencrypted repositories. The provider can't compute a blob's name without the
+   address key, so it can't check for a known save, and dedup still works because every
+   device derives the same names.
+6. **Kept on each device.** The unwrapped key is stored in `<data_dir>/keys/<repo_id>.key`, so
+   the passphrase is entered once per data directory. On Windows the key is protected with
+   DPAPI (`CryptProtectData`, current user, the repository id as extra entropy), so a copied
+   data directory is useless to another user or machine. Elsewhere it is a 0600 file in a 0700
+   directory. That is the documented fallback on macOS and Linux desktops (anyone who can read
+   the user's files can read the key, as they can the saves), and on Android and iOS, where the
+   data directory is the app's private storage. The ABI has no hook for a host keystore
+   (Android Keystore, iOS Keychain). Adding one means appending a field to `es_config`, which a
+   host built against the current header would then pass short and get `ES_E_ABI`, so it waits
+   for the next reason to change the ABI. A key file that can't be read (another Windows user,
+   or another repository's file copied in) is ignored with a warning, and the repository is
+   locked.
+7. **Locked.** A data directory bound to an encrypted repository without its key (added
+   without the passphrase, or after `remote lock` / `Engine::forget_key`) is *locked*. Every
+   network cycle fails with `Error::Locked` / `ES_E_LOCKED` before it reads or writes
+   anything, and so does fetching a version's blobs. Local snapshots continue and upload once
+   it is unlocked. `emusync watch` and `emusync service install` refuse to start while locked.
+8. **C ABI** (still ABI version 1). Two status codes are appended, `ES_E_LOCKED = -11` and
+   `ES_E_PASSPHRASE = -12`. Older headers don't name them, and `es_status_str` describes them;
+   no function or struct changed. `es_repo_create_encrypted` keeps the passphrase for the next
+   `es_remote_add` (the only order that works, since `es_remote_add` creates `repo.json`),
+   which creates the repository encrypted or unlocks an existing encrypted one. If that remote
+   is unreachable, the passphrase waits with it for the deferred setup (§20 item 1). Without a
+   passphrase, `es_remote_add` returns `ES_E_LOCKED` for an encrypted repository whose key the
+   data directory doesn't have. Once the setup succeeds, the setup thread hands it to the
+   worker ahead of queued work and returns the outcome of binding it, so a failure there (the
+   key can't be stored, say) is returned as an error rather than `ES_OK`. `es_repo_unlock` runs
+   on the worker and waits for it. Passphrases are held in `Zeroizing` buffers and never
+   logged.
+9. **CLI.** A passphrase is read from the terminal without echo (`rpassword`), or as the first
+   line of stdin when stdin isn't a terminal. There is no flag or environment variable for it.
+   A new repository asks twice. A wrong passphrase at `remote add` leaves the remote added and
+   locked, with a hint to run `emusync remote unlock`.
+10. **Tests.** `crates/emusync-core/tests/encryption.rs`, over the in-memory remote: two
+    devices syncing both ways; every version readable by a third device from the remote alone;
+    no plaintext, content hash or device name in any object or object name; the passphrase
+    once per data directory; locked and wrong-passphrase paths; versions made before the
+    remote was added; tampered and planted segments and swapped blobs; unencrypted
+    repositories unchanged; format and header checks; and the default Argon2id parameters.
+    Unit tests in `crypto.rs` (wrap and unwrap, hostile headers, sealing, keyed names) and
+    `keystore.rs` (DPAPI on Windows, 0600 elsewhere). In `emusync-ffi`: two devices through the
+    exported functions (create, locked, wrong passphrase, unlock, restart without the
+    passphrase) and the argument and error cases; the C smoke test and the C++ header check
+    use the new functions and codes. For the CLI, `s3_encrypted_repository_between_two_data_dirs`
+    runs against moto in CI (the `s3-moto` job). Argon2 and BLAKE2 are built with
+    `opt-level = 3` in the dev profile, so debug builds and tests don't spend seconds on each
+    key derivation.

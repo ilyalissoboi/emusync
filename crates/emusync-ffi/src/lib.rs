@@ -40,6 +40,8 @@ pub enum EsStatus {
     Incompatible = -8,
     NotFound = -9,
     Abi = -10,
+    Locked = -11,
+    Passphrase = -12,
     Internal = -100,
 }
 
@@ -72,6 +74,8 @@ pub extern "C" fn es_status_str(s: i32) -> *const c_char {
         -8 => "incompatible\0",
         -9 => "not found\0",
         -10 => "ABI mismatch\0",
+        -11 => "repository locked (passphrase needed)\0",
+        -12 => "wrong passphrase\0",
         -100 => "internal error\0",
         _ => "unknown status\0",
     };
@@ -92,6 +96,9 @@ pub(crate) fn status_of(e: &emusync_core::Error) -> i32 {
         Error::Format(_) => ES_E_FORMAT,
         Error::NotFound(_) => ES_E_NOT_FOUND,
         Error::InvalidArg(_) => ES_E_INVALID_ARG,
+        Error::Locked => ES_E_LOCKED,
+        Error::WrongPassphrase => ES_E_PASSPHRASE,
+        Error::Incompatible(_) => ES_E_INCOMPATIBLE,
         Error::Json(_) => ES_E_INTERNAL,
     }
 }

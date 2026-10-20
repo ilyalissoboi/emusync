@@ -29,9 +29,11 @@ ctrlc.workspace = true
 dirs.workspace = true
 log.workspace = true
 notify.workspace = true
+rpassword.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sysinfo.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
