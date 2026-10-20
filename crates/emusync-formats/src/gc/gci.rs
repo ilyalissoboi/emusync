@@ -38,7 +38,9 @@ pub fn gci_bytes(save: &Save) -> Vec<u8> {
 }
 
 fn is_gci(path: &str) -> bool {
-    !path.contains('/') && path.len() > 4 && path[path.len() - 4..].eq_ignore_ascii_case(".gci")
+    // Bytes, not a str slice: the last four bytes of a non-ASCII name may split a character.
+    let b = path.as_bytes();
+    !path.contains('/') && b.len() > 4 && b[b.len() - 4..].eq_ignore_ascii_case(b".gci")
 }
 
 /// Dolphin's `EscapeFileName`: control characters and `"*/:<>?\|` and DEL become `__xx__`,
@@ -233,6 +235,17 @@ mod tests {
         let tree = Tree::decode(&img).unwrap();
         assert_eq!(parse_gci(tree.file("01-GM8E-MetroidPrime A.gci").unwrap()).unwrap().data, m2.data);
         assert!(tree.file("64-GSWE-RogueLeader.gci").is_none());
+    }
+
+    #[test]
+    fn gci_files_are_found_by_extension() {
+        assert!(is_gci("a.gci") && is_gci("A.GCI"));
+        assert!(!is_gci(".gci") && !is_gci("sub/a.gci") && !is_gci("a.gcx"));
+        // Non-ASCII names, including ones whose last four bytes split a character.
+        assert!(!is_gci("Pokémon") && !is_gci("セーブ") && is_gci("ポケモン.gci"));
+        let m = save(b"GM8E", b"01", "MetroidPrime A", 1, 1);
+        let img = folder(&[("Pokémon", vec![1]), ("a.gci", gci_bytes(&m))]);
+        assert_eq!(GciFolder.extract_all(&img).unwrap(), vec![canonical(&m)]);
     }
 
     #[test]
