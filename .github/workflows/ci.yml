@@ -36,6 +36,68 @@ jobs:
       - name: Build the C ABI as a shared library
         run: cargo rustc -p emusync-ffi --lib --crate-type cdylib
 
+  # The desktop shared library, the way PCSX2, Dolphin and PPSSPP link it: through
+  # bindings/cmake/EmuSync.cmake (a consumer project that builds and runs the C smoke test against
+  # it), and as the package scripts/build-desktop.sh stages for non-CMake builds (MSBuild).
+  desktop:
+    name: desktop library (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The Visual Studio generator: multi-config, like PCSX2's own Windows builds.
+          - os: windows-latest
+            cmake_args: ""
+            package_args: ""
+          # A universal library, which is what macOS apps ship.
+          - os: macos-latest
+            cmake_args: -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
+            package_args: --target aarch64-apple-darwin --target x86_64-apple-darwin
+          - os: ubuntu-latest
+            cmake_args: ""
+            package_args: ""
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.os == 'macos-latest' && 'aarch64-apple-darwin, x86_64-apple-darwin' || '' }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Build and run the smoke test with bindings/cmake/EmuSync.cmake
+        shell: bash
+        run: |
+          cmake -S bindings/cmake/desktop-test -B build/desktop -DCMAKE_BUILD_TYPE=Release             -DEMUSYNC_CARGO_TARGET_DIR="$PWD/target" ${{ matrix.cmake_args }}
+          cmake --build build/desktop --config Release
+          ctest --test-dir build/desktop -C Release --output-on-failure
+      - name: Package with scripts/build-desktop.sh
+        shell: bash
+        run: scripts/build-desktop.sh --out dist ${{ matrix.package_args }}
+      - name: Check the library
+        shell: bash
+        run: |
+          case "$RUNNER_OS" in
+            Linux)
+              scripts/check-desktop-lib.sh dist/lib/libemusync.so
+              smoke=$(find build/desktop -name emusync_smoke -type f | head -1)
+              readelf -d "$smoke" | grep -q 'NEEDED.*\[libemusync\.so\]' || { echo "::error::the smoke test does not need libemusync.so by name"; exit 1; }
+              ;;
+            macOS)
+              scripts/check-desktop-lib.sh dist/lib/libemusync.dylib "arm64 x86_64"
+              ;;
+            Windows)
+              test -f dist/bin/emusync.dll && test -f dist/lib/emusync.lib && test -f dist/include/emusync.h
+              ;;
+          esac
+      - name: The CMake module switches itself off without the Rust target
+        if: runner.os == 'Linux'
+        run: |
+          cmake -S bindings/cmake/desktop-test -B build/off -DEMUSYNC_RUST_TARGET=riscv64gc-unknown-linux-gnu             -DEMUSYNC_EXPECT_FOUND=OFF | tee off.log
+          grep -q "emusync: Rust target riscv64gc-unknown-linux-gnu not installed -> DISABLED" off.log
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libemusync-desktop-${{ runner.os }}
+          path: dist/
+
   # libemusync.so for Android, the way ARMSX2 links it (docs/research/armsx2.md §4). The ELF
   # checks are in scripts/check-android-so.sh.
   android:
