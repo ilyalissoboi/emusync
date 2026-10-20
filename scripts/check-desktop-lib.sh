@@ -35,8 +35,10 @@ case "$(uname -s)" in
         all="$(nm -D "$lib" | awk '{print $NF}')"
         ;;
     Darwin)
-        install_name="$(otool -D "$lib" | tail -n +2)"
-        [ "$install_name" = "@rpath/libemusync.dylib" ] || fail "install name is '$install_name'"
+        # One "<file> (architecture …):" header per slice of a universal library, each followed
+        # by that slice's install name; every one must be the @rpath name.
+        install_name="$(otool -D "$lib" | grep -v ':$' | sort -u)"
+        [ "$install_name" = "@rpath/libemusync.dylib" ] || fail "install names are '$(echo $install_name)'"
         echo "install name: $install_name"
         if [ $# -ge 2 ]; then
             archs="$(lipo -archs "$lib" | tr ' ' '\n' | sort | paste -sd' ' -)"
