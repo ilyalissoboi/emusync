@@ -67,6 +67,35 @@ pub fn atomic_replace(path: &Path, data: &[u8]) -> std::io::Result<()> {
     result
 }
 
+/// Replaces `path` with `data` in a file only its owner can read: mode 0600 in a 0700
+/// directory on Unix (created if missing), the user's own file on Windows, whose profile is
+/// already private. Temp + rename, so a crash leaves the old file or the new one. For secrets
+/// kept in files: repository keys (DESIGN §22) and the host-secret fallback (§24).
+pub fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    let dir = path.parent().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no parent directory"))?;
+    fs::create_dir_all(dir)?;
+    let tmp = temp_path(path);
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+        opts.mode(0o600);
+    }
+    let result = (|| {
+        let mut f = opts.open(&tmp)?;
+        f.write_all(data)?;
+        f.sync_all()?;
+        drop(f);
+        fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
 /// Writes a content-addressed file if it doesn't exist yet (temp + rename, so a crash never
 /// leaves a truncated file under the final name).
 pub fn write_once(path: &Path, data: &[u8]) -> std::io::Result<()> {

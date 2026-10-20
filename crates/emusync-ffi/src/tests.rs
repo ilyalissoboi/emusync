@@ -888,3 +888,80 @@ fn encryption_errors() {
         assert!((*t.c).shared.cache().remote.is_some());
     }
 }
+
+#[test]
+fn secret_calls_validate_their_arguments() {
+    // None of these reach a credential store: they fail on the arguments first.
+    let (svc, name, val) = (cstr("emusync-test"), cstr("name"), cstr("value"));
+    let bad = cstr("../name");
+    let null = std::ptr::null();
+    unsafe {
+        assert_eq!(es_secret_set(null, name.as_ptr(), val.as_ptr(), null), ES_E_INVALID_ARG);
+        assert_eq!(es_secret_set(svc.as_ptr(), null, val.as_ptr(), null), ES_E_INVALID_ARG);
+        assert_eq!(es_secret_set(svc.as_ptr(), name.as_ptr(), null, null), ES_E_INVALID_ARG);
+        assert_eq!(es_secret_set(svc.as_ptr(), bad.as_ptr(), val.as_ptr(), null), ES_E_INVALID_ARG);
+        assert_eq!(es_secret_set(svc.as_ptr(), name.as_ptr(), cstr("").as_ptr(), null), ES_E_INVALID_ARG);
+        assert_eq!(es_secret_delete(svc.as_ptr(), bad.as_ptr(), null), ES_E_INVALID_ARG);
+
+        let mut buf = [b'x' as c_char; 8];
+        let mut len = 99usize;
+        assert_eq!(
+            es_secret_get(svc.as_ptr(), bad.as_ptr(), null, buf.as_mut_ptr(), buf.len(), &mut len),
+            ES_E_INVALID_ARG
+        );
+        assert_eq!((buf[0], len), (0, 0), "out and out_len are cleared on errors");
+        assert_eq!(
+            es_secret_get(svc.as_ptr(), name.as_ptr(), null, std::ptr::null_mut(), 8, std::ptr::null_mut()),
+            ES_E_INVALID_ARG,
+            "out NULL with cap > 0"
+        );
+    }
+}
+
+/// The C side of the system-store round trip in emusync_core::secrets: like that one, it runs
+/// only with EMUSYNC_TEST_OS_SECRETS=1, because it writes to this machine's credential store.
+#[test]
+fn secrets_round_trip_through_the_c_abi() {
+    if std::env::var_os("EMUSYNC_TEST_OS_SECRETS").is_none() {
+        eprintln!("skipped: set EMUSYNC_TEST_OS_SECRETS=1 to use this machine's credential store");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let fallback = cstr(dir.path().to_str().unwrap());
+    let svc = cstr("emusync-test");
+    let name = cstr(&format!("c-abi-{}", std::process::id()));
+    let value = "AKIA-not-a-real-secret/0123456789";
+    unsafe {
+        let mut len = 0usize;
+        assert_eq!(
+            es_secret_get(svc.as_ptr(), name.as_ptr(), fallback.as_ptr(), std::ptr::null_mut(), 0, &mut len),
+            ES_E_NOT_FOUND
+        );
+        assert_eq!(es_secret_set(svc.as_ptr(), name.as_ptr(), cstr(value).as_ptr(), fallback.as_ptr()), ES_OK);
+
+        // The size query, then a buffer one byte short, then the right size.
+        assert_eq!(
+            es_secret_get(svc.as_ptr(), name.as_ptr(), fallback.as_ptr(), std::ptr::null_mut(), 0, &mut len),
+            ES_E_NO_SPACE
+        );
+        assert_eq!(len, value.len() + 1);
+        let mut buf = vec![b'x' as c_char; len];
+        assert_eq!(
+            es_secret_get(svc.as_ptr(), name.as_ptr(), fallback.as_ptr(), buf.as_mut_ptr(), len - 1, &mut len),
+            ES_E_NO_SPACE
+        );
+        assert_eq!(buf[0], 0);
+        assert_eq!(
+            es_secret_get(svc.as_ptr(), name.as_ptr(), fallback.as_ptr(), buf.as_mut_ptr(), buf.len(), &mut len),
+            ES_OK
+        );
+        assert_eq!(CStr::from_ptr(buf.as_ptr()).to_str().unwrap(), value);
+
+        assert_eq!(es_secret_delete(svc.as_ptr(), name.as_ptr(), fallback.as_ptr()), ES_OK);
+        assert_eq!(
+            es_secret_get(svc.as_ptr(), name.as_ptr(), fallback.as_ptr(), buf.as_mut_ptr(), buf.len(), &mut len),
+            ES_E_NOT_FOUND
+        );
+        assert_eq!(es_secret_delete(svc.as_ptr(), name.as_ptr(), fallback.as_ptr()), ES_OK);
+    }
+}

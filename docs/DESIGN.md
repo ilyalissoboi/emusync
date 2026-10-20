@@ -1404,3 +1404,45 @@ add --encrypt`, `remote unlock`, `remote lock`). Where it differs from or pins d
     runs against moto in CI (the `s3-moto` job). Argon2 and BLAKE2 are built with
     `opt-level = 3` in the dev profile, so debug builds and tests don't spend seconds on each
     key derivation.
+
+## 24. Implementation notes (host secrets)
+
+Desktop hosts keep S3 keys and an encryption passphrase between runs. §7 says platform bindings
+keep them in the OS keystore; without help each emulator would write its own code for three
+stores. `emusync_core::secrets` and the C functions `es_secret_set`, `es_secret_get` and
+`es_secret_delete` do it once:
+
+- **Stores.** Windows: Credential Manager, a generic credential of the current user. macOS: the
+  user's Keychain, a generic password. Linux: the Secret Service over D-Bus (GNOME Keyring,
+  KWallet). All three through the `keyring` crate, 3.x (4.x needs Rust 1.88, above this
+  workspace's 1.80), with its pure-Rust D-Bus client on Linux (`zbus`), so the library gains no
+  `libdbus` dependency at build or run time.
+- **Naming.** A secret is `service` (the host, `PCSX2`) plus `name` (the setting,
+  `s3-secret-access-key`): that is the service and account Keychain Access and Credential Manager
+  show the user. Both are limited to 64 letters, digits, spaces, `.`, `_` and `-`, because the
+  fallback below uses them as file names. Values are 1 to 1024 bytes: Credential Manager holds at
+  most 2,560.
+- **Fallback.** Only on Linux, where a Secret Service may not be running (a headless machine, the
+  Steam Deck in game mode, a minimal window manager): if the store is unavailable, the secret
+  goes to `<fallback_dir>/secrets/<service>/<name>`, mode 0600 in 0700 directories, the same
+  protection repository keys get there (§22; the writer is shared, `fsutil::write_private`).
+  Reads check the store first, then the file; storing again once the store is back moves the
+  secret into it and deletes the file. On Windows and macOS an unreachable store (a keychain the
+  user refused to unlock) is reported as `ES_E_IO`, not silently replaced by a file. Without a
+  `fallback_dir` the Linux case is `ES_E_IO` too.
+- **No client.** The calls are free functions, so a host can read its keys before
+  `es_client_create`, and settings screens can store them without a running sync. They run
+  under the same panic guard as the rest of the ABI. They may block while the system asks the
+  user to unlock the keychain or keyring.
+- **Output buffer.** `es_secret_get` writes the value and a NUL into the caller's buffer and
+  reports the size needed; a buffer that is too small gets `ES_E_NO_SPACE` and an empty string,
+  and `out = NULL, cap = 0` asks for the size only. Values are held in `Zeroizing` buffers inside
+  the library.
+- **Android and iOS** hosts keep secrets in the Android Keystore or the iOS Keychain from their
+  own code (ARMSX2 does, §21); the calls fail there with `ES_E_INVALID_ARG`, and the library
+  doesn't link `keyring` for those targets.
+- **Tests.** Argument checks run everywhere, including the C smoke test, and never reach a
+  store. The round trips through the real store (core and C ABI) write to the machine's
+  credential store, so they run only with `EMUSYNC_TEST_OS_SECRETS=1`; CI sets it, which covers
+  Credential Manager on Windows and the Keychain on macOS, and the fallback file on Linux runners,
+  which have no Secret Service. Not tested: a real Secret Service (GNOME Keyring, KWallet).

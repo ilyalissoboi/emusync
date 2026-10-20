@@ -27,7 +27,12 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       # Includes the C ABI checks (crates/emusync-ffi/tests/c_abi.rs): a C smoke test and a C++
       # compile of include/emusync.h, built with this runner's C compiler against the static library.
+      # EMUSYNC_TEST_OS_SECRETS lets the host-secret tests write to the runner's credential store:
+      # Credential Manager on Windows, the Keychain on macOS. Linux runners have no Secret
+      # Service, so there they test the fallback file.
       - run: cargo test --workspace
+        env:
+          EMUSYNC_TEST_OS_SECRETS: "1"
       - name: Build the C ABI as a shared library
         run: cargo rustc -p emusync-ffi --lib --crate-type cdylib
 

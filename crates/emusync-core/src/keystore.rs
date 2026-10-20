@@ -13,7 +13,6 @@ use crate::crypto::RepoKey;
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
@@ -81,28 +80,7 @@ pub(crate) fn save(data_dir: &Path, repo_id: &str, key: &RepoKey) -> Result<()> 
         })
         .expect("key file serializes"),
     );
-    let dir = p.parent().expect("key path has a parent");
-    fs::create_dir_all(dir)?;
-    let tmp = crate::fsutil::temp_path(&p);
-    let mut opts = fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
-        opts.mode(0o600);
-    }
-    let result = (|| {
-        let mut f = opts.open(&tmp)?;
-        f.write_all(&body)?;
-        f.sync_all()?;
-        drop(f);
-        fs::rename(&tmp, &p)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&tmp);
-    }
-    Ok(result?)
+    Ok(crate::fsutil::write_private(&p, &body)?)
 }
 
 /// Deletes the stored key for `repo_id`, if any.
