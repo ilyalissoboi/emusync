@@ -105,7 +105,7 @@ impl Dev {
         assert_eq!(unsafe { es_client_create(&cfg, &mut c) }, ES_OK);
         if let Some(r) = remote {
             let client = unsafe { &*c };
-            let status = crate::api::setup_remote(&client.shared, r, false).unwrap().recv().unwrap();
+            let status = crate::api::setup_remote(&client.shared, r, false, None).unwrap().recv().unwrap();
             assert_eq!(status, ES_OK);
         }
         let id = add(c, &card, None).unwrap();
@@ -209,6 +209,36 @@ impl Dev {
         let status = unsafe { es_session_begin(self.c, &args, &mut info) };
         (status, info)
     }
+}
+
+impl Dev {
+    /// Destroys the client and creates a new one on the same data directory, as a restarted
+    /// app would.
+    fn reopen(&mut self) {
+        unsafe { es_client_destroy(self.c, 10_000) };
+        let data = cstr(self._dir.path().join("data").to_str().unwrap());
+        let mut cfg = config_init();
+        cfg.data_dir = data.as_ptr();
+        self.c = std::ptr::null_mut();
+        assert_eq!(unsafe { es_client_create(&cfg, &mut self.c) }, ES_OK);
+    }
+}
+
+/// `es_remote_add` for the in-memory remote: sets it up with the passphrase from
+/// `es_repo_create_encrypted`, if one was given, and returns the status.
+fn attach(c: *mut Client, r: Arc<dyn Remote>) -> i32 {
+    let client = unsafe { &*c };
+    let passphrase = crate::client::lock(&client.shared.create_passphrase).take();
+    let status = crate::api::setup_remote(&client.shared, r, false, passphrase).unwrap().recv().unwrap();
+    // Wait for the worker to bind it.
+    let (p, reply) = crate::client::Pending::new();
+    client.shared.queue.push(crate::client::Cmd::History("none".into(), reply));
+    let _ = p.wait(Duration::from_secs(10), crate::client::WaitMode::Deadline);
+    status
+}
+
+fn contains(hay: &[u8], needle: &[u8]) -> bool {
+    hay.windows(needle.len()).any(|w| w == needle)
 }
 
 impl Drop for Dev {
@@ -728,8 +758,6 @@ fn unimplemented_features_are_refused() {
     let dev = Dev::new("pc", None, ES_POLICY_ASK);
     let mut url = [1 as c_char; 16];
     unsafe {
-        assert_eq!(es_repo_create_encrypted(dev.c, cstr("pw").as_ptr()), ES_E_INVALID_ARG);
-        assert_eq!(es_repo_unlock(dev.c, cstr("pw").as_ptr()), ES_E_INVALID_ARG);
         assert_eq!(
             es_oauth_begin(dev.c, std::ptr::null(), std::ptr::null(), url.as_mut_ptr(), url.len()),
             ES_E_INVALID_ARG
@@ -753,6 +781,10 @@ fn version_and_status_strings() {
     assert!(v.starts_with(env!("CARGO_PKG_VERSION")));
     let s = unsafe { CStr::from_ptr(crate::es_status_str(crate::EsStatus::NoSpace as i32)) };
     assert_eq!(s.to_str().unwrap(), "no space in container");
+    let s = unsafe { CStr::from_ptr(crate::es_status_str(ES_E_LOCKED)) };
+    assert_eq!(s.to_str().unwrap(), "repository locked (passphrase needed)");
+    let s = unsafe { CStr::from_ptr(crate::es_status_str(crate::EsStatus::Passphrase as i32)) };
+    assert_eq!(s.to_str().unwrap(), "wrong passphrase");
     let s = unsafe { CStr::from_ptr(crate::es_status_str(12345)) };
     assert_eq!(s.to_str().unwrap(), "unknown status");
 }
@@ -765,4 +797,86 @@ fn fixed_buffers_truncate_at_char_boundaries() {
     copy_str(&mut buf, "aé€");
     assert_eq!(read_buf(&buf).unwrap(), "aé");
     assert_eq!(read_buf(&[1, 2]), None, "no NUL");
+}
+
+#[test]
+fn encrypted_repository_between_two_devices() {
+    let remote = memory();
+    let pass = cstr("correct horse battery staple");
+    let a = Dev::new("pc", None, ES_POLICY_ASK);
+    unsafe { assert_eq!(es_repo_create_encrypted(a.c, pass.as_ptr()), ES_OK) };
+    assert_eq!(attach(a.c, remote.clone()), ES_OK);
+    assert!(contains(&remote.raw_get("repo.json").unwrap(), b"\"format\":2"));
+    a.put(GTA, b"gta progress");
+    a.sync();
+    // The provider sees neither save data nor log records.
+    let objects: Vec<String> =
+        remote.keys().into_iter().filter(|k| k != "repo.json" && !k.starts_with("_probe/")).collect();
+    assert!(objects.iter().any(|k| k.ends_with(".ndjson")));
+    for k in &objects {
+        let body = remote.raw_get(k).unwrap();
+        for marker in [&b"gta progress"[..], GTA.as_bytes(), b"\"op\""] {
+            assert!(!contains(&body, marker), "{k} holds {}", String::from_utf8_lossy(marker));
+        }
+    }
+
+    // A second device without the passphrase: the remote is added, locked.
+    let mut b = Dev::new("phone", None, ES_POLICY_ASK);
+    assert_eq!(attach(b.c, remote.clone()), ES_E_LOCKED);
+    let evs = b.sync();
+    let finished = evs.iter().find(|e| e.kind == ES_EV_SYNC_FINISHED).unwrap();
+    assert_eq!(finished.status, ES_E_LOCKED);
+    assert!(finished.message.as_deref().unwrap_or_default().contains("passphrase"), "{finished:?}");
+    assert!(evs.iter().any(|e| e.kind == ES_EV_ERROR && e.status == ES_E_LOCKED));
+    unsafe {
+        assert_eq!(es_repo_unlock(b.c, cstr("wrong").as_ptr()), ES_E_PASSPHRASE);
+        assert_eq!(es_repo_unlock(b.c, pass.as_ptr()), ES_OK);
+    }
+    let evs = b.sync();
+    assert!(evs.iter().any(|e| e.kind == ES_EV_SYNC_FINISHED && e.status == ES_OK), "{evs:#?}");
+    assert_eq!(b.saves().get(GTA).map(Vec::as_slice), Some(&b"gta progress"[..]));
+
+    // Restarted, the phone needs no passphrase: the key was kept in its data directory.
+    b.reopen();
+    assert_eq!(attach(b.c, remote.clone()), ES_OK);
+    b.put(RAC, b"rac progress");
+    b.sync();
+    a.sync();
+    assert_eq!(a.saves().get(RAC).map(Vec::as_slice), Some(&b"rac progress"[..]));
+}
+
+#[test]
+fn encryption_errors() {
+    unsafe {
+        let dev = Dev::new("pc", None, ES_POLICY_ASK);
+        assert_eq!(es_repo_create_encrypted(dev.c, std::ptr::null()), ES_E_INVALID_ARG);
+        assert_eq!(es_repo_create_encrypted(dev.c, cstr("").as_ptr()), ES_E_INVALID_ARG);
+        assert_eq!(es_repo_unlock(std::ptr::null_mut(), cstr("pw").as_ptr()), ES_E_INVALID_ARG);
+        // No remote yet.
+        assert_eq!(es_repo_unlock(dev.c, cstr("pw").as_ptr()), ES_E_INVALID_ARG);
+
+        // An unencrypted repository: nothing to unlock, and it can't become encrypted.
+        let plain = memory();
+        let p = Dev::new("pc", Some(plain.clone()), ES_POLICY_ASK);
+        assert_eq!(es_repo_unlock(p.c, cstr("pw").as_ptr()), ES_E_INVALID_ARG);
+        let q = Dev::new("phone", None, ES_POLICY_ASK);
+        assert_eq!(es_repo_create_encrypted(q.c, cstr("pw").as_ptr()), ES_OK);
+        assert_eq!(attach(q.c, plain.clone()), ES_E_INCOMPATIBLE);
+        assert!(contains(&plain.raw_get("repo.json").unwrap(), b"\"format\":1"));
+        // The passphrase applied to that es_remote_add only.
+        assert_eq!(attach(q.c, plain.clone()), ES_OK);
+
+        // The wrong passphrase for an existing encrypted repository: not added.
+        let enc = memory();
+        let r = Dev::new("a", None, ES_POLICY_ASK);
+        assert_eq!(es_repo_create_encrypted(r.c, cstr("right").as_ptr()), ES_OK);
+        assert_eq!(attach(r.c, enc.clone()), ES_OK);
+        let s = Dev::new("b", None, ES_POLICY_ASK);
+        assert_eq!(es_repo_create_encrypted(s.c, cstr("left").as_ptr()), ES_OK);
+        assert_eq!(attach(s.c, enc.clone()), ES_E_PASSPHRASE);
+        assert!((*s.c).shared.cache().remote.is_none());
+        // With the right one it is added and unlocked.
+        assert_eq!(es_repo_create_encrypted(s.c, cstr("right").as_ptr()), ES_OK);
+        assert_eq!(attach(s.c, enc.clone()), ES_OK);
+    }
 }

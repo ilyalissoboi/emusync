@@ -9,13 +9,14 @@
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use emusync_core::{
-    short_id, split_unit, CardMode, ConflictPolicy, ContainerDesc, Engine, EngineOptions, HistoryEntry, Resolution,
-    SyncReport,
+    short_id, split_unit, CardMode, ConflictPolicy, ContainerDesc, Encryption, Engine, EngineOptions, HistoryEntry,
+    KdfParams, Resolution, SyncReport,
 };
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
+use zeroize::Zeroizing;
 
 mod logging;
 mod service;
@@ -88,9 +89,25 @@ enum Cmd {
 enum RemoteCmd {
     /// Register the remote, e.g. s3://my-saves/emusync/v1?region=eu-west-1 or
     /// s3://saves/emusync/v1?endpoint=http://nas.local:9000&path_style=1
-    Add { uri: String },
+    ///
+    /// If the repository is encrypted, asks for its passphrase (once per device).
+    Add {
+        uri: String,
+        /// Create the repository end-to-end encrypted with a passphrase (asked for; never
+        /// given on the command line). Only for a new repository: an existing unencrypted one
+        /// stays unencrypted. On an existing encrypted one, the same as unlocking it.
+        #[arg(long)]
+        encrypt: bool,
+    },
     /// Show the configured remote.
     Show,
+    /// Enter the passphrase of the encrypted repository, so this device can sync with it.
+    /// The key is kept in the data directory (DPAPI-protected on Windows), so this is needed
+    /// once per device.
+    Unlock,
+    /// Forget this device's copy of the encrypted repository's key; `remote unlock` brings it
+    /// back.
+    Lock,
 }
 
 #[derive(Subcommand)]
@@ -174,12 +191,73 @@ pub fn main() -> ExitCode {
     match run(cli) {
         Ok(code) => code,
         Err(e) => {
+            let hint = match e.downcast_ref::<emusync_core::Error>() {
+                Some(emusync_core::Error::Locked) => " (run `emusync remote unlock`)",
+                _ => "",
+            };
             if to_file {
-                log::error!("{e}");
+                log::error!("{e}{hint}");
             }
-            eprintln!("error: {e}");
+            eprintln!("error: {e}{hint}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Reads a passphrase: from the terminal without echo, or, when stdin is not a terminal
+/// (scripts, tests), as the first line of stdin. Never from the command line or the
+/// environment, and never logged. `confirm` asks twice on a terminal.
+fn read_passphrase(prompt: &str, confirm: bool) -> AnyResult<Zeroizing<String>> {
+    let pass = if std::io::stdin().is_terminal() {
+        let pass = Zeroizing::new(rpassword::prompt_password(prompt)?);
+        if confirm && !pass.is_empty() {
+            let again = Zeroizing::new(rpassword::prompt_password("Repeat the passphrase: ")?);
+            if *again != *pass {
+                return Err("the passphrases don't match".into());
+            }
+        }
+        pass
+    } else {
+        let mut line = Zeroizing::new(String::new());
+        std::io::stdin().read_line(&mut line)?;
+        Zeroizing::new(line.trim_end_matches(['\r', '\n']).to_string())
+    };
+    if pass.is_empty() {
+        return Err("no passphrase given".into());
+    }
+    Ok(pass)
+}
+
+/// Unlocks the bound encrypted repository; on a terminal, up to three attempts.
+fn unlock(engine: &mut Engine) -> AnyResult<()> {
+    let attempts = if std::io::stdin().is_terminal() { 3 } else { 1 };
+    for attempt in 1..=attempts {
+        let pass = read_passphrase("Passphrase of the encrypted repository: ", false)?;
+        match engine.unlock(&pass) {
+            Ok(()) => {
+                println!("unlocked; the key is kept on this device ({})", key_storage());
+                return Ok(());
+            }
+            Err(emusync_core::Error::WrongPassphrase) if attempt < attempts => eprintln!("wrong passphrase, try again"),
+            Err(e) => return Err(e.into()),
+        }
+    }
+    unreachable!("the last attempt returns")
+}
+
+fn key_storage() -> &'static str {
+    if cfg!(windows) {
+        "in the data directory, protected with DPAPI for this Windows user"
+    } else {
+        "in the data directory, readable only by this user"
+    }
+}
+
+fn encryption_line(engine: &Engine) -> &'static str {
+    match engine.encryption() {
+        Encryption::None => "none",
+        Encryption::Unlocked => "end-to-end (unlocked on this device)",
+        Encryption::Locked => "end-to-end, LOCKED on this device (run `emusync remote unlock`)",
     }
 }
 
@@ -270,23 +348,66 @@ fn run(cli: Cli) -> AnyResult<ExitCode> {
     }
     let mut engine = open(&cli)?;
     match &cli.cmd {
-        Cmd::Remote(RemoteCmd::Add { uri }) => {
-            let remote = emusync_remote::open(uri, Box::new(emusync_remote::EnvCredentials))?;
-            let conditional = engine.add_remote(Arc::from(remote))?;
+        Cmd::Remote(RemoteCmd::Add { uri, encrypt }) => {
+            let remote: Arc<dyn emusync_remote::Remote> =
+                Arc::from(emusync_remote::open(uri, Box::new(emusync_remote::EnvCredentials))?);
+            engine.check_remote(&remote.describe())?;
+            let conditional = if *encrypt {
+                let new = remote.get("repo.json")?.is_none();
+                let pass = if new {
+                    eprintln!(
+                        "Choose a passphrase for the new encrypted repository. Every device needs it once; \
+                         it cannot be recovered if lost."
+                    );
+                    read_passphrase("New passphrase: ", true)?
+                } else {
+                    read_passphrase("Passphrase of the encrypted repository: ", false)?
+                };
+                engine.add_remote_encrypted(remote, &pass, KdfParams::default())?
+            } else {
+                engine.add_remote(remote)?
+            };
             println!("remote added: {}", engine.remote_uri()?.unwrap_or_default());
             if conditional {
                 println!("conditional writes (If-None-Match) supported");
             } else {
                 println!("conditional writes not supported; using HEAD-before-PUT");
             }
+            match engine.encryption() {
+                Encryption::None => {}
+                Encryption::Unlocked => {
+                    println!("encryption: end-to-end; the key is kept on this device ({})", key_storage())
+                }
+                Encryption::Locked => {
+                    println!("the repository is end-to-end encrypted");
+                    unlock(&mut engine)
+                        .map_err(|e| format!("{e}; the remote is added: run `emusync remote unlock` to try again"))?;
+                }
+            }
+        }
+        Cmd::Remote(RemoteCmd::Unlock) => {
+            if engine.remote_uri()?.is_none() {
+                return Err("no remote configured (run `emusync remote add <uri>`)".into());
+            }
+            unlock(&mut engine)?;
+        }
+        Cmd::Remote(RemoteCmd::Lock) => {
+            if engine.encryption() == Encryption::None {
+                return Err("the repository is not encrypted".into());
+            }
+            engine.forget_key()?;
+            println!("this device's copy of the key is deleted; `emusync remote unlock` restores it");
         }
         Cmd::Remote(RemoteCmd::Show) | Cmd::Status => {
             println!("device:  {} ({})", engine.device_name()?, engine.device_id()?);
             match engine.remote_uri()? {
-                Some(uri) => println!(
-                    "remote:  {uri} ({})",
-                    if engine.conditional_writes() { "conditional writes" } else { "HEAD-before-PUT" }
-                ),
+                Some(uri) => {
+                    println!(
+                        "remote:  {uri} ({})",
+                        if engine.conditional_writes() { "conditional writes" } else { "HEAD-before-PUT" }
+                    );
+                    println!("encryption: {}", encryption_line(&engine));
+                }
                 None => println!("remote:  none (run `emusync remote add <uri>`)"),
             }
             if matches!(cli.cmd, Cmd::Status) {
@@ -393,6 +514,9 @@ fn run(cli: Cli) -> AnyResult<ExitCode> {
             if !attach(&mut engine)? {
                 return Err("no remote configured (run `emusync remote add <uri>`)".into());
             }
+            if engine.encryption() == Encryption::Locked {
+                return Err(emusync_core::Error::Locked.into());
+            }
             watch::run(engine, args, &data_dir(&cli))?;
         }
         Cmd::Service(cmd) => {
@@ -403,6 +527,9 @@ fn run(cli: Cli) -> AnyResult<ExitCode> {
             };
             if matches!(cmd, service::ServiceCmd::Install { .. }) && engine.remote_uri()?.is_none() {
                 return Err("no remote configured (run `emusync remote add <uri>` first)".into());
+            }
+            if matches!(cmd, service::ServiceCmd::Install { .. }) && engine.encryption() == Encryption::Locked {
+                return Err(emusync_core::Error::Locked.into());
             }
             drop(engine);
             return service::run(cmd, &ctx);

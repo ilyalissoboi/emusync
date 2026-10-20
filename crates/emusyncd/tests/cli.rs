@@ -254,3 +254,95 @@ fn service_needs_a_remote_and_reports_status() {
     let out = ok(&data, &["service", "stop"]);
     assert!(out.contains("not running"), "{out}");
 }
+
+/// `emusync` with `input` on stdin (how scripts and these tests give a passphrase).
+fn emusync_with_input(data: &Path, args: &[&str], input: &str) -> (bool, String) {
+    use std::io::Write;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_emusync"))
+        .arg("--data-dir")
+        .arg(data)
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+    let out = child.wait_with_output().unwrap();
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    (out.status.success(), text)
+}
+
+#[test]
+fn passphrases_are_never_arguments() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let (success, out) = emusync_with_input(&data, &["remote", "unlock"], "secret\n");
+    assert!(!success && out.contains("no remote configured"), "{out}");
+    let (success, out) = emusync(&data, &["remote", "add", "s3://b/p?region=x", "--passphrase", "secret"]);
+    assert!(!success && out.contains("unexpected argument"), "{out}");
+    // Nothing on stdin: refused before any network request.
+    let uri = "s3://saves/emusync/v1?endpoint=http://127.0.0.1:1&path_style=1&region=us-east-1";
+    let (success, out) = emusync(&data, &["remote", "add", uri, "--encrypt"]);
+    assert!(!success, "{out}");
+    let (success, out) = emusync(&data, &["remote", "lock"]);
+    assert!(!success && out.contains("not encrypted"), "{out}");
+}
+
+#[test]
+fn s3_encrypted_repository_between_two_data_dirs() {
+    let Some(uri) = s3_test_uri("cli-e2e") else { return };
+    const PASS: &str = "correct horse battery staple";
+    let dir = tempfile::tempdir().unwrap();
+    let (pc, phone) = (dir.path().join("pc"), dir.path().join("phone"));
+    let (pc_card, phone_card) = (pc.join("Mcd001.ps2"), phone.join("Mcd001.ps2"));
+    for (d, card) in [(&pc, &pc_card), (&phone, &phone_card)] {
+        std::fs::create_dir_all(d).unwrap();
+        std::fs::write(card, blank_card(8192, true, [0; 8])).unwrap();
+    }
+    let (pc_data, phone_data) = (pc.join("data"), phone.join("data"));
+    let mut transcript = String::new();
+    let mut run = |data: &Path, args: &[&str], input: &str, expect: bool| {
+        let (success, out) = emusync_with_input(data, args, input);
+        assert_eq!(success, expect, "emusync {args:?}:\n{out}");
+        transcript.push_str(&out);
+        out
+    };
+
+    // The PC creates the encrypted repository and uploads a save.
+    let out = run(&pc_data, &["--device-name", "pc", "remote", "add", &uri, "--encrypt"], &format!("{PASS}\n"), true);
+    assert!(out.contains("encryption: end-to-end"), "{out}");
+    run(&pc_data, &["card", "add", pc_card.to_str().unwrap()], "", true);
+    write_saves(&pc_card, &[save("BASLUS-20062GTA3", &vec![1; 200_000])]);
+    let out = run(&pc_data, &["sync"], "", true);
+    assert!(out.contains("uploaded 1 version"), "{out}");
+    let out = run(&pc_data, &["status"], "", true);
+    assert!(out.contains("encryption: end-to-end (unlocked"), "{out}");
+
+    // The phone joins: the wrong passphrase leaves it added but locked.
+    let out = run(&phone_data, &["--device-name", "phone", "remote", "add", &uri], "wrong\n", false);
+    assert!(out.contains("wrong passphrase") && out.contains("remote unlock"), "{out}");
+    let out = run(&phone_data, &["status"], "", true);
+    assert!(out.contains("LOCKED"), "{out}");
+    run(&phone_data, &["card", "add", phone_card.to_str().unwrap()], "", true);
+    let out = run(&phone_data, &["sync"], "", false);
+    assert!(out.contains("locked") && out.contains("emusync remote unlock"), "{out}");
+    let out = run(&phone_data, &["remote", "unlock"], &format!("{PASS}\n"), true);
+    assert!(out.contains("unlocked"), "{out}");
+    let out = run(&phone_data, &["sync"], "", true);
+    assert!(out.contains("applied   ps2:Mcd001:BASLUS-20062GTA3"), "{out}");
+    assert_eq!(save_names(&phone_card), ["BASLUS-20062GTA3"]);
+
+    // And back, with no passphrase needed any more.
+    write_saves(&phone_card, &[save("BASCUS-97199RAC", b"rac")]);
+    run(&phone_data, &["sync"], "", true);
+    let out = run(&pc_data, &["sync"], "", true);
+    assert!(out.contains("applied   ps2:Mcd001:BASCUS-97199RAC"), "{out}");
+
+    // Locking forgets the key on this device only.
+    run(&phone_data, &["remote", "lock"], "", true);
+    let out = run(&phone_data, &["status"], "", true);
+    assert!(out.contains("LOCKED"), "{out}");
+    run(&pc_data, &["sync"], "", true);
+    assert!(!transcript.contains(PASS), "the passphrase was printed:\n{transcript}");
+}

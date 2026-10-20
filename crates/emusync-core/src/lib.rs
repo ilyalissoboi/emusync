@@ -16,16 +16,19 @@
 //! ```
 
 pub mod chunk;
+pub mod crypto;
 mod engine;
 mod error;
 pub mod fsutil;
 pub mod hlc;
+mod keystore;
 pub mod model;
 mod store;
 
+pub use crypto::KdfParams;
 pub use engine::LOCKED;
 pub use engine::{
-    Applied, BlockKind, Blocked, BusyGate, CardStatus, ConflictInfo, ConflictPolicy, ContainerDesc, Engine,
+    Applied, BlockKind, Blocked, BusyGate, CardStatus, ConflictInfo, ConflictPolicy, ContainerDesc, Encryption, Engine,
     EngineOptions, HistoryEntry, RemoteSetup, Resolution, SyncReport, UnitStatus,
 };
 pub use error::{Error, Result};

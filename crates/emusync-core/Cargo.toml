@@ -10,8 +10,11 @@ rust-version.workspace = true
 [dependencies]
 emusync-formats.workspace = true
 emusync-remote.workspace = true
+argon2.workspace = true
 blake3.workspace = true
+chacha20poly1305.workspace = true
 fastcdc.workspace = true
+getrandom.workspace = true
 hex.workspace = true
 log.workspace = true
 rusqlite.workspace = true
@@ -19,7 +22,12 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
+zeroize.workspace = true
 zstd.workspace = true
+
+# The local copy of a repository key is protected with DPAPI (DESIGN section 22).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
 
 [dev-dependencies]
 tempfile.workspace = true

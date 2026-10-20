@@ -97,6 +97,11 @@ int main(int argc, char** argv) {
     CHECK(es_unit_history(c, "sram:game", on_version, NULL) == ES_OK);
     CHECK(versions == 2);
     CHECK(es_state_publish(c, NULL) == ES_E_INVALID_ARG);
+    /* Encryption: no remote to unlock yet; a passphrase is required. */
+    CHECK(es_repo_unlock(c, "secret") == ES_E_INVALID_ARG);
+    CHECK(es_repo_create_encrypted(c, "") == ES_E_INVALID_ARG);
+    CHECK(es_repo_create_encrypted(c, "secret") == ES_OK);
+    CHECK(strcmp(es_status_str(ES_E_LOCKED), "repository locked (passphrase needed)") == 0);
 
     while ((polled = es_event_poll(c, &ev)) == 1) {
         if (ev.type == ES_EV_SYNC_STARTED) started++;

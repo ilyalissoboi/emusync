@@ -28,5 +28,7 @@ int main() {
     if (es_event_poll(nullptr, &ev) != ES_E_INVALID_ARG) return 1;
     es_client_destroy(nullptr, 0);
     std::printf("%s\n", es_status_str(ES_E_NO_SPACE));
+    static_assert(ES_E_LOCKED == -11 && ES_E_PASSPHRASE == -12, "status codes are fixed");
+    if (es_repo_unlock(nullptr, "pw") != ES_E_INVALID_ARG) return 1;
     return 0;
 }

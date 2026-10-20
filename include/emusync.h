@@ -80,6 +80,9 @@ typedef enum es_status {
     ES_E_INCOMPATIBLE  = -8,  /* e.g. a card mode this build has no adapter for */
     ES_E_NOT_FOUND     = -9,
     ES_E_ABI           = -10, /* struct_size / ABI version mismatch */
+    ES_E_LOCKED        = -11, /* the repository is encrypted and this device has no key yet:
+                                 es_repo_unlock with the passphrase */
+    ES_E_PASSPHRASE    = -12, /* the passphrase does not unlock the repository */
     ES_E_INTERNAL      = -100
 } es_status;
 
@@ -220,15 +223,43 @@ typedef struct es_credential_provider {
    "folder://…", "https://…" (reference server). Returns ES_E_INVALID_ARG for unsupported schemes,
    and for a remote other than the one this data_dir is already bound to.
    Blocks up to 10 s while it validates access with one LIST, probes conditional-write support
-   and creates the repository if it is new. Returns ES_OK, ES_E_AUTH (credentials rejected; the
-   remote is not added), or ES_OFFLINE if the endpoint is unreachable or slower than that: the
-   remote is still added (another remote is refused from then on), and its setup completes in
-   the background or on the next sync.
+   and creates the repository if it is new (unencrypted, unless es_repo_create_encrypted came
+   first). Returns ES_OK, ES_E_AUTH (credentials rejected; the remote is not added), or
+   ES_OFFLINE if the endpoint is unreachable or slower than that: the remote is still added
+   (another remote is refused from then on), and its setup completes in the background or on
+   the next sync. For an encrypted repository: ES_E_LOCKED if this data_dir has no key for it
+   yet (the remote is added; call es_repo_unlock), and with a passphrase from
+   es_repo_create_encrypted, ES_E_PASSPHRASE if it is wrong, or ES_E_INCOMPATIBLE if the
+   repository exists and is not encrypted (in both cases the remote is not added).
+   ES_E_INCOMPATIBLE also for a repository made by a newer emusync.
    Does not start a sync (see es_sync_now). The provider struct is copied. */
 ES_API es_status es_remote_add(es_client* c, const char* remote_uri, const es_credential_provider* creds);
 
-/* E2E encryption. Create: initialises a new encrypted repo. Unlock: derives the key on a new
-   device. Not implemented in ABI version 1: both return ES_E_INVALID_ARG. */
+/* End-to-end encryption (docs/DESIGN.md §7, §22). Optional, chosen when a repository is created:
+   blobs, log segments and device.json are encrypted with a random repository key, which
+   repo.json holds wrapped with a key derived from the passphrase (Argon2id, 64 MiB, 3 passes:
+   under 0.1 s on a desktop CPU; the host should still not call it on its UI thread). The passphrase is needed once per data_dir: the unwrapped key is kept in
+   data_dir/keys/ (DPAPI-protected on Windows; elsewhere a file only the app can read, which on
+   Android and iOS is the app's private storage). The library never logs a passphrase, and keeps
+   it in memory only until it is used (wiped afterwards). Neither can be undone: a lost
+   passphrase cannot be recovered, and an encrypted repository cannot be made unencrypted.
+
+   es_repo_create_encrypted: call it *before* es_remote_add. The next es_remote_add then creates
+   a new repository encrypted with this passphrase, or unlocks an existing encrypted one with it
+   (see es_remote_add for its results). Applies to that one es_remote_add only. Returns ES_OK, or
+   ES_E_INVALID_ARG for a NULL or empty passphrase. Does not block.
+
+   es_repo_unlock: for an encrypted repository es_remote_add reported as ES_E_LOCKED (a device
+   joining an existing repository). Derives the key, checks it against repo.json and keeps it in
+   data_dir; no network unless the remote's setup hadn't completed yet. Waits for the worker and
+   blocks while the key is derived. Returns ES_OK (then call es_sync_now), ES_E_PASSPHRASE,
+   ES_E_INVALID_ARG (NULL or empty passphrase, no remote, or the repository is not encrypted),
+   ES_OFFLINE (the remote's setup still can't reach it) or ES_TIMEOUT.
+
+   While a repository is locked, sync cycles fail with ES_E_LOCKED (ES_EV_ERROR and
+   ES_EV_SYNC_FINISHED carry it); local snapshots (touched/flushed) still work and are uploaded
+   once it is unlocked. Older libraries (before encryption) refuse an encrypted repository at
+   es_remote_add with ES_E_INVALID_ARG ("unsupported repository format"). */
 ES_API es_status es_repo_create_encrypted(es_client* c, const char* passphrase);
 ES_API es_status es_repo_unlock(es_client* c, const char* passphrase);
 

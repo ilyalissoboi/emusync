@@ -3,13 +3,14 @@
 Native library enabling seamless cloud-based save sync between game emulators on different
 platforms. Design: [docs/DESIGN.md](docs/DESIGN.md). C API contract: [include/emusync.h](include/emusync.h).
 
-**Status: M1.** PS2 memory cards (`.ps2`, the PCSX2/ARMSX2 default) sync **per save** through
+**Status: M2.** PS2 memory cards (`.ps2`, the PCSX2/ARMSX2 default) sync **per save** through
 Amazon S3 or any S3-compatible service: saves of different games played offline on different
 devices merge without conflicts, and every save has its own version history. PCSX2 folder
 cards hold the same saves, so a folder card on one device syncs with a `.ps2` file on another.
 Other card formats sync as whole files (byte-identical mirrors). `emusync watch` keeps
 unmodified PCSX2 in sync with no manual steps, and `emusync service install` starts it at
-every login.
+every login. Emulators embed it through the C ABI (`include/emusync.h`, ABI v1), as the ARMSX2
+Android port does. Repositories can be [end-to-end encrypted](#end-to-end-encryption).
 
 ## Crates
 
@@ -46,6 +47,46 @@ empty; emusync formats it when the first save arrives. Cards synced by M0 as who
 working; to switch one to per-save sync, run `emusync card add <file>` again on each device,
 then `emusync card mode Mcd001 units` on one of them. `emusync card mode Mcd001 whole-file`
 goes back to byte-identical mirrors.
+
+## End-to-end encryption
+
+A repository can be encrypted, so the storage provider (or anyone who gets the bucket) sees
+only object names and sizes: no saves, no game names, no device names. Choose it when you
+create the repository, on a new prefix:
+
+```sh
+# First device: creates the encrypted repository and asks for a new passphrase (twice).
+emusync remote add "s3://my-saves/emusync/v2?region=eu-west-1" --encrypt
+
+# Every other device: asks for the passphrase once (a wrong one leaves the remote added but
+# locked; `emusync remote unlock` asks again).
+emusync remote add "s3://my-saves/emusync/v2?region=eu-west-1"
+
+emusync status            # encryption: end-to-end (unlocked on this device)
+emusync remote unlock     # enter the passphrase again, e.g. after `emusync remote lock`
+emusync remote lock       # forget this device's copy of the key
+```
+
+- **The passphrase is needed once per device.** The repository key it unlocks is kept in the
+  data directory (`keys/`): protected with DPAPI for your Windows user on Windows, and in a
+  file only your user can read on macOS and Linux. Through the C ABI it is in the data directory
+  the app passes, on Android its private storage.
+- **It is never a command-line argument and never logged.** On a terminal it is read without
+  echo; otherwise (scripts) it is the first line of stdin: `emusync remote unlock < passfile`.
+- **It cannot be recovered.** Without it no device can read the repository; keep it in a
+  password manager.
+- **Encryption is chosen at creation.** An existing unencrypted repository stays unencrypted
+  (`--encrypt` on it is refused); to switch, create an encrypted one on a new prefix and add it
+  with a new data directory on each device. Unencrypted repositories work exactly as before.
+- **Older emusync versions refuse an encrypted repository** ("unsupported repository format"),
+  so they never write unencrypted data into it. Update every device first.
+- While a device is locked, `emusync sync` and `emusync watch` stop with "run `emusync remote
+  unlock`"; nothing is uploaded unencrypted.
+
+Blobs, logs and device descriptions are encrypted with XChaCha20-Poly1305 under a random
+256-bit repository key; `repo.json` holds that key wrapped with a key derived from the
+passphrase by Argon2id (64 MiB, 3 passes). Blob names are keyed BLAKE3 hashes, so the provider
+can't check whether you have a particular save. Details: [DESIGN.md §22](docs/DESIGN.md#22-implementation-notes-end-to-end-encryption).
 
 ## Watching PCSX2 (sidecar mode)
 

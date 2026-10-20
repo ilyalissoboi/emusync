@@ -6,9 +6,11 @@
 //! - **whole-file mode**: the card image is the only unit (`ps2:Mcd001:@card`).
 
 use crate::chunk;
+use crate::crypto::{Cipher, EncryptionHeader, KdfParams, RepoKey};
 use crate::error::{Error, Result};
 use crate::fsutil;
 use crate::hlc::Hlc;
+use crate::keystore;
 use crate::model::{
     content_id, parse_record, split_unit, unit_id, whole_file_unit, CardMode, CardRecord, LogRecord, VersionRecord,
 };
@@ -252,6 +254,66 @@ pub enum Resolution {
 pub struct RemoteSetup {
     pub uri: String,
     pub conditional_writes: bool,
+    /// `repo_id` from `repo.json`.
+    pub repo_id: Option<String>,
+    /// `encryption` from `repo.json`: `Some` for an encrypted repository.
+    pub encryption: Option<EncryptionHeader>,
+    /// The repository key, if the setup had the passphrase
+    /// ([`Engine::prepare_remote_encrypted`]).
+    pub key: Option<RepoKey>,
+}
+
+impl RemoteSetup {
+    /// Whether binding this setup in `data_dir` leaves the repository locked: it is encrypted,
+    /// the setup has no key, and none was kept there earlier. Lets a host that runs
+    /// [`Engine::prepare_remote`] on another thread ask for the passphrase straight away.
+    pub fn locked_in(&self, data_dir: &Path) -> Result<bool> {
+        match (&self.encryption, &self.key, &self.repo_id) {
+            (Some(_), None, Some(id)) => Ok(keystore::load(data_dir, id)?.is_none()),
+            _ => Ok(false),
+        }
+    }
+}
+
+/// Whether the bound repository is encrypted, and whether this device can read it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Encryption {
+    /// Not encrypted (or no remote yet).
+    None,
+    /// Encrypted, and this device doesn't have the key: [`Engine::unlock`] with the passphrase.
+    Locked,
+    Unlocked,
+}
+
+/// `repo.json` format of an unencrypted repository; older versions of emusync know only this.
+const FORMAT_PLAIN: u64 = 1;
+/// `repo.json` format of an encrypted repository. Versions without encryption refuse it
+/// ("unsupported repository format"), so they never write plaintext into it.
+const FORMAT_ENCRYPTED: u64 = 2;
+
+/// Parses `repo.json`: the repository id and its encryption header, if any.
+fn parse_repo_json(body: &[u8]) -> Result<(Option<String>, Option<EncryptionHeader>)> {
+    let v: serde_json::Value = serde_json::from_slice(body)?;
+    let id = v.get("repo_id").and_then(|i| i.as_str()).map(str::to_string);
+    let enc = v.get("encryption").filter(|e| !e.is_null());
+    match v.get("format").and_then(|f| f.as_u64()) {
+        Some(FORMAT_PLAIN) if enc.is_none() => Ok((id, None)),
+        Some(FORMAT_ENCRYPTED) => {
+            let header: EncryptionHeader = enc
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(|e| Error::Incompatible(format!("repo.json: unreadable encryption header: {e}")))?
+                .ok_or_else(|| Error::Incompatible("repo.json: format 2 without an encryption header".into()))?;
+            header.check()?;
+            let id = id.ok_or_else(|| Error::Incompatible("repo.json: encrypted repository without an id".into()))?;
+            Ok((Some(id), Some(header)))
+        }
+        Some(f) if f > FORMAT_ENCRYPTED => Err(Error::Incompatible(format!(
+            "the repository has format {f}, newer than this version of emusync supports; update emusync"
+        ))),
+        _ => Err(Error::Incompatible(format!("unsupported repository format in repo.json: {v}"))),
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -267,6 +329,10 @@ pub struct Engine {
     conditional_writes: bool,
     opts: EngineOptions,
     busy: BusyGate,
+    /// `Some` when the bound repository is encrypted.
+    encryption: Option<EncryptionHeader>,
+    /// Its key, once this device has it.
+    cipher: Option<Arc<Cipher>>,
 }
 
 /// The containers the emulator has open ([`Engine::set_busy`]), shareable with other threads.
@@ -364,7 +430,17 @@ impl Engine {
         let me = store.meta("device_id")?.unwrap();
         store.set_device_name(&me, &name)?;
         let conditional_writes = store.meta("conditional_writes")?.as_deref() == Some("1");
-        Ok(Self { dir, store, remote: None, conditional_writes, opts, busy: BusyGate::default() })
+        let encryption: Option<EncryptionHeader> = match store.meta("encryption")? {
+            Some(h) => Some(serde_json::from_str(&h)?),
+            None => None,
+        };
+        let mut cipher = None;
+        if encryption.is_some() {
+            let id =
+                store.meta("repo_id")?.ok_or_else(|| Error::Integrity("encrypted repository without an id".into()))?;
+            cipher = keystore::load(&dir, &id)?.map(|k| Arc::new(Cipher::new(&k)));
+        }
+        Ok(Self { dir, store, remote: None, conditional_writes, opts, busy: BusyGate::default(), encryption, cipher })
     }
 
     pub fn device_id(&self) -> Result<String> {
@@ -407,41 +483,180 @@ impl Engine {
         }
     }
 
+    /// Like [`Engine::add_remote`], with a passphrase: a new repository is created encrypted
+    /// (DESIGN §7), an existing encrypted one is unlocked, and an existing unencrypted one is
+    /// refused ([`Error::Incompatible`]).
+    pub fn add_remote_encrypted(&mut self, remote: Arc<dyn Remote>, passphrase: &str, kdf: KdfParams) -> Result<bool> {
+        self.check_remote(&remote.describe())?;
+        let setup = Self::prepare_remote_encrypted(&*remote, passphrase, kdf)?;
+        self.bind_remote(remote, setup)
+    }
+
     /// The network half of [`Engine::add_remote`], which needs no engine, so a host can run it
     /// on another thread: validates access, probes conditional writes, and creates `repo.json`
     /// if the repository is new. Finish with [`Engine::bind_remote`].
+    ///
+    /// An existing encrypted repository is reported in [`RemoteSetup::encryption`]; unless
+    /// this data directory already has its key, it is bound locked.
     pub fn prepare_remote(remote: &dyn Remote) -> Result<RemoteSetup> {
+        Self::prepare(remote, None)
+    }
+
+    /// [`Engine::prepare_remote`] for [`Engine::add_remote_encrypted`]. Runs Argon2id (`kdf`:
+    /// under 0.1 s on a desktop CPU with the defaults). [`Error::WrongPassphrase`] if the repository
+    /// exists and the passphrase doesn't unlock it.
+    pub fn prepare_remote_encrypted(remote: &dyn Remote, passphrase: &str, kdf: KdfParams) -> Result<RemoteSetup> {
+        if passphrase.is_empty() {
+            return Err(Error::InvalidArg("the passphrase is empty".into()));
+        }
+        Self::prepare(remote, Some((passphrase, kdf)))
+    }
+
+    fn prepare(remote: &dyn Remote, encrypt: Option<(&str, KdfParams)>) -> Result<RemoteSetup> {
         remote.list_dirs("devices/")?;
         let cond = probe_conditional_writes(remote)?;
-        match remote.get("repo.json")? {
-            Some(body) => {
-                let v: serde_json::Value = serde_json::from_slice(&body)?;
-                if v.get("format").and_then(|f| f.as_u64()) != Some(1) {
-                    return Err(Error::InvalidArg(format!("unsupported repository format in repo.json: {v}")));
-                }
+        let uri = remote.describe();
+        loop {
+            if let Some(body) = remote.get("repo.json")? {
+                let (repo_id, encryption) = parse_repo_json(&body)?;
+                let key = match (&encryption, encrypt) {
+                    (None, Some(_)) => {
+                        return Err(Error::Incompatible(format!(
+                            "{uri} already holds an unencrypted repository; encryption is chosen when a \
+                             repository is created (use a new, empty prefix for an encrypted one)"
+                        )))
+                    }
+                    (Some(h), Some((pass, _))) => {
+                        Some(RepoKey::unwrap(h, pass, repo_id.as_deref().unwrap_or_default())?)
+                    }
+                    _ => None,
+                };
+                return Ok(RemoteSetup { uri, conditional_writes: cond, repo_id, encryption, key });
             }
-            None => {
-                let repo = serde_json::json!({
-                    "format": 1,
-                    "repo_id": uuid::Uuid::now_v7().to_string(),
-                    "encryption": null,
-                });
-                create_only(remote, "repo.json", repo.to_string().as_bytes(), cond)?;
+            let repo_id = uuid::Uuid::now_v7().to_string();
+            let mut setup = RemoteSetup {
+                uri: uri.clone(),
+                conditional_writes: cond,
+                repo_id: Some(repo_id.clone()),
+                encryption: None,
+                key: None,
+            };
+            let repo = match encrypt {
+                None => serde_json::json!({ "format": FORMAT_PLAIN, "repo_id": repo_id, "encryption": null }),
+                Some((pass, kdf)) => {
+                    let key = RepoKey::generate();
+                    let header = key.wrap(pass, kdf, &repo_id)?;
+                    let repo =
+                        serde_json::json!({ "format": FORMAT_ENCRYPTED, "repo_id": repo_id, "encryption": header });
+                    setup.encryption = Some(header);
+                    setup.key = Some(key);
+                    repo
+                }
+            };
+            match create_only(remote, "repo.json", repo.to_string().as_bytes(), cond)? {
+                PutOutcome::Created => return Ok(setup),
+                // Another device created it first: use theirs.
+                PutOutcome::AlreadyExists => continue,
             }
         }
-        Ok(RemoteSetup { uri: remote.describe(), conditional_writes: cond })
     }
 
     /// The local half of [`Engine::add_remote`]: binds this data directory to the remote that
     /// [`Engine::prepare_remote`] set up. Returns whether it supports conditional writes.
+    ///
+    /// For an encrypted repository, the key in `setup` is kept on this device (DESIGN §22);
+    /// without one, the key kept earlier is used, or the repository stays locked
+    /// ([`Engine::encryption`]).
     pub fn bind_remote(&mut self, remote: Arc<dyn Remote>, setup: RemoteSetup) -> Result<bool> {
         self.check_remote(&setup.uri)?;
+        if let (Some(old), Some(new)) = (self.store.meta("repo_id")?, &setup.repo_id) {
+            if old != *new {
+                return Err(Error::Incompatible(format!(
+                    "the repository at {} was replaced by another one (id {new}, was {old}); use a new data \
+                     directory for it",
+                    setup.uri
+                )));
+            }
+        }
+        let cipher = match (&setup.encryption, &setup.repo_id) {
+            (Some(_), Some(id)) => {
+                let key = match &setup.key {
+                    Some(k) => {
+                        keystore::save(&self.dir, id, k)?;
+                        Some(k.clone())
+                    }
+                    None => keystore::load(&self.dir, id)?,
+                };
+                key.map(|k| Arc::new(Cipher::new(&k)))
+            }
+            _ => None,
+        };
         let cond = setup.conditional_writes;
-        self.store.set_meta("remote", &setup.uri)?;
-        self.store.set_meta("conditional_writes", if cond { "1" } else { "0" })?;
+        let header = setup.encryption.as_ref().map(serde_json::to_string).transpose()?;
+        self.store.tx(|| {
+            self.store.set_meta("remote", &setup.uri)?;
+            self.store.set_meta("conditional_writes", if cond { "1" } else { "0" })?;
+            if let Some(id) = &setup.repo_id {
+                self.store.set_meta("repo_id", id)?;
+            }
+            match &header {
+                Some(h) => self.store.set_meta("encryption", h),
+                None => self.store.delete_meta("encryption"),
+            }
+        })?;
         self.conditional_writes = cond;
+        self.encryption = setup.encryption;
+        self.cipher = cipher;
         self.remote = Some(remote);
         Ok(cond)
+    }
+
+    /// Whether the bound repository is encrypted, and whether this device has its key.
+    pub fn encryption(&self) -> Encryption {
+        match (&self.encryption, &self.cipher) {
+            (None, _) => Encryption::None,
+            (Some(_), None) => Encryption::Locked,
+            (Some(_), Some(_)) => Encryption::Unlocked,
+        }
+    }
+
+    /// Unlocks the bound encrypted repository with its passphrase and keeps the key on this
+    /// device (DESIGN §22), so the passphrase is needed only once. Runs Argon2id; no network.
+    /// [`Error::WrongPassphrase`], or [`Error::InvalidArg`] if the repository isn't encrypted
+    /// or hasn't been set up yet.
+    pub fn unlock(&mut self, passphrase: &str) -> Result<()> {
+        let Some(header) = &self.encryption else {
+            return Err(Error::InvalidArg(match self.store.meta("repo_id")?.and(self.remote_uri()?) {
+                Some(uri) => format!("the repository at {uri} is not encrypted"),
+                None => "no remote has been set up yet".into(),
+            }));
+        };
+        let id =
+            self.store.meta("repo_id")?.ok_or_else(|| Error::Integrity("encrypted repository without an id".into()))?;
+        let key = RepoKey::unwrap(header, passphrase, &id)?;
+        keystore::save(&self.dir, &id, &key)?;
+        self.cipher = Some(Arc::new(Cipher::new(&key)));
+        Ok(())
+    }
+
+    /// Deletes this device's copy of the repository key: the repository is locked until the
+    /// next [`Engine::unlock`].
+    pub fn forget_key(&mut self) -> Result<()> {
+        if let Some(id) = self.store.meta("repo_id")? {
+            keystore::remove(&self.dir, &id)?;
+        }
+        self.cipher = None;
+        Ok(())
+    }
+
+    /// The cipher for remote objects: `None` for an unencrypted repository, [`Error::Locked`]
+    /// if this device doesn't have the key.
+    fn cipher(&self) -> Result<Option<&Cipher>> {
+        match (&self.encryption, &self.cipher) {
+            (None, _) => Ok(None),
+            (Some(_), Some(c)) => Ok(Some(c)),
+            (Some(_), None) => Err(Error::Locked),
+        }
     }
 
     /// Attaches a remote for this session without network setup, using the cached
@@ -1397,9 +1612,17 @@ impl Engine {
                     if !online {
                         return Err(RemoteError::Network("offline".into()).into());
                     }
-                    let blob = remote
-                        .get(&chunk::blob_key(id))?
+                    let cipher = self.cipher()?;
+                    let key = match cipher {
+                        Some(c) => c.blob_key(id),
+                        None => chunk::blob_key(id),
+                    };
+                    let mut blob = remote
+                        .get(&key)?
                         .ok_or_else(|| Error::Integrity(format!("blob {id} is missing from the remote")))?;
+                    if let Some(c) = cipher {
+                        blob = c.open(&key, &blob)?;
+                    }
                     chunk::decode_blob(&blob, id)?
                 }
             };
@@ -1430,6 +1653,7 @@ impl Engine {
     /// record. The segment body is fixed before the first attempt, so a retry after a crash
     /// either finds its own earlier write or writes the same bytes.
     fn push(&self, remote: &dyn Remote, report: &mut SyncReport) -> Result<()> {
+        let cipher = self.cipher()?;
         let seg: PendingSegment = match self.store.meta("pending_segment")? {
             Some(s) => serde_json::from_str(&s)?,
             None => {
@@ -1455,10 +1679,20 @@ impl Engine {
             let seq = self.next_seq()?;
             self.ensure_device_json(remote, &dev)?;
             let key = segment_key(&dev, seq);
-            match create_only(remote, &key, seg.body.as_bytes(), self.conditional_writes)? {
+            // Encrypted for the key it is written under; a fresh nonce on every attempt.
+            let body = match cipher {
+                Some(c) => c.seal(&key, seg.body.as_bytes()),
+                None => seg.body.as_bytes().to_vec(),
+            };
+            match create_only(remote, &key, &body, self.conditional_writes)? {
                 PutOutcome::Created => break seq,
                 PutOutcome::AlreadyExists => {
-                    if remote.get(&key)?.as_deref() == Some(seg.body.as_bytes()) {
+                    let existing = remote.get(&key)?;
+                    let existing = match (cipher, existing) {
+                        (Some(c), Some(b)) => c.open(&key, &b).ok(),
+                        (_, b) => b,
+                    };
+                    if existing.as_deref() == Some(seg.body.as_bytes()) {
                         break seq; // our own write from an interrupted attempt
                     }
                     // Another installation is using this device id (DESIGN §6.2): a restored
@@ -1489,7 +1723,15 @@ impl Engine {
             return Err(Error::Integrity(format!("staged chunk {id} is corrupt")));
         }
         // Blobs are content-addressed, so "already exists" counts as success.
-        create_only(remote, &chunk::blob_key(id), &chunk::encode_blob(&data), self.conditional_writes)?;
+        let (key, body) = match self.cipher()? {
+            Some(c) => {
+                let key = c.blob_key(id);
+                let body = c.seal(&key, &chunk::encode_blob(&data));
+                (key, body)
+            }
+            None => (chunk::blob_key(id), chunk::encode_blob(&data)),
+        };
+        create_only(remote, &key, &body, self.conditional_writes)?;
         self.store.mark_blob_known(id)?;
         report.uploaded_blobs += 1;
         Ok(())
@@ -1506,12 +1748,12 @@ impl Engine {
             "os": std::env::consts::OS,
             "created": Hlc { ms: Hlc::wall_ms(), counter: 0 }.to_string(),
         });
-        create_only(
-            remote,
-            &format!("devices/{dev}/device.json"),
-            body.to_string().as_bytes(),
-            self.conditional_writes,
-        )?;
+        let key = format!("devices/{dev}/device.json");
+        let body = match self.cipher()? {
+            Some(c) => c.seal(&key, body.to_string().as_bytes()),
+            None => body.to_string().into_bytes(),
+        };
+        create_only(remote, &key, &body, self.conditional_writes)?;
         self.store.set_meta(&flag, "1")
     }
 
@@ -1541,6 +1783,7 @@ impl Engine {
     /// and merge their records. A segment that is listed but can't be read yet stops that
     /// device's pull until the next cycle; absence is never read as deletion.
     fn pull(&self, remote: &dyn Remote, report: &mut SyncReport) -> Result<()> {
+        let cipher = self.cipher()?;
         let me = self.device_id()?;
         for dev in remote.list_dirs("devices/")? {
             // Device ids end up in keys and the DB: accept only UUID-shaped names.
@@ -1548,7 +1791,12 @@ impl Engine {
                 continue;
             }
             if self.store.device_name(&dev)?.is_none() {
-                if let Some(body) = remote.get(&format!("devices/{dev}/device.json"))? {
+                let key = format!("devices/{dev}/device.json");
+                let body = match (remote.get(&key)?, cipher) {
+                    (Some(b), Some(c)) => c.open(&key, &b).ok(),
+                    (b, _) => b,
+                };
+                if let Some(body) = body {
                     let name = serde_json::from_slice::<serde_json::Value>(&body)
                         .ok()
                         .and_then(|v| v.get("name").and_then(|n| n.as_str()).map(str::to_string));
@@ -1571,8 +1819,21 @@ impl Engine {
                     log::info!("{key}: waiting for segment {expected:016x} of {dev} to become visible");
                     break;
                 }
-                let Some(body) = remote.get(&key)? else { break };
+                let Some(mut body) = remote.get(&key)? else { break };
                 expected += 1;
+                if let Some(c) = cipher {
+                    // Not written with this repository's key (or altered): nothing in it can be
+                    // trusted, so it is skipped like a malformed record.
+                    match c.open(&key, &body) {
+                        Ok(plain) => body = plain,
+                        Err(e) => {
+                            log::warn!("skipping segment: {e}");
+                            report.warnings.push(format!("skipped segment: {e}"));
+                            self.store.set_cursor(&dev, &key)?;
+                            continue;
+                        }
+                    }
+                }
                 self.store.tx(|| {
                     for line in body.split(|b| *b == b'\n').filter(|l| !l.iter().all(u8::is_ascii_whitespace)) {
                         match parse_record(line) {

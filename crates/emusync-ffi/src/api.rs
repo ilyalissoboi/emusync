@@ -5,9 +5,11 @@
 
 use crate::abi::*;
 use crate::callbacks::{route_logs, Callbacks};
-use crate::client::{lock, Client, Cmd, Pending, Session, Shared, WaitMode, Waited, WORKER_WAIT};
+use crate::client::{lock, Client, Cmd, Passphrase, Pending, Session, Shared, WaitMode, Waited, WORKER_WAIT};
 use crate::status_of;
-use emusync_core::{CardMode, ConflictPolicy, ContainerDesc, Engine, EngineOptions, HistoryEntry, Resolution};
+use emusync_core::{
+    CardMode, ConflictPolicy, ContainerDesc, Engine, EngineOptions, HistoryEntry, KdfParams, Resolution,
+};
 use emusync_remote::{Remote, S3Config, S3Remote};
 use std::ffi::{c_char, c_int, c_void, CStr};
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -176,10 +178,15 @@ pub unsafe extern "C" fn es_client_destroy(c: *mut Client, timeout_ms: u32) {
 /// result goes to the worker as a `BindRemote` command, and to the returned channel. If the
 /// remote is rejected and `reserved` (this call reserved `pending_remote`), the reservation is
 /// dropped.
+///
+/// With `passphrase` (from `es_repo_create_encrypted`), a new repository is created encrypted
+/// and an existing encrypted one unlocked. Without, an encrypted repository whose key this data
+/// directory doesn't have yet is added locked: `ES_E_LOCKED`.
 pub(crate) fn setup_remote(
     shared: &Arc<Shared>,
     remote: Arc<dyn Remote>,
     reserved: bool,
+    passphrase: Option<Passphrase>,
 ) -> Result<mpsc::Receiver<i32>, i32> {
     let (tx, rx) = mpsc::channel();
     let shared = shared.clone();
@@ -188,14 +195,26 @@ pub(crate) fn setup_remote(
         .spawn(move || {
             let _route = route_logs(&shared.cb);
             let uri = remote.describe();
-            let status = match Engine::prepare_remote(&*remote) {
+            let prepared = match &passphrase {
+                Some(p) => Engine::prepare_remote_encrypted(&*remote, p, KdfParams::default()),
+                None => Engine::prepare_remote(&*remote),
+            };
+            let status = match prepared {
                 Ok(setup) => {
-                    shared.queue.push(Cmd::BindRemote(remote, Some(setup)));
-                    ES_OK
+                    let locked = setup.locked_in(&shared.data_dir).unwrap_or(true);
+                    if locked {
+                        log::info!("{uri} is encrypted; unlock it with es_repo_unlock");
+                    }
+                    shared.queue.push(Cmd::BindRemote(remote, Some(setup), None));
+                    if locked {
+                        ES_E_LOCKED
+                    } else {
+                        ES_OK
+                    }
                 }
                 Err(e) if e.is_offline() => {
                     log::info!("{uri} is unreachable; it is set up once it can be reached: {e}");
-                    shared.queue.push(Cmd::BindRemote(remote, None));
+                    shared.queue.push(Cmd::BindRemote(remote, None, passphrase));
                     ES_OFFLINE
                 }
                 Err(e) => {
@@ -251,19 +270,48 @@ pub unsafe extern "C" fn es_remote_add(
             *pending = Some(uri);
             reserved
         };
-        let rx = setup_remote(&client.shared, remote, reserved)?;
+        let passphrase = lock(&client.shared.create_passphrase).take();
+        let rx = setup_remote(&client.shared, remote, reserved, passphrase)?;
         Ok(rx.recv_timeout(REMOTE_ADD_WAIT).unwrap_or(ES_OFFLINE))
     })
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn es_repo_create_encrypted(c: *mut Client, _passphrase: *const c_char) -> c_int {
-    with_client(c, |_| Err(invalid("encrypted repositories are not supported yet")))
+/// A passphrase argument. Copied straight into memory that is wiped after use; never logged.
+unsafe fn passphrase_arg(p: *const c_char) -> Result<Passphrase, i32> {
+    if p.is_null() {
+        return Err(invalid("passphrase is NULL"));
+    }
+    let bytes = CStr::from_ptr(p).to_bytes();
+    let s = Passphrase::new(
+        std::str::from_utf8(bytes).map_err(|_| invalid("the passphrase is not valid UTF-8"))?.to_string(),
+    );
+    if s.is_empty() {
+        return Err(invalid("the passphrase is empty"));
+    }
+    Ok(s)
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn es_repo_unlock(c: *mut Client, _passphrase: *const c_char) -> c_int {
-    with_client(c, |_| Err(invalid("encrypted repositories are not supported yet")))
+pub unsafe extern "C" fn es_repo_create_encrypted(c: *mut Client, passphrase: *const c_char) -> c_int {
+    with_client(c, |client| {
+        let p = passphrase_arg(passphrase)?;
+        *lock(&client.shared.create_passphrase) = Some(p);
+        Ok(ES_OK)
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn es_repo_unlock(c: *mut Client, passphrase: *const c_char) -> c_int {
+    with_client(c, |client| {
+        let p = passphrase_arg(passphrase)?;
+        let (pending, reply) = Pending::new();
+        client.shared.queue.push(Cmd::Unlock(p, reply));
+        match pending.wait(WORKER_WAIT, WaitMode::CancelIfQueued) {
+            Waited::Done(status) => Ok(status),
+            Waited::TimedOut => Err(ES_TIMEOUT),
+            Waited::Lost => Err(ES_E_INTERNAL),
+        }
+    })
 }
 
 #[no_mangle]

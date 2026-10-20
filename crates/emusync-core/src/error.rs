@@ -21,6 +21,17 @@ pub enum Error {
     Integrity(String),
     #[error("no remote configured")]
     NoRemote,
+    /// The repository is encrypted and this device doesn't have its key yet: it must be
+    /// unlocked with the passphrase ([`crate::Engine::unlock`]).
+    #[error("the repository is encrypted and locked on this device: unlock it with the passphrase")]
+    Locked,
+    #[error("wrong passphrase")]
+    WrongPassphrase,
+    /// The repository needs something this version doesn't have (a newer format, an unknown
+    /// encryption scheme), or doesn't match what was asked for (encryption on an existing
+    /// unencrypted repository).
+    #[error("incompatible repository: {0}")]
+    Incompatible(String),
 }
 
 impl Error {
