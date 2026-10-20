@@ -53,7 +53,7 @@ fn folder_cards_are_detected() {
     let plain = dir.path().join("photos");
     std::fs::create_dir(&plain).unwrap();
     let (success, out) = emusync(&data, &["card", "add", plain.to_str().unwrap()]);
-    assert!(!success && out.contains("not a PCSX2 folder memory card"), "{out}");
+    assert!(!success && out.contains("neither a PCSX2 folder card"), "{out}");
 }
 
 /// A save directory with one data file, as a game would write it.

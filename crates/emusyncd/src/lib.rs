@@ -112,9 +112,11 @@ enum RemoteCmd {
 
 #[derive(Subcommand)]
 enum CardCmd {
-    /// Register a memory card: a card file, or a PCSX2 folder card (a directory with a
-    /// _pcsx2_superblock). The logical card name defaults to the file stem, so Mcd001.ps2 on
-    /// every device is the same card, whether it is a file or a folder.
+    /// Register a memory card: a card file (PS2 .ps2, GameCube .raw), a PCSX2 folder card (a
+    /// directory with a _pcsx2_superblock) or a Dolphin GCI folder (GC/<region>/Card A). The
+    /// logical card name defaults to the file stem, so Mcd001.ps2 on every device is the same
+    /// card, whether it is a file or a folder; a GCI folder GC/USA/Card A is MemoryCardA.USA, the
+    /// same card as Dolphin's MemoryCardA.USA.raw.
     Add {
         path: PathBuf,
         /// Logical card name (default: file stem, e.g. Mcd001).
@@ -140,7 +142,7 @@ enum CardCmd {
         #[arg(long)]
         no_sync: bool,
     },
-    /// List the saves in a card file or folder card without registering or changing it.
+    /// List the saves in a card file or card folder without registering or changing it.
     Inspect { path: PathBuf },
 }
 
@@ -313,7 +315,9 @@ fn target_of(unit: &str) -> String {
 fn inspect(path: &Path) -> AnyResult<()> {
     let (image, fmt) = if path.is_dir() {
         let image = emusync_core::fsutil::read_tree(path)?.encode();
-        let fmt = emusync_formats::detect_dir(&image).ok_or("not a PCSX2 folder memory card (no _pcsx2_superblock)")?;
+        let fmt = emusync_formats::detect_dir(&image).ok_or(
+            "not a memory card folder: neither a PCSX2 folder card (no _pcsx2_superblock) nor a Dolphin GCI folder (no .gci files)",
+        )?;
         (image, fmt)
     } else {
         let image = std::fs::read(path)?;
