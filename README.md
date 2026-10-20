@@ -19,7 +19,7 @@ Android port does. Repositories can be [end-to-end encrypted](#end-to-end-encryp
 | `emusync-core` | Data model, version DAG, SQLite state, sync engine |
 | `emusync-formats` | Container format adapters: `ps2.card` (PS2 memory card file system), `ps2.card.folder` (PCSX2 folder cards), `raw` |
 | `emusync-remote` | `Remote` trait, S3 backend (SigV4 + rustls), in-memory remote, conformance suite |
-| `emusync-ffi` | C ABI v1 (`include/emusync.h`): static library, or shared with `cargo rustc -p emusync-ffi --lib --crate-type cdylib` ([Android](#building-for-android)) |
+| `emusync-ffi` | C ABI v1 (`include/emusync.h`): static library, or shared with `cargo rustc -p emusync-ffi --lib --crate-type cdylib` ([desktop](#building-for-windows-macos-and-linux), [Android](#building-for-android)) |
 | `emusyncd` | The `emusync` command-line tool, including the `emusync watch` sidecar; `emusyncw`, the same tool without a console window on Windows |
 
 ## Quick start
@@ -177,6 +177,48 @@ emulators is running.
 
 For MinIO or other S3-compatible services:
 `s3://<bucket>/<prefix>?endpoint=http://nas.local:9000&path_style=1`.
+
+## Building for Windows, macOS and Linux
+
+An emulator links the C ABI as a shared library: `emusync.dll` (with the import library
+`emusync.lib`) on Windows, `libemusync.dylib` on macOS, `libemusync.so` on Linux. It is shared
+rather than static because it bundles its own SQLite, zstd and ring, and only the `es_*` functions
+are exported, so they cannot clash with the emulator's own copies (PCSX2, Dolphin and PPSSPP all
+link zstd).
+
+From a CMake build, include [`bindings/cmake/EmuSync.cmake`](bindings/cmake/EmuSync.cmake). It
+runs cargo for the platform being built (both architectures, joined into a universal library,
+when `CMAKE_OSX_ARCHITECTURES` names `arm64` and `x86_64`), defines the imported target
+`emusync::emusync`, and `emusync_deploy_runtime()` copies the library next to the executable and
+points the executable's rpath there. Without cargo, rustc or the Rust target it sets
+`EMUSYNC_FOUND` to `OFF`, so the emulator can compile the feature out. On Android the same include
+uses `EmuSyncAndroid.cmake` (below), so a project that builds desktop and Android from one CMake
+tree needs only this:
+
+```cmake
+include(${CMAKE_SOURCE_DIR}/Externals/emusync/bindings/cmake/EmuSync.cmake)
+if(EMUSYNC_FOUND)
+  target_link_libraries(myemu PRIVATE emusync::emusync)
+  target_compile_definitions(myemu PRIVATE HAS_EMUSYNC)
+  emusync_deploy_runtime(myemu)   # a macOS app bundle: DESTINATION <bundle>/Contents/Frameworks
+endif()
+```
+
+For a build that doesn't use CMake (PCSX2's Visual Studio solution), stage a package instead:
+
+```sh
+scripts/build-desktop.sh                   # this machine's target, release, into target/desktop
+scripts/build-desktop.sh --target aarch64-apple-darwin --target x86_64-apple-darwin   # universal
+scripts/check-desktop-lib.sh target/desktop/lib/libemusync.so                          # Linux, macOS
+```
+
+It holds `include/emusync.h`, and `bin/emusync.dll`, `bin/emusync.pdb` and `lib/emusync.lib` on
+Windows, or `lib/libemusync.dylib` / `lib/libemusync.so`. Windows builds need MSVC or clang-cl
+(the `*-pc-windows-msvc` targets); the DLL depends only on system libraries and the Visual C++
+runtime. [`bindings/cmake/desktop-test`](bindings/cmake/desktop-test/CMakeLists.txt) is a complete
+example; CI builds it on Windows (Visual Studio generator), macOS (universal) and Linux, runs the C
+smoke test against the deployed library, checks it, and uploads each package as a
+`libemusync-desktop-<os>` artifact.
 
 ## Building for Android
 
