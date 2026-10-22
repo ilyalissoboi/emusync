@@ -7,16 +7,21 @@
 //! - [`raw`]: a whole file as one opaque unit; the fallback for formats without an adapter.
 //! - [`ps2`] (`ps2.card`): PS2 memory card images, one unit per save directory.
 //! - [`ps2::folder`] (`ps2.card.folder`): PCSX2 folder memory cards, with the same units.
+//! - [`gc::card`] (`gc.card`): GameCube memory card images (Dolphin's `.raw`), one unit per save.
+//! - [`gc::gci`] (`gc.gci`): Dolphin's GCI folders, with the same units.
 //!
 //! A container that is a directory on the host is handed to its adapter as a [`tree::Tree`]
 //! image ([`ContainerKind::Directory`]).
 
 use std::collections::BTreeMap;
 
+pub mod gc;
 pub mod ps2;
 pub mod raw;
 pub mod tree;
 
+pub use gc::card::GcCard;
+pub use gc::gci::GciFolder;
 pub use ps2::folder::Ps2Folder;
 pub use ps2::Ps2Card;
 pub use raw::Raw;
@@ -115,14 +120,20 @@ pub fn by_id(id: &str) -> Option<&'static dyn ContainerFormat> {
         "raw" => Some(&Raw),
         "ps2.card" => Some(&Ps2Card),
         "ps2.card.folder" => Some(&Ps2Folder),
+        "gc.card" => Some(&GcCard),
+        "gc.gci" => Some(&GciFolder),
         _ => None,
     }
 }
 
 /// Picks the adapter for a directory container from its [`tree::Tree`] image: a PCSX2 folder
-/// card (it has a `_pcsx2_superblock`), or nothing.
+/// card (it has a `_pcsx2_superblock`), a Dolphin GCI folder (it has a valid `.gci` file), or
+/// nothing.
 pub fn detect_dir(image: &[u8]) -> Option<&'static dyn ContainerFormat> {
-    (Ps2Folder.probe(image) == Confidence::Certain).then_some(&Ps2Folder as &dyn ContainerFormat)
+    if Ps2Folder.probe(image) == Confidence::Certain {
+        return Some(&Ps2Folder);
+    }
+    (GciFolder.probe(image) == Confidence::Certain).then_some(&GciFolder as &dyn ContainerFormat)
 }
 
 /// Picks the adapter for a card file: one whose format is recognised in the image, or whose
@@ -133,6 +144,10 @@ pub fn detect(file_name: &str, image: &[u8]) -> &'static dyn ContainerFormat {
         || (infer_platform(file_name) == "ps2" && Ps2Card.probe(image) == Confidence::Maybe)
     {
         return &Ps2Card;
+    }
+    // A GameCube card is recognised by its header's checksum and size field (it has no magic).
+    if GcCard.probe(image) == Confidence::Certain {
+        return &GcCard;
     }
     &Raw
 }
@@ -167,5 +182,8 @@ mod tests {
         assert_eq!(detect("Mcd001.ps2", &vec![0xFF; card.len()]).id(), "ps2.card");
         assert_eq!(detect("Mcd001.ps2", b"not a card").id(), "raw");
         assert_eq!(detect("save.srm", &vec![0xFF; card.len()]).id(), "raw");
+        let gc = gc::card::blank_card(4, [1; 12], 0, false);
+        assert_eq!(detect("MemoryCardA.USA.raw", &gc).id(), "gc.card");
+        assert_eq!(detect("SRAM.raw", &[0; 68]).id(), "raw");
     }
 }

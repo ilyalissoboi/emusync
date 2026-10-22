@@ -26,6 +26,13 @@ use std::sync::{Arc, Mutex};
 /// Local content hash of a unit that is not on the card (deleted, or not placed yet).
 const ABSENT: &str = "absent";
 
+/// The card name of a Dolphin GCI folder (`…/USA/Card A` → `MemoryCardA.USA`), if it is one.
+fn dolphin_card_name(dir: &Path) -> Option<String> {
+    let folder = dir.file_name()?.to_str()?;
+    let region = dir.parent()?.file_name()?.to_str()?;
+    formats::gc::gci::dolphin_card_name(region, folder)
+}
+
 /// Reads a container's image: a file's bytes, or a directory as a tree image (DESIGN §19).
 /// With `recover`, an interrupted directory replace is completed first.
 fn read_image(path: &Path, fmt: &dyn ContainerFormat, recover: bool) -> std::io::Result<Vec<u8>> {
@@ -687,7 +694,10 @@ impl Engine {
     /// the repository's mode is adopted.
     ///
     /// A directory is registered as a PCSX2 folder card (`ps2.card.folder`, platform `ps2`) if
-    /// it has a `_pcsx2_superblock`, and refused otherwise.
+    /// it has a `_pcsx2_superblock`, as a Dolphin GCI folder (`gc.gci`, platform `gc`) if it has
+    /// a valid `.gci` file or is Dolphin's `Card A`/`Card B` folder, and refused otherwise. A GCI
+    /// folder `<region>/Card A` is card `MemoryCardA.<region>` unless named, the same card as
+    /// Dolphin's raw card `MemoryCardA.<region>.raw`.
     pub fn add_container(&mut self, desc: ContainerDesc) -> Result<i64> {
         let location = std::path::absolute(&desc.location)?;
         let loc = location.to_string_lossy().into_owned();
@@ -700,11 +710,16 @@ impl Engine {
             Some(f) => f.clone(),
             None if is_dir => {
                 let image = fsutil::read_tree(&location)?.encode();
-                formats::detect_dir(&image).map(|f| f.id().to_string()).ok_or_else(|| {
-                    Error::InvalidArg(format!(
-                        "{loc} is a directory but not a PCSX2 folder memory card (it has no _pcsx2_superblock)"
-                    ))
-                })?
+                match formats::detect_dir(&image) {
+                    Some(f) => f.id().to_string(),
+                    // An empty GCI folder: only its place tells.
+                    None if dolphin_card_name(&location).is_some() => "gc.gci".into(),
+                    None => {
+                        return Err(Error::InvalidArg(format!(
+                            "{loc} is a directory but not a memory card: neither a PCSX2 folder card (it has no _pcsx2_superblock) nor a Dolphin GCI folder (it has no .gci files)"
+                        )))
+                    }
+                }
             }
             None => match fs::read(&location) {
                 Ok(image) => formats::detect(&file_name, &image).id().to_string(),
@@ -735,10 +750,12 @@ impl Engine {
         }
         let platform = desc.platform.clone().unwrap_or_else(|| match fmt.id() {
             "ps2.card.folder" => "ps2".to_string(),
+            "gc.card" | "gc.gci" => "gc".to_string(),
             _ => formats::infer_platform(&file_name).to_string(),
         });
         let name = match &desc.card {
             Some(n) => n.clone(),
+            None if fmt.id() == "gc.gci" => dolphin_card_name(&location).unwrap_or_else(|| file_name.clone()),
             None => location.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
         };
         for (what, v) in [("platform", &platform), ("card name", &name)] {

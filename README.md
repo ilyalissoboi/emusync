@@ -7,7 +7,8 @@ platforms. Design: [docs/DESIGN.md](docs/DESIGN.md). C API contract: [include/em
 Amazon S3 or any S3-compatible service: saves of different games played offline on different
 devices merge without conflicts, and every save has its own version history. PCSX2 folder
 cards hold the same saves, so a folder card on one device syncs with a `.ps2` file on another.
-Other card formats sync as whole files (byte-identical mirrors). `emusync watch` keeps
+GameCube cards sync per save too, whether Dolphin keeps them as `.raw` images or GCI folders
+(see [GameCube cards](#gamecube-cards)). Other card formats sync as whole files (byte-identical mirrors). `emusync watch` keeps
 unmodified PCSX2 in sync with no manual steps, and `emusync service install` starts it at
 every login. Emulators embed it through the C ABI (`include/emusync.h`, ABI v1), as the ARMSX2
 Android port does. Repositories can be [end-to-end encrypted](#end-to-end-encryption).
@@ -17,7 +18,7 @@ Android port does. Repositories can be [end-to-end encrypted](#end-to-end-encryp
 | Crate | Purpose |
 |---|---|
 | `emusync-core` | Data model, version DAG, SQLite state, sync engine |
-| `emusync-formats` | Container format adapters: `ps2.card` (PS2 memory card file system), `ps2.card.folder` (PCSX2 folder cards), `raw` |
+| `emusync-formats` | Container format adapters: `ps2.card` (PS2 memory card file system), `ps2.card.folder` (PCSX2 folder cards), `gc.card` (GameCube card images), `gc.gci` (Dolphin GCI folders), `raw` |
 | `emusync-remote` | `Remote` trait, S3 backend (SigV4 + rustls), in-memory remote, conformance suite |
 | `emusync-ffi` | C ABI v1 (`include/emusync.h`): static library, or shared with `cargo rustc -p emusync-ffi --lib --crate-type cdylib` ([desktop](#building-for-windows-macos-and-linux), [Android](#building-for-android)) |
 | `emusyncd` | The `emusync` command-line tool, including the `emusync watch` sidecar; `emusyncw`, the same tool without a console window on Windows |
@@ -47,6 +48,24 @@ empty; emusync formats it when the first save arrives. Cards synced by M0 as who
 working; to switch one to per-save sync, run `emusync card add <file>` again on each device,
 then `emusync card mode Mcd001 units` on one of them. `emusync card mode Mcd001 whole-file`
 goes back to byte-identical mirrors.
+
+## GameCube cards
+
+Dolphin keeps a slot's card either as a raw image (`GC/MemoryCardA.USA.raw`) or as a GCI folder
+(`GC/USA/Card A`, one `.gci` file per save, Dolphin's default). Both sync per save, and they are
+the same logical card, `gc:MemoryCardA.USA`, so one device can use a raw card and another a
+GCI folder:
+
+```sh
+emusync card add ~/"Dolphin Emulator/GC/MemoryCardA.USA.raw"   # a raw card
+emusync card add ~/"Dolphin Emulator/GC/USA/Card A"            # or a GCI folder, even an empty one
+emusync card inspect MemoryCardA.EUR.raw                       # list the saves on any card
+```
+
+Saves are named `<game code><maker>-<file>` (`GM8E01-MetroidPrime A`). Saves that check the card
+they are on (Phantasy Star Online, F-Zero GX) work on every card: emusync rewrites the card's
+serial into them as Dolphin does. Sync with Dolphin closed: it keeps the card in memory while a
+game runs. Details: [DESIGN §25](docs/DESIGN.md#25-implementation-notes-gamecube-cards).
 
 ## End-to-end encryption
 

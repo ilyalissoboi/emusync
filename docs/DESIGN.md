@@ -142,7 +142,7 @@ the host gets an error and the image is left alone.
 in whole-file mode has the single unit `ps2:Mcd001:@card`.
 
 - `native_name` is the name inside the card: the PS2 directory name, the PS1 block filename, or
-  the GCI `gamecode+filename`.
+  the GCI game code, maker code and file name (`GM8E01-MetroidPrime A`, §25.2).
 - Because the card is part of the identity, the same save directory on two different cards
   (a user who keeps a backup copy on `Mcd002`, for example) is two independent units, and the
   copies never overwrite each other.
@@ -336,7 +336,8 @@ Every apply follows the same steps, whatever the format:
 
 - `ps1.card`: raw 128 KB images plus headered variants. Units are block chains. Apply rebuilds
   the directory frames and link fields.
-- `gc.card` / `gc.gci`: Dolphin raw images and GCI folders (v2).
+- `gc.card` / `gc.gci`: GameCube raw card images and Dolphin GCI folders, with the same units
+  (§25).
 - `sram`: normalises cartridge save files between emulators (v2, with a quirk table for each
   emulator).
 - `dir`: any directory tree as one unit (PSP `SAVEDATA/*`, Citra/Azahar and others).
@@ -830,10 +831,11 @@ event and released explicitly. `es_abi_version()` lets a host refuse a mismatche
 `libemusync.so` with its CMake module (§21), the ARMSX2 integration (the fork in
 `ilyalissoboi/ARMSX2` embeds `libemusync.so`; two-way sync verified on a real device, an AYN
 Thor, against desktop PCSX2), end-to-end encryption (§22) with passphrase entry in ARMSX2's
-settings, the desktop build of the shared library (§23), and host secrets in the system's
-credential store (§24). **Open:** the Android AAR with
-Kotlin bindings and a SAF VFS, the C++ RAII wrapper `bindings/cpp/emusync.hpp`, and a PCSX2
-desktop fork; the roadmap below orders them.
+settings, the desktop build of the shared library (§23), host secrets in the system's
+credential store (§24), the PCSX2 desktop integration (the fork in `ilyalissoboi/pcsx2`; two-way
+sync verified against ARMSX2), and the GameCube adapters (§25, ahead of M4). **Open:** the Android AAR with
+Kotlin bindings and a SAF VFS, and the C++ RAII wrapper `bindings/cpp/emusync.hpp`; the roadmap
+below orders them.
 
 **Roadmap (October 2026).** Memory cards come before save states (M3). In this order, with the
 dependencies each item needs placed before it:
@@ -843,7 +845,7 @@ dependencies each item needs placed before it:
    Service) behind the C ABI, so emulators don't each write their own (§24).
 3. **PCSX2 desktop integration** (a fork with ARMSX2's hooks and a Qt settings page), on Windows,
    macOS and Linux. Removes the sidecar's Windows limitation (uploads wait for the game to close).
-4. GameCube adapters: `gc.card` (raw images) and `gc.gci` (GCI folders).
+4. GameCube adapters: `gc.card` (raw images) and `gc.gci` (GCI folders) (§25).
 5. The Android AAR: Kotlin API, Keystore-backed settings, lifecycle hooks, shared by the Android
    integrations below instead of each copying ARMSX2's.
 6. **Dolphin integration**, desktop and Android (one codebase; Android keeps its data in
@@ -1519,3 +1521,165 @@ stores. `emusync_core::secrets` and the C functions `es_secret_set`, `es_secret_
   credential store, so they run only with `EMUSYNC_TEST_OS_SECRETS=1`; CI sets it, which covers
   Credential Manager on Windows and the Keychain on macOS, and the fallback file on Linux runners,
   which have no Secret Service. Not tested: a real Secret Service (GNOME Keyring, KWallet).
+
+## 25. Implementation notes (GameCube cards)
+
+Two adapters in `emusync_formats::gc`, verified against Dolphin's source (`GCMemcard`,
+`GCMemcardDirectory`, `GCIFile`) and against real Dolphin cards:
+
+- `gc.card`: a raw card image, Dolphin's `GC/MemoryCardA.USA.raw` (also the format of real
+  cards dumped with GCMM). File container.
+- `gc.gci`: a Dolphin GCI folder, `GC/USA/Card A/`, one `.gci` file per save. Directory
+  container (§19.3), Dolphin's default card type.
+
+Both have the same units in the same canonical form, so a raw card on one device and a GCI
+folder on another sync with no conversion, as PCSX2's folder and file cards do (§19).
+
+### 25.1 The card
+
+Blocks are 8 KB. Block 0 is the header (serial data, format time, size in megabits, encoding,
+checksum), blocks 1 and 2 are two copies of the directory (127 entries of 64 bytes, an update
+counter, a checksum), blocks 3 and 4 are two copies of the block allocation table (a counter,
+the free count, the last block allocated, the next-block map, a checksum). Saves start at block
+5. Checksums are the 16-bit big-endian sum and inverse sum of the area, with `0xFFFF` stored as
+0. Sizes are 4 to 128 megabits (59 to 2043 save blocks).
+
+Reading follows Dolphin and the BIOS: the header's checksum and size must hold; of each pair
+the copy with the higher counter whose checksum holds is active (the first on a tie); a card
+with more than one bad copy, or a directory that doesn't agree with the allocation table
+(a save's chain running off the card, looping, or sharing blocks; free counts that don't add
+up), fails `validate`, so it is never synced (§5 step 1). `probe` is `Certain` for an image of
+a valid size whose header checksum holds; `detect` tries it after the PS2 adapter, so a
+`.raw` file that isn't a GameCube card (Dolphin's `SRAM.raw`) stays `raw`.
+
+Writing (`apply`) writes the new directory and allocation table into the **inactive** copies
+with the counter one higher and fresh checksums, the way the BIOS commits a change, then the
+data blocks. Untouched saves keep their blocks. A put allocates from the block after the last
+one allocated, wrapping, as Dolphin does, and fails with `NoSpace` when there are no free
+blocks or entries.
+
+### 25.2 Saves and their canonical form
+
+A save is its 64-byte directory entry plus its data blocks. Its identity, as on the console,
+is the game code, maker code and file name up to the first NUL; its unit name is
+`<gamecode><maker>-<filename>` (`GM8E01-MetroidPrime A`, bytes mapped one to one to Latin-1 so
+Shift JIS names round-trip), its title key `gc:<gamecode><maker>` (`gc:GM8E01`).
+
+The canonical bytes are a magic (`ES-GCU01`), the entry and the data, with what differs
+between two copies of the same save normalised away: the first block (`0xFFFF`), the
+modification time and the copy counter (zero), and the unused bytes (`0xFF`). The time and the
+copy counter go to the meta key `gc.dentry` (not hashed) and are restored on apply, so Dolphin
+and the BIOS still show when a save was written.
+
+**Copy protection.** Three saves embed the card's serial number, derived from the header, and
+check it: Phantasy Star Online's `PSO_SYSTEM` and `PSO3_SYSTEM` (serial plus a CRC-32 over part
+of the save) and F-Zero GX's `f_zero.dat` (serial plus a CRC-16 over the save). Dolphin rewrites
+those fields when it imports one of them into a card and when it loads a GCI folder. The
+canonical form zeroes them, so one version of the save hashes the same on every card; `gc.card`
+writes the destination card's serial and checksums back (the same arithmetic as Dolphin),
+and `gc.gci` leaves them zero for Dolphin to fill in.
+
+### 25.3 GCI folders
+
+Units are the `.gci` files in the folder's root whatever their name, in path order. A file
+that isn't a valid save (too short, a block count that doesn't match its size, an empty entry)
+or has the identity of an earlier file is skipped and left alone, as Dolphin does when it
+builds its virtual card; other files (Dolphin's `MC_SYSTEM_AREA`) are kept. A replaced save
+keeps its file; a new one gets the name Dolphin would give it, `<maker>-<gamecode>-<filename>.gci`
+escaped with Dolphin's `EscapeFileName`, with ` (n)` added if that name is taken; a deleted one
+loses its file. A file's mtime is the save's modification time.
+
+`probe` is `Certain` for a folder with at least one valid `.gci` file. An empty folder can't
+be told from any other: `add_container` registers an empty directory as `gc.gci` when it is
+Dolphin's `Card A` or `Card B` folder, and the format can always be given.
+
+### 25.4 In the core
+
+- Platform `gc` for both formats.
+- Card names: a raw card's stem, `MemoryCardA.USA`. A GCI folder `<region>/Card A` gets the same
+  name, `MemoryCardA.<region>`, since Dolphin keeps the raw card for that slot and region at
+  `GC/MemoryCardA.<region>.raw`: switching a slot between the two in Dolphin, or using a
+  different one on each device, keeps one logical card.
+- Dolphin keeps the card in memory while a game runs (both types) and writes it back (§25.5),
+  so like PCSX2 it needs the host to say when the card is in use; that is the Dolphin
+  integration (roadmap item 6), and a `dolphin` profile for the sidecar is left for later.
+- A GCI folder at a custom path is named only for its region (`X/USA`, §25.5) and needs the
+  card name given; the Dolphin integration knows the slot and passes it.
+- Not done: a raw card that doesn't exist yet is not created (Dolphin creates it, formatted, on
+  first use).
+
+### 25.5 How Dolphin handles cards
+
+Read in Dolphin's source (`MainSettings.cpp`, `GameCubePane.cpp`, `EXI.cpp`, `EXI_Channel.cpp`,
+`EXI_DeviceMemoryCard.cpp`, `GCMemcardRaw.cpp`, `GCMemcardDirectory.cpp`; upstream master of
+October 2026, the same in the `ilyalissoboi/dolphin` fork) and confirmed in the tests below.
+The Dolphin integration and a sidecar profile have to work with all of it.
+
+- **Which card a slot uses.** Each slot has a device type (`[Core] SlotA`/`SlotB`: 1 Memory
+  Card, 8 GCI Folder, 255 Nothing) and, separately, a raw card path (`MemcardAPath`) and a GCI
+  folder path (`GCIFolderAPath`), empty for the defaults `GC/MemoryCardA.<region>.raw` and
+  `GC/<region>/Card A`. The card in use is the device type plus the path for it, resolved for
+  the running game's region (`GetMemcardPath`, `GetGCIFolderPath`).
+- **The region is always in the path.** A raw card path the user picks gets `.<region>` before
+  the extension (`X/test.raw` opens `X/test.USA.raw`, a new blank card if that doesn't exist)
+  and a custom GCI folder gets `/<region>` (`X` opens `X/USA`); a region already in the name
+  (`.USA`, `.EUR`, `.JAP`, `.DEV`; `/USA`, `/EUR`, `/JPN`, `/DEV`) is replaced. The settings
+  pane refuses a file or folder whose name has no region part. NTSC-K games use the Japanese
+  name.
+- **Paths outlive the device type.** Setting a slot to Nothing, or to the other card type,
+  keeps its paths, and the settings pane refuses a card or folder "already used" by the other
+  slot by comparing with that slot's stored path, whatever its device type. A path can be
+  freed only by pointing that slot elsewhere (or by editing `Dolphin.ini` with Dolphin closed).
+- **Settings are written late.** `Dolphin.ini` is saved when the settings window closes and
+  when Dolphin exits, so while Dolphin runs the file can disagree with what it uses, and an
+  edit made while it runs is overwritten.
+- **Changes while a game runs swap the card.** Changing a slot's device or path during a game
+  unplugs the card for a second and inserts the new one (`ChangeDevice`), as if swapped by hand.
+- **Save states restore the card type.** A state stores each slot's device type; loading a
+  state taken with another type (a raw card in a slot now set to a GCI folder) creates the
+  state's type, at the path configured for it. Card contents are not in a state (except
+  while a movie runs), but the game's memory is, so a game resumed from a state can find the
+  card's save different from the one it remembers (Rogue Leader: "This Memory Card contains
+  different … File Data", offering to overwrite).
+- **Raw cards are written whole.** A raw card is read into memory when the slot is set up and
+  written back whole within 15 seconds after a game writes to it (showing "Wrote to Memory Card A"),
+  and again, unconditionally, when the card is removed: game stop, a slot change, Dolphin
+  closing. A file can be rewritten with identical bytes; `SRAM.raw` is written at the same
+  moment.
+- **GCI folders are written per save.** Dolphin builds a virtual card from the folder: the
+  running game's saves always, other games' saves only while the card keeps about 10% of its
+  blocks and 14 of its 127 entries free. A changed save is written to its own file a second
+  after the game's last write ("Wrote save contents to GCI Folder"), with the first-block field
+  set to its place on the virtual card (`0x0005`, where emusync writes `0xFFFF`; the field is
+  not part of the canonical form, §25.2). A new save gets Dolphin's file name, with a `0`
+  inserted before `.gci` on a clash. A deleted save's file is renamed to `<name>.deleted`,
+  which `gc.gci` leaves alone as it isn't a `.gci` file.
+- **The Memory Card Manager** (Tools) opens only slots whose device is a raw Memory Card, so
+  with GCI folders it starts empty; it works on files, not on the cards in use.
+
+### 25.6 Tests
+
+Unit tests build cards and saves from scratch: Dolphin's checksum of an empty directory, blank
+cards of every size, round trips, untouched saves keeping their blocks, full cards, copy
+protection (same hash on two cards, the serial written back), every corruption the reader
+rejects, Dolphin's file-name escaping, and saves moving between a card and a folder.
+`tests/gamecube.rs` syncs a raw card on one device with an empty GCI folder on another, both
+ways, including a copy-protected save. Real Dolphin cards (a USA and a PAL card with saves of
+four games) were checked locally, not committed: detection, listing, re-putting every save,
+deleting one, copying all to a blank card and to a GCI folder, and merging each card's saves
+into the other.
+
+**In Dolphin** (October 2026, `ilyalissoboi/dolphin` 2606-fork-6 on Windows, Star Wars Rogue
+Squadron II: Rogue Leader, USA), with copies of those cards:
+
+- A raw card emusync built (the USA card's saves plus the PAL card's, merged) in slot A: the game
+  loaded its save, saved after a mission, and Dolphin wrote the card. The Rogue Leader save
+  got a new time and the directory counter went up; its blocks and the three other saves were
+  untouched, and `gc.card` validates and reads the result.
+- A GCI folder emusync wrote from the same saves, in slot A: the game loaded and saved, and
+  Dolphin rewrote only `64-GSWE-RogueLeader.gci` (new time, new data, first block `0x0005`);
+  `emusync card inspect` detects the folder as `gc.gci` and lists all four saves.
+- The first attempts saved elsewhere, which is how the behaviour in §25.5 was found: the region
+  inserted into the chosen file name opened a new blank card, a slot path kept by a slot set to
+  Nothing blocked the card from the other slot, and loading a save state taken with a raw card
+  replaced the GCI folder set for the slot.
