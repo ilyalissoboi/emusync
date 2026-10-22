@@ -112,6 +112,12 @@ pub trait ContainerFormat: Send + Sync {
     }
     /// Builds a new image with `ops` applied. The input image is validated first.
     fn apply(&self, image: &[u8], ops: &[ApplyOp]) -> Result<Vec<u8>>;
+    /// The image of a new, empty container named `file_name`, for formats whose emulator would
+    /// create one itself on first use; the engine then creates a missing container when saves
+    /// arrive for it (DESIGN §25.4). `None`: a missing container stays missing.
+    fn empty(&self, _file_name: &str) -> Option<Vec<u8>> {
+        None
+    }
 }
 
 /// Looks up an adapter by id.

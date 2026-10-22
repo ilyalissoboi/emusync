@@ -66,6 +66,27 @@ impl Device {
         Device { engine, card, layout, _dir: dir }
     }
 
+    /// A device whose card doesn't exist yet (nor its GC folders), as on a new installation of
+    /// Dolphin: registered with its format, since there is nothing to detect.
+    fn without_card(remote: &Arc<MemoryRemote>, name: &str, layout: Layout) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let gc = dir.path().join("Dolphin Emulator").join("GC");
+        let (card, format) = match layout {
+            Layout::Raw => (gc.join("MemoryCardA.USA.raw"), "gc.card"),
+            Layout::Gci => (gc.join("USA").join("Card A"), "gc.gci"),
+        };
+        let mut engine = Engine::open(
+            dir.path().join("data"),
+            EngineOptions { device_name: Some(name.into()), policy: ConflictPolicy::Ask, ..Default::default() },
+        )
+        .unwrap();
+        engine.add_remote(remote.clone()).unwrap();
+        let desc = ContainerDesc { location: card.clone(), format: Some(format.into()), ..Default::default() };
+        engine.add_container(desc).unwrap();
+        assert_eq!(engine.containers().unwrap()[0].card_id, "gc:MemoryCardA.USA");
+        Device { engine, card, layout, _dir: dir }
+    }
+
     fn fmt(&self) -> &'static dyn ContainerFormat {
         match self.layout {
             Layout::Raw => &GcCard,
@@ -154,4 +175,61 @@ fn copy_protected_saves_follow_the_card() {
         let report = d.engine.sync().unwrap();
         assert_eq!((report.new_local_versions, report.uploaded_versions), (0, 0), "{report:?}");
     }
+}
+
+/// A new device has no card yet: the saves from the cloud arrive in one emusync creates, of
+/// either kind, so the game's first boot there finds them.
+#[test]
+fn missing_cards_are_created_for_the_saves_synced_to_them() {
+    for layout in [Layout::Raw, Layout::Gci] {
+        let remote = Arc::new(MemoryRemote::default());
+        let mut pc = Device::new(&remote, "windows", Layout::Raw);
+        let metroid = save(b"GM8E", b"01", "MetroidPrime A", 1, 1);
+        pc.game_writes(&[ApplyOp::Put(canonical(&metroid))]);
+        pc.engine.sync().unwrap();
+
+        let mut phone = Device::without_card(&remote, "android", layout);
+        let report = phone.engine.sync().unwrap();
+        assert!(phone.card.exists(), "{report:?}");
+        assert!(report.blocked.is_empty(), "{report:?}");
+        assert_eq!(phone.units(), pc.units());
+        if let Layout::Raw = phone.layout {
+            let card = std::fs::read(&phone.card).unwrap();
+            assert_eq!(card.len(), 2048 * 0x2000, "Dolphin's default size");
+            GcCard.validate(&card).unwrap();
+        }
+        // Nothing new to upload: the save came from the cloud.
+        let again = phone.engine.sync().unwrap();
+        assert_eq!((again.new_local_versions, again.uploaded_versions), (0, 0), "{again:?}");
+    }
+}
+
+/// No saves for the card: nothing is created (Dolphin creates its cards on first use).
+#[test]
+fn missing_cards_without_saves_stay_missing() {
+    let remote = Arc::new(MemoryRemote::default());
+    let mut phone = Device::without_card(&remote, "android", Layout::Raw);
+    let report = phone.engine.sync().unwrap();
+    assert!(!phone.card.exists());
+    assert!(report.blocked.is_empty(), "{report:?}");
+}
+
+/// A card file deleted after it synced comes back with its saves: deleting the file is not
+/// deleting the saves, on this device or any other.
+#[test]
+fn a_deleted_card_comes_back_without_deleting_saves() {
+    let remote = Arc::new(MemoryRemote::default());
+    let mut pc = Device::new(&remote, "windows", Layout::Raw);
+    let mut phone = Device::new(&remote, "android", Layout::Raw);
+    let metroid = save(b"GM8E", b"01", "MetroidPrime A", 1, 1);
+    phone.game_writes(&[ApplyOp::Put(canonical(&metroid))]);
+    phone.engine.sync().unwrap();
+    pc.engine.sync().unwrap();
+
+    std::fs::remove_file(&phone.card).unwrap();
+    let report = phone.engine.sync().unwrap();
+    assert_eq!(report.new_local_versions, 0, "no deletion recorded: {report:?}");
+    assert_eq!(phone.units().len(), 1);
+    pc.engine.sync().unwrap();
+    assert_eq!(pc.units().len(), 1, "the other device keeps the save");
 }

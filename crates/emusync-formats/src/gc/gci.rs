@@ -141,6 +141,11 @@ impl ContainerFormat for GciFolder {
         super::titles_of(unit_name)
     }
 
+    /// An empty folder, as Dolphin starts a GCI folder.
+    fn empty(&self, _file_name: &str) -> Option<Vec<u8>> {
+        Some(Tree::default().encode())
+    }
+
     fn apply(&self, image: &[u8], ops: &[ApplyOp]) -> Result<Vec<u8>> {
         let mut tree = Tree::decode(image)?;
         for op in ops {

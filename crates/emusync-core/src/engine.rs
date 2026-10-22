@@ -59,6 +59,9 @@ fn write_image(path: &Path, fmt: &dyn ContainerFormat, image: &[u8]) -> std::io:
     }
 }
 
+/// The image hash [`Engine::scan`] gives a missing container that [`Engine::apply`] may create.
+const MISSING_CREATABLE: &str = "missing";
+
 /// Reason reported for a container another program has locked (see [`fsutil::is_locked`]). It is
 /// read again on the next cycle; nothing else in the cycle is affected.
 pub const LOCKED: &str = "locked by another program";
@@ -1034,6 +1037,17 @@ impl Engine {
         formats::by_id(&c.format).ok_or_else(|| Error::InvalidArg(format!("unknown format {:?}", c.format)))
     }
 
+    /// The empty image of a missing container that may be created when saves arrive for it: a
+    /// card in unit mode whose format creates new containers itself (DESIGN §25.4, GameCube
+    /// cards and GCI folders). `None` for every other container, which stays missing.
+    fn creatable(&self, c: &ContainerRow, fmt: &dyn ContainerFormat) -> Result<Option<Vec<u8>>> {
+        if c.flags & CF_READ_ONLY != 0 || self.card_mode(&c.card_id)? != CardMode::Units {
+            return Ok(None);
+        }
+        let name = Path::new(&c.location).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        Ok(fmt.empty(&name))
+    }
+
     /// Whether this build can sync the card in the repository's mode.
     fn card_syncable(&self, c: &ContainerRow) -> Result<bool> {
         let fmt = self.format_of(c)?;
@@ -1069,6 +1083,15 @@ impl Engine {
                 return Ok(None);
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if self.creatable(c, fmt)?.is_some() {
+                    // Reconciled as an empty container, which `apply` creates if saves arrive
+                    // for it. What was recorded about it describes a file that is gone (a card
+                    // the user deleted): its saves come back from the cloud, none is deleted.
+                    for (unit, _) in self.store.local_units_of(c.id)? {
+                        self.store.delete_local_unit(&unit, c.id)?;
+                    }
+                    return Ok(Some(MISSING_CREATABLE.to_string()));
+                }
                 let reason = format!("{} does not exist", c.location);
                 report.blocked.push(Blocked { unit: card_unit, container: c.id, kind: BlockKind::Missing, reason });
                 return Ok(None);
@@ -1419,9 +1442,20 @@ impl Engine {
         }
         let path = Path::new(&c.location);
         let fmt = self.format_of(c)?;
-        // 1. Read the current container. It must still be what we scanned (and validated).
+        // 1. Read the current container. It must still be what we scanned (and validated). A
+        // missing one that the scan reconciled as empty is created by the write below.
+        let mut creating = false;
         let current = match read_image(path, fmt, false) {
             Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && image_hash == MISSING_CREATABLE => {
+                match self.creatable(c, fmt)? {
+                    Some(empty) => {
+                        creating = true;
+                        empty
+                    }
+                    None => return Err(e.into()),
+                }
+            }
             Err(e) if fsutil::is_locked(&e) => {
                 for (unit, t) in &pending {
                     self.block(c, unit, &t.rec.id, BlockKind::Busy, LOCKED.into(), report)?;
@@ -1430,7 +1464,7 @@ impl Engine {
             }
             Err(e) => return Err(e.into()),
         };
-        if content_id(&current) != image_hash {
+        if !creating && content_id(&current) != image_hash {
             for (unit, _) in &pending {
                 report.blocked.push(Blocked {
                     unit: unit.clone(),
@@ -1500,7 +1534,15 @@ impl Engine {
         // A host thread may have marked the container busy since the check above (a session
         // that stopped waiting for this cycle). The gate is held across the write, so once
         // `BusyGate::set` returns nothing writes to the container any more.
-        let failure = match self.busy.write_unless_busy(c.id, || write_image(path, fmt, &image)) {
+        let failure = match self.busy.write_unless_busy(c.id, || {
+            if creating {
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                log::info!("creating {} for the saves synced to it", c.location);
+            }
+            write_image(path, fmt, &image)
+        }) {
             None => Some((BlockKind::Busy, "container is in use".to_string())),
             Some(Err(e)) => Some((BlockKind::Io, format!("cannot replace {}: {e}", c.location))),
             Some(Ok(())) => None,
