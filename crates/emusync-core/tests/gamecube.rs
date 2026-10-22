@@ -66,8 +66,9 @@ impl Device {
         Device { engine, card, layout, _dir: dir }
     }
 
-    /// A device whose card doesn't exist yet (nor its GC folders), as on a new installation of
-    /// Dolphin: registered with its format, since there is nothing to detect.
+    /// A device whose card doesn't exist yet, as on a new installation of Dolphin, which has
+    /// created its GC folders (`GC`, `GC/USA`, ...) but no card: registered with its format,
+    /// since there is nothing to detect.
     fn without_card(remote: &Arc<MemoryRemote>, name: &str, layout: Layout) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let gc = dir.path().join("Dolphin Emulator").join("GC");
@@ -75,6 +76,7 @@ impl Device {
             Layout::Raw => (gc.join("MemoryCardA.USA.raw"), "gc.card"),
             Layout::Gci => (gc.join("USA").join("Card A"), "gc.gci"),
         };
+        std::fs::create_dir_all(card.parent().unwrap()).unwrap();
         let mut engine = Engine::open(
             dir.path().join("data"),
             EngineOptions { device_name: Some(name.into()), policy: ConflictPolicy::Ask, ..Default::default() },
@@ -245,6 +247,8 @@ fn a_card_moves_from_a_raw_card_to_a_gci_folder() {
     pc.engine.sync().unwrap();
 
     let folder = pc.card.parent().unwrap().join("USA").join("Card A");
+    // Dolphin creates its region folders at startup; the card's own folder is created for it.
+    std::fs::create_dir_all(folder.parent().unwrap()).unwrap();
     let desc = |replace| ContainerDesc {
         location: folder.clone(),
         format: Some("gc.gci".into()),
@@ -261,4 +265,25 @@ fn a_card_moves_from_a_raw_card_to_a_gci_folder() {
     pc.engine.sync().unwrap();
     let file = folder.join("01-GM8E-MetroidPrime A.gci");
     assert_eq!(parse_gci(&std::fs::read(file).unwrap()).unwrap().data, metroid.data);
+}
+
+/// A card whose folder is gone too (a drive that isn't mounted, say) is not recreated on the
+/// disk underneath: it stays missing until its folder is back.
+#[test]
+fn a_card_without_its_folder_is_not_created() {
+    let remote = Arc::new(MemoryRemote::default());
+    let mut pc = Device::new(&remote, "windows", Layout::Raw);
+    pc.game_writes(&[ApplyOp::Put(canonical(&save(b"GM8E", b"01", "MetroidPrime A", 1, 1)))]);
+    pc.engine.sync().unwrap();
+
+    let mut phone = Device::without_card(&remote, "android", Layout::Gci);
+    let usa = phone.card.parent().unwrap().to_path_buf();
+    std::fs::remove_dir(&usa).unwrap();
+    let report = phone.engine.sync().unwrap();
+    assert!(!usa.exists(), "nothing created under a missing folder");
+    assert!(report.blocked.iter().any(|b| b.kind == emusync_core::BlockKind::Missing), "{report:?}");
+
+    std::fs::create_dir(&usa).unwrap();
+    phone.engine.sync().unwrap();
+    assert_eq!(phone.units().len(), 1, "created once the folder is back");
 }

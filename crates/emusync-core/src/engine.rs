@@ -1050,9 +1050,14 @@ impl Engine {
 
     /// The empty image of a missing container that may be created when saves arrive for it: a
     /// card in unit mode whose format creates new containers itself (DESIGN §25.4, GameCube
-    /// cards and GCI folders). `None` for every other container, which stays missing.
+    /// cards and GCI folders), in a folder that exists. `None` for every other container, which
+    /// stays missing: in particular one whose folder is gone too, which is more likely a drive
+    /// that isn't mounted than a new device, and must not be recreated on the disk underneath.
     fn creatable(&self, c: &ContainerRow, fmt: &dyn ContainerFormat) -> Result<Option<Vec<u8>>> {
         if c.flags & CF_READ_ONLY != 0 || self.card_mode(&c.card_id)? != CardMode::Units {
+            return Ok(None);
+        }
+        if !Path::new(&c.location).parent().is_some_and(Path::is_dir) {
             return Ok(None);
         }
         let name = Path::new(&c.location).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -1547,9 +1552,6 @@ impl Engine {
         // `BusyGate::set` returns nothing writes to the container any more.
         let failure = match self.busy.write_unless_busy(c.id, || {
             if creating {
-                if let Some(parent) = path.parent() {
-                    fs::create_dir_all(parent)?;
-                }
                 log::info!("creating {} for the saves synced to it", c.location);
             }
             write_image(path, fmt, &image)
