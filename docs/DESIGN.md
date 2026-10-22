@@ -1613,9 +1613,12 @@ Dolphin's `Card A` or `Card B` folder, and the format can always be given.
   give the image of a new, empty container (`ContainerFormat::empty`): `gc.card` a card as
   Dolphin makes one (2043 blocks, formatted now, Shift JIS for `*.JAP.raw`, a serial of its
   own), `gc.gci` an empty folder. A scan that finds such a container missing (in unit mode, not
-  read-only) reconciles it as empty, with the image hash `missing` rather than one of an image,
-  and `apply` creates it, parent folders included, only if saves arrive for it and it is still
-  missing: one that appeared meanwhile is the usual "changed during sync". Nothing is created
+  read-only) in a folder that exists reconciles it as empty, with the image hash `missing` rather
+  than one of an image, and `apply` creates it only if saves arrive for it and it is still
+  missing: one that appeared meanwhile is the usual "changed during sync". A container whose
+  folder is gone too is more likely on a drive that isn't mounted than new, and stays missing
+  rather than being created on the disk underneath (Dolphin creates `GC/` and `GC/<region>/` at
+  startup, so its cards' folders exist). Nothing is created
   for a card nobody has saves for. A card file deleted after syncing is the same case: its
   local records are dropped and its saves come back from the cloud, so deleting the file
   deletes no save anywhere. Other formats keep reporting a missing container.

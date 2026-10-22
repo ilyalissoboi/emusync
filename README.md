@@ -62,8 +62,9 @@ emusync card add ~/"Dolphin Emulator/GC/USA/Card A"            # or a GCI folder
 emusync card inspect MemoryCardA.EUR.raw                       # list the saves on any card
 ```
 
-A card or GCI folder that doesn't exist yet on a device is created when saves arrive for it,
-as Dolphin would create it, so a game's first boot on a new device finds them. Saves are named
+With an emulator integration (Dolphin's), a card or GCI folder that doesn't exist yet on a device
+is created when saves arrive for it, as Dolphin would create it, so a game's first boot on a new
+device finds them. (`emusync card add` takes only a card that exists.) Saves are named
 `<game code><maker>-<file>` (`GM8E01-MetroidPrime A`). Saves that check the card
 they are on (Phantasy Star Online, F-Zero GX) work on every card: emusync rewrites the card's
 serial into them as Dolphin does. Sync with Dolphin closed: it keeps the card in memory while a
