@@ -66,6 +66,9 @@ class SyncControllerTest {
 
     @After
     fun cleanUp() {
+        // The context keeps handing out its cached instance after the file is deleted, with the old
+        // values: clear that too, synchronously.
+        context.getSharedPreferences(prefsName, Context.MODE_PRIVATE).edit().clear().commit()
         context.deleteSharedPreferences(prefsName)
         KeyStore.getInstance("AndroidKeyStore").apply { load(null) }.deleteEntry(keyAlias)
     }
