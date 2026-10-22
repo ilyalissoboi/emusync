@@ -1603,8 +1603,11 @@ Dolphin's `Card A` or `Card B` folder, and the format can always be given.
 - Dolphin keeps the card in memory while a game runs (both types) and writes it back, so like
   PCSX2 it needs the host to say when the card is in use; that is the Dolphin integration
   (roadmap item 6), and a `dolphin` profile for the sidecar is left for later.
-- Not done: Dolphin's per-game GCI folders and region-free custom paths need the card name
-  given; a raw card that doesn't exist yet is not created (Dolphin creates it, formatted, on
+- Custom paths: Dolphin always puts the game's region into a card path the user picks, so
+  `X/test.raw` is opened as `X/test.USA.raw` and a GCI folder `X` as `X/USA` (`GetMemcardPath`,
+  `GetGCIFolderPath`). Such a GCI folder, named only for its region, needs the card name given;
+  the Dolphin integration knows the slot and passes it.
+- Not done: a raw card that doesn't exist yet is not created (Dolphin creates it, formatted, on
   first use).
 
 ### 25.5 Tests
