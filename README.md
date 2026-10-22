@@ -301,6 +301,64 @@ example; CI builds it for arm64-v8a and x86_64, checks the result, runs the C sm
 x86_64 emulator, and uploads `libemusync.so` and `emusync.h` as the `libemusync-android`
 artifact.
 
+### The Android AAR
+
+[`bindings/android`](bindings/android) builds `emusync-release.aar` for apps that don't want a
+Rust toolchain in their build ([DESIGN §26](docs/DESIGN.md#26-implementation-notes-android-aar)).
+The emulator's native code owns the emusync client, as in PCSX2 and ARMSX2. The AAR gives it the
+library, and gives the Kotlin side the rest of an integration:
+
+- `libemusync.so` (arm64-v8a, x86_64) packaged into the APK, and a Prefab package so the native
+  build finds it:
+
+  ```cmake
+  find_package(emusync REQUIRED CONFIG)   # needs buildFeatures { prefab = true }
+  target_link_libraries(emucore PRIVATE emusync::emusync)
+  ```
+
+- `SyncSettings`: storage address, keys, passphrase and device name, with the secrets encrypted
+  by an Android Keystore key, plus emusync's data folder for each storage (not backed up).
+- `SyncController`: starts and stops sync in the background to match the settings, and reports
+  when the app goes to the background and comes back. It drives the native side through
+  `SyncBackend`, a small interface the app implements over its own JNI:
+
+  ```kotlin
+  object NativeSync : SyncBackend {          // each call goes to the app's own JNI functions
+      override val isAvailable get() = NativeApp.syncAvailable()
+      override fun start(config: SyncConfig) = NativeApp.syncStart(config.dataDir.path,
+          config.deviceName, config.appVersion, config.remoteUri, config.accessKeyId,
+          config.secretAccessKey, config.passphrase)   // null when started, else the reason
+      override fun stop() = NativeApp.syncStop()
+      override val isRunning get() = NativeApp.syncRunning()
+      override fun syncNow() = NativeApp.syncNow()
+      override fun status() = NativeApp.syncStatus()
+      override fun setAppBackgrounded(backgrounded: Boolean) = NativeApp.syncBackgrounded(backgrounded)
+  }
+
+  val sync = SyncController(SyncSettings(context), NativeSync, BuildConfig.VERSION_NAME)
+  sync.attachToAppLifecycle()     // once, on the main thread
+  sync.startInBackground()        // at app start, and startAsync { error -> ... } after a change
+  ```
+
+Building it needs Rust with the Android targets and the NDK (r29), like the library alone; on
+Windows the build calls `scripts/build-android.sh` through Git's bash.
+
+```sh
+cd bindings/android
+./gradlew :emusync:assembleRelease       # emusync/build/outputs/aar/emusync-release.aar
+```
+
+An app adds the `.aar` and the one library it depends on:
+
+```kotlin
+implementation(files("libs/emusync-release.aar"))
+implementation("androidx.lifecycle:lifecycle-process:2.11.0")
+```
+
+CI builds it, checks the libraries inside, runs its instrumented tests and a Prefab consumer
+([`prefab-test`](bindings/android/prefab-test)) on an emulator, and uploads it as the
+`emusync-aar` artifact.
+
 ## Tests
 
 ```sh
