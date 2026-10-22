@@ -1768,7 +1768,8 @@ weak reference the `getrandom` crate checks, falling back to the system call:
   identity would mix their logs). The preferences name and key alias are parameters, and ARMSX2's
   (`memcard_sync`, `armsx2.memcardSync.secret`) keep its stored settings when it moves to the AAR.
   `config(appVersion)` gives the `SyncConfig` to start with, or null when sync is off or
-  incomplete. `SyncConfig.toString()` hides the secret and the passphrase.
+  incomplete. `secretAccessKey()` and `passphrase()` read the secrets back for a settings
+  screen's Show. `SyncConfig.toString()` hides the secret and the passphrase.
 - **`SyncController`:** `start()` (blocking), `startAsync`, `startInBackground` and `stopAsync`
   run on one thread of the controller's, in order, each reading the settings when it runs; a
   settings screen that closes right after a change can't cancel its restart. `start` stops sync

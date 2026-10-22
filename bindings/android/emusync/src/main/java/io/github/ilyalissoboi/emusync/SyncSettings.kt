@@ -84,9 +84,16 @@ class SyncSettings @JvmOverloads constructor(
     fun setPassphrase(value: String) = seal(KEY_PASSPHRASE, value)
 
     /**
+     * The stored secret access key, for a settings screen's Show: to check which key this device
+     * uses, or to set up another device with it. Null when none is stored or it can't be
+     * decrypted here.
+     */
+    fun secretAccessKey(): String? = unseal(KEY_SECRET)
+
+    /**
      * The stored passphrase, for a settings screen's Show: the user needs it again to set up their
      * other devices, and losing it loses the saves. Null when none is stored or it can't be
-     * decrypted here. The secret access key has no getter: it can be issued again.
+     * decrypted here.
      */
     fun passphrase(): String? = unseal(KEY_PASSPHRASE)
 
