@@ -647,7 +647,7 @@ States are a separate class from saves, and opt-in for each client:
 |---|---|
 | **Windows** | Static lib (`.lib`) or DLL. `ReplaceFileW` for atomic replace. File-change detection via `ReadDirectoryChangesW` (sidecar). DPAPI / Credential Manager. |
 | **macOS** | Universal static lib or XCFramework. FSEvents (sidecar). Keychain. Code-signing friendly, with no runtime downloads. |
-| **Android** | AAR with JNI glue and a Kotlin API (coroutines `Flow` for events). **VFS callbacks** let the core read and write `content://` URIs through SAF when ARMSX2 stores cards in a user-chosen folder. `WorkManager` for deferred upload. `ConnectivityManager` for metered detection. Android Keystore. |
+| **Android** | AAR with the library for the host's native code (Prefab) and a Kotlin API for settings, Keystore secrets and lifecycle (§26). **VFS callbacks** let the core read and write `content://` URIs through SAF when ARMSX2 stores cards in a user-chosen folder. `WorkManager` for deferred upload. `ConnectivityManager` for metered detection. Android Keystore. |
 | **iOS** (later) | XCFramework + SwiftPM. `BGProcessingTask` for deferred sync. Background time is short, so `app_suspend` stages to the outbox and pushes at the next launch. |
 | **Linux** | Same as desktop, with inotify for the sidecar. Covers the Steam Deck. |
 
@@ -705,7 +705,9 @@ es_event ev; while (es_event_poll(sync, &ev)) { ImGuiFullscreen::Handle(ev); es_
 
 ### 10.2 ARMSX2 fork (Android)
 
-The ARMSX2 native core shares the PCSX2 hooks above. The Kotlin layer adds:
+The ARMSX2 native core shares the PCSX2 hooks above. The sketch below is the original plan for
+its Kotlin layer, with Kotlin owning the client; the integrations built since keep the client in
+the native core and the Kotlin side in the AAR's `SyncSettings` and `SyncController` (§26.1):
 
 ```kotlin
 val sync = EmuSync.create(context, EmuSyncConfig(emulatorId = "armsx2", emulatorVersion = BuildConfig.VERSION_NAME))
@@ -781,7 +783,7 @@ emusync/
   include/emusync.h     the C ABI contract (checked in; CI fails if cbindgen output drifts)
   bindings/cmake/       EmuSyncAndroid.cmake: libemusync.so from an Android CMake build (§21)
   bindings/cpp/         emusync.hpp: RAII wrappers, std::string_view, expected<>
-  bindings/android/     Gradle module → AAR (JNI + Kotlin)
+  bindings/android/     Gradle build → AAR: libemusync.so as Prefab + Kotlin API (§26)
   bindings/apple/       SwiftPM package → XCFramework
   fixtures/             golden card images, emulator quirk samples
   fuzz/                 cargo-fuzz targets for every adapter
@@ -833,8 +835,8 @@ event and released explicitly. `es_abi_version()` lets a host refuse a mismatche
 Thor, against desktop PCSX2), end-to-end encryption (§22) with passphrase entry in ARMSX2's
 settings, the desktop build of the shared library (§23), host secrets in the system's
 credential store (§24), the PCSX2 desktop integration (the fork in `ilyalissoboi/pcsx2`; two-way
-sync verified against ARMSX2), and the GameCube adapters (§25, ahead of M4). **Open:** the Android AAR with
-Kotlin bindings and a SAF VFS, and the C++ RAII wrapper `bindings/cpp/emusync.hpp`; the roadmap
+sync verified against ARMSX2), the GameCube adapters (§25, ahead of M4), and the Android AAR
+(§26). **Open:** the SAF VFS and the C++ RAII wrapper `bindings/cpp/emusync.hpp`; the roadmap
 below orders them.
 
 **Roadmap (October 2026).** Memory cards come before save states (M3). In this order, with the
@@ -846,7 +848,7 @@ dependencies each item needs placed before it:
 3. **PCSX2 desktop integration** (a fork with ARMSX2's hooks and a Qt settings page), on Windows,
    macOS and Linux. Removes the sidecar's Windows limitation (uploads wait for the game to close).
 4. GameCube adapters: `gc.card` (raw images) and `gc.gci` (GCI folders) (§25).
-5. The Android AAR: Kotlin API, Keystore-backed settings, lifecycle hooks, shared by the Android
+5. The Android AAR (§26): Kotlin API, Keystore-backed settings, lifecycle hooks, shared by the Android
    integrations below instead of each copying ARMSX2's.
 6. **Dolphin integration**, desktop and Android (one codebase; Android keeps its data in
    app-specific storage, so no SAF).
@@ -1683,3 +1685,90 @@ Squadron II: Rogue Leader, USA), with copies of those cards:
   inserted into the chosen file name opened a new blank card, a slot path kept by a slot set to
   Nothing blocked the card from the other slot, and loading a save state taken with a raw card
   replaced the GCI folder set for the slot.
+
+## 26. Implementation notes (Android AAR)
+
+`bindings/android` is a Gradle build whose `:emusync` module produces the AAR, roadmap item 5:
+what an Android integration shares, so the next ones (Dolphin, PPSSPP) don't copy ARMSX2's.
+
+### 26.1 The host's native code owns the client
+
+§10.2 sketched a Kotlin API that creates the client and is the integration. The integrations
+built since put the client in the emulator's C++ core: it has to call the session hooks around
+its own card I/O (§6.4), PCSX2 and ARMSX2 share that code, and Dolphin will share one C++
+integration between desktop and Android. So the AAR does not wrap the C ABI for Kotlin, and has no
+JNI of its own:
+
+- **For the native code:** `libemusync.so` for each ABI and `emusync.h`, as a Prefab package
+  (26.2). A host's CMake build links it with `find_package(emusync REQUIRED CONFIG)` and
+  `emusync::emusync`, with no Rust toolchain; the AAR's `jni/` folder puts the library in the
+  APK.
+- **For the Kotlin side:** what ARMSX2's `MemcardSyncSettings` did, made generic (26.3): the
+  settings with their secrets in the Keystore, the data folder per storage, starting and stopping
+  sync in the background, and telling the native code when the app leaves the screen. It drives
+  the native side through `SyncBackend`, a small interface the host implements over its own JNI
+  (start with a config, stop, running, sync now, status, backgrounded).
+
+### 26.2 Building the AAR
+
+- **The library:** a task runs `scripts/build-android.sh`, the build CI checks (§21), for each
+  ABI (Gradle property `emusync.abis`, default `arm64-v8a,x86_64`; API 26; NDK 29.0.14206865
+  like ARMSX2) into a generated `jniLibs` directory of the variant. Cargo decides what to rebuild,
+  so the task always runs. On Windows it uses Git's bash (`emusync.bash` overrides it): a plain
+  `bash` there can be WSL's. Building the AAR therefore needs Rust with the Android targets;
+  using it doesn't.
+- **The Prefab package:** AGP's Prefab publishing only publishes libraries its own CMake build
+  links, and cargo links this one. So a task added with AGP's artifact API
+  (`SingleArtifact.AAR` transform) writes the package into the finished AAR:
+  `prefab/prefab.json` (schema 2, the workspace version), `prefab/modules/emusync/module.json`,
+  `include/emusync.h`, and `libs/android.<abi>/` with `abi.json` (API 26, NDK 29, STL `none`,
+  shared) and the unstripped library. The copies in `jni/` are the ones AGP strips for APKs.
+  Both pass `scripts/check-android-so.sh`.
+- **Consumers in the same build** can't take the Prefab package from the project, since it only
+  exists in the `.aar`, so `:prefab-test` depends on the `.aar` file. So does a host that copies
+  the `.aar` (CI uploads it as `emusync-aar`); a Maven publication is left for later. A file
+  dependency doesn't bring the AAR's own dependency, `androidx.lifecycle:lifecycle-process`, so
+  such a host adds it too.
+
+### 26.3 The Kotlin API
+
+Package `io.github.ilyalissoboi.emusync`, `minSdk` 26:
+
+- **`SyncSettings`:** on/off, storage address, access key ID and device name in
+  SharedPreferences; the secret access key and the encryption passphrase sealed with AES-GCM
+  under a non-exportable Android Keystore key, so a backup restored on another phone reads as
+  "not set". `dataDir(remoteUri)` is `noBackupFilesDir/emusync-<first 8 bytes of SHA-256 of the
+  address, hex>`, one folder per storage, never backed up (two installations sharing a device
+  identity would mix their logs). The preferences name and key alias are parameters, and ARMSX2's
+  (`memcard_sync`, `armsx2.memcardSync.secret`) keep its stored settings when it moves to the AAR.
+  `config(appVersion)` gives the `SyncConfig` to start with, or null when sync is off or
+  incomplete. `SyncConfig.toString()` hides the secret and the passphrase.
+- **`SyncController`:** `start()` (blocking), `startAsync`, `startInBackground` and `stopAsync`
+  run on one thread of the controller's, in order, each reading the settings when it runs; a
+  settings screen that closes right after a change can't cancel its restart. `start` stops sync
+  when the settings are off or incomplete, and turns a backend exception into the sentence it
+  returns. `attachToAppLifecycle()` follows `ProcessLifecycleOwner` (the app's first activity
+  started, its last one stopped) and calls `SyncBackend.setAppBackgrounded` on the main thread,
+  which must not block: what to do then depends on the emulator (ARMSX2 queues it behind the
+  CPU thread's card flush). A host that follows its own activity calls `setAppBackgrounded`
+  itself. A backend that reports `isAvailable = false` (a build without sync) is never called.
+
+### 26.4 Tests
+
+Instrumented, on CI's API 30 x86_64 emulator (`android-emulator` job, after the C smoke test):
+
+- `SyncSettingsTest`, with the real Keystore: defaults, trimming (not of the passphrase), that
+  no secret is in the preferences in the clear, removing values, a value whose key is gone (a
+  restored backup) reading as not set and being enterable again, and the data folder per
+  storage.
+- `SyncControllerTest`, against a fake backend: incomplete settings stop, complete ones start
+  with their config, errors come back as sentences, a build without sync is never called, async
+  starts run in order and report on the main thread, and lifecycle calls reach the backend on
+  the main thread.
+- `:prefab-test`, an app that consumes the `.aar` as a host would: its JNI library links
+  `emusync::emusync` through Prefab (CI checks its `DT_NEEDED` is the bare `libemusync.so`), the
+  APK packages both libraries, and its test loads them and creates and destroys a client in the
+  app's sandbox.
+
+Not done here: a Maven publication, WorkManager for uploads after the app is closed (roadmap
+item 13, when ARMSX2 moves to the AAR), and the SAF VFS (item 8).
