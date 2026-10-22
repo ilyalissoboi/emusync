@@ -1607,8 +1607,21 @@ Dolphin's `Card A` or `Card B` folder, and the format can always be given.
   integration (roadmap item 6), and a `dolphin` profile for the sidecar is left for later.
 - A GCI folder at a custom path is named only for its region (`X/USA`, §25.5) and needs the
   card name given; the Dolphin integration knows the slot and passes it.
-- Not done: a raw card that doesn't exist yet is not created (Dolphin creates it, formatted, on
-  first use).
+- **Missing cards are created for synced saves.** Dolphin creates a card or GCI folder the first
+  time a game uses it, so on a new device the card for a slot and region often doesn't exist
+  yet, and the game's first boot there would not see the saves made elsewhere. A format can
+  give the image of a new, empty container (`ContainerFormat::empty`): `gc.card` a card as
+  Dolphin makes one (2043 blocks, formatted now, Shift JIS for `*.JAP.raw`, a serial of its
+  own), `gc.gci` an empty folder. A scan that finds such a container missing (in unit mode, not
+  read-only) in a folder that exists reconciles it as empty, with the image hash `missing` rather
+  than one of an image, and `apply` creates it only if saves arrive for it and it is still
+  missing: one that appeared meanwhile is the usual "changed during sync". A container whose
+  folder is gone too is more likely on a drive that isn't mounted than new, and stays missing
+  rather than being created on the disk underneath (Dolphin creates `GC/` and `GC/<region>/` at
+  startup, so its cards' folders exist). Nothing is created
+  for a card nobody has saves for. A card file deleted after syncing is the same case: its
+  local records are dropped and its saves come back from the cloud, so deleting the file
+  deletes no save anywhere. Other formats keep reporting a missing container.
 
 ### 25.5 How Dolphin handles cards
 

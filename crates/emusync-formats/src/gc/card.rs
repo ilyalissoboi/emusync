@@ -350,10 +350,34 @@ impl ContainerFormat for GcCard {
         Card::parse(&out)?;
         Ok(out)
     }
+
+    /// A card as Dolphin creates one when none exists: 2043 blocks (128 Mbit, its default size),
+    /// formatted now, with Shift JIS names for its Japanese cards (`*.JAP.raw`), and a serial of
+    /// its own. Copy-protected saves written to it get that serial (see the module docs).
+    fn empty(&self, file_name: &str) -> Option<Vec<u8>> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs())
+            .saturating_sub(super::GC_EPOCH_UNIX as u64);
+        Some(blank_card(128, new_serial(file_name), now, file_name.contains(".JAP.")))
+    }
+}
+
+/// Twelve bytes that differ from card to card. A real card's serial comes from the console's
+/// flash ID; it only has to differ between cards for the copy-protected saves to tell them apart.
+fn new_serial(file_name: &str) -> [u8; 12] {
+    use std::hash::BuildHasher;
+    let mut out = [0u8; 12];
+    for chunk in out.chunks_mut(8) {
+        // A fresh RandomState is randomly keyed each time.
+        let h = std::collections::hash_map::RandomState::new().hash_one((file_name, std::time::SystemTime::now()));
+        chunk.copy_from_slice(&h.to_le_bytes()[..chunk.len()]);
+    }
+    out
 }
 
 /// A freshly formatted card, the way Dolphin formats one: header fields from the arguments
-/// (`serial` is the first 12 header bytes), empty directories and BATs. For tests and tools.
+/// (`serial` is the first 12 header bytes), empty directories and BATs.
 pub fn blank_card(mbit: u16, serial: [u8; 12], format_time: u64, shift_jis: bool) -> Vec<u8> {
     assert!(SIZES_MBIT.contains(&mbit));
     let blocks = mbit as usize * BLOCKS_PER_MBIT;
@@ -521,6 +545,22 @@ mod tests {
         set_be16(&mut chain, bat_at, s);
         set_be16(&mut chain, bat_at + 2, i);
         assert!(GcCard.validate(&chain).is_err());
+    }
+
+    /// A card emusync creates for synced saves: Dolphin's default size, valid and empty, with
+    /// Shift JIS names for a Japanese card and a serial of its own.
+    #[test]
+    fn new_cards_for_synced_saves() {
+        let usa = GcCard.empty("MemoryCardA.USA.raw").unwrap();
+        assert_eq!(usa.len(), 2048 * BLOCK);
+        GcCard.validate(&usa).unwrap();
+        assert!(names(&usa).is_empty());
+        assert_eq!(be16(&usa, 0x24), 0, "Windows-1252");
+        let jap = GcCard.empty("MemoryCardA.JAP.raw").unwrap();
+        assert_eq!(be16(&jap, 0x24), 1, "Shift JIS");
+        assert_ne!(usa[..12], jap[..12], "each card has its own serial");
+        let put = GcCard.apply(&usa, &[ApplyOp::Put(canonical(&save(b"GM8E", b"01", "m", 1, 1)))]).unwrap();
+        assert_eq!(names(&put), ["GM8E01-m"]);
     }
 
     /// Two saves whose chains share a block: deleting one would free the other's data.
