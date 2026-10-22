@@ -379,6 +379,44 @@ fn containers_and_card_modes() {
     }
 }
 
+/// ES_CF_REPLACE moves a card to another container on this device (a file card replaced by a
+/// folder card here; for Dolphin, a slot switched between a raw card and a GCI folder).
+#[test]
+fn replace_moves_a_card_to_another_container() {
+    let dev = Dev::new("windows", None, ES_POLICY_ASK);
+    let folder = dev.card.with_file_name("Mcd001");
+    std::fs::create_dir(&folder).unwrap();
+    std::fs::write(folder.join("_pcsx2_superblock"), b"").unwrap();
+    let loc = cstr(folder.to_str().unwrap());
+    let card = cstr("Mcd001");
+    let desc = |flags: u32| es_container_desc {
+        struct_size: std::mem::size_of::<es_container_desc>() as u32,
+        format: std::ptr::null(),
+        location: loc.as_ptr(),
+        platform: std::ptr::null(),
+        card: card.as_ptr(),
+        title_scope: std::ptr::null(),
+        flags,
+    };
+    let mut id = 0;
+    assert_eq!(unsafe { es_container_add(dev.c, &desc(0), &mut id) }, ES_E_INVALID_ARG, "the card has a container");
+
+    // Not while a session is open: the container it would replace may be the session's.
+    let (status, info) = dev.begin(0);
+    assert!(status == ES_OK || status == ES_OFFLINE, "{status}");
+    assert_eq!(unsafe { es_container_add(dev.c, &desc(ES_CF_REPLACE), &mut id) }, ES_E_BUSY);
+    unsafe { es_session_end(dev.c, info.id, 0) };
+
+    assert_eq!(unsafe { es_container_add(dev.c, &desc(ES_CF_REPLACE), &mut id) }, ES_OK);
+    assert!(dev.card.exists(), "the old container's file is left alone");
+    // The card is the folder's now: the file can't have it back without the flag.
+    assert_eq!(add(dev.c, &dev.card, None), Err(ES_E_INVALID_ARG));
+    // Adding the new location again is idempotent, with or without the flag.
+    let mut again = 0;
+    assert_eq!(unsafe { es_container_add(dev.c, &desc(ES_CF_REPLACE), &mut again) }, ES_OK);
+    assert_eq!(again, id);
+}
+
 #[test]
 fn session_begin_applies_before_the_emulator_opens_the_card() {
     let remote = memory();

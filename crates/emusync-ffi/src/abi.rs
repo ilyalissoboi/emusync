@@ -42,6 +42,7 @@ pub const ES_CRED_S3: i32 = 1;
 
 pub const ES_CF_READ_ONLY: u32 = 1 << 0;
 pub const ES_CF_NO_UPLOAD: u32 = 1 << 1;
+pub const ES_CF_REPLACE: u32 = 1 << 2;
 
 pub const ES_CFG_KNOWN_FLAGS: u32 = 0b111;
 pub const ES_SB_QUERY_RESUME_STATE: u32 = 1 << 0;

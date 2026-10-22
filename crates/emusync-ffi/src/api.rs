@@ -448,11 +448,16 @@ pub unsafe extern "C" fn es_container_add(
                 "per-game containers (title_scope) are not supported yet"
             }));
         }
-        if d.flags & !(ES_CF_READ_ONLY | ES_CF_NO_UPLOAD) != 0 {
+        if d.flags & !(ES_CF_READ_ONLY | ES_CF_NO_UPLOAD | ES_CF_REPLACE) != 0 {
             return Err(invalid(format!("unknown container flags {:#x}", d.flags)));
         }
         if d.flags & ES_CF_NO_UPLOAD != 0 {
             return Err(invalid("ES_CF_NO_UPLOAD is not supported yet"));
+        }
+        // The container it would replace may belong to a session, one that is still starting
+        // included, which no container may be taken from.
+        if d.flags & ES_CF_REPLACE != 0 && !lock(&client.shared.sessions).open.is_empty() {
+            return Err(ES_E_BUSY);
         }
         let desc = ContainerDesc {
             location: PathBuf::from(location),
@@ -460,6 +465,7 @@ pub unsafe extern "C" fn es_container_add(
             platform,
             card,
             read_only: d.flags & ES_CF_READ_ONLY != 0,
+            replace: d.flags & ES_CF_REPLACE != 0,
         };
         let (p, reply) = Pending::new();
         client.shared.queue.push(Cmd::AddContainer(desc, reply));

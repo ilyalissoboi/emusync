@@ -1254,6 +1254,13 @@ pins down §3.2, §6.4, §10 and §12:
    start one.
 10. **One client per data directory** per process (`ES_E_BUSY`), since two engines on one
     SQLite state would race on its sequence numbers and HLC.
+    **Moving a card** (added later, compatibly): a logical card has one container per device,
+    and adding a second one for it fails, unless the descriptor has `ES_CF_REPLACE`. Then the
+    old container is unregistered (its files are left alone) and the card continues at the new
+    location, which is scanned like any new container. Hosts whose card changes place use it, such as
+    a Dolphin slot switched between a raw card and a GCI folder (§25.4); the CLI doesn't, and
+    asks for another name. `ES_E_BUSY` while any session is open, since the replaced container
+    may be one of its own; the engine also refuses to move a card whose container is in use.
 11. **Build.** `crate-type = ["rlib", "staticlib"]`; the shared library is built with
     `cargo rustc -p emusync-ffi --lib --crate-type cdylib` (CI does this on every OS). Listing
     `cdylib` in `Cargo.toml` would make it collide on Windows with the `emusync` CLI binary,
@@ -1607,6 +1614,9 @@ Dolphin's `Card A` or `Card B` folder, and the format can always be given.
   integration (roadmap item 6), and a `dolphin` profile for the sidecar is left for later.
 - A GCI folder at a custom path is named only for its region (`X/USA`, §25.5) and needs the
   card name given; the Dolphin integration knows the slot and passes it.
+- A host that names its cards by slot and region (Dolphin's integration: `MemoryCardA.USA` for
+  slot A's USA card, raw or GCI) moves the card with `ES_CF_REPLACE` when the slot's type or
+  path changes (§20 item 10).
 - **Missing cards are created for synced saves.** Dolphin creates a card or GCI folder the first
   time a game uses it, so on a new device the card for a slot and region often doesn't exist
   yet, and the game's first boot there would not see the saves made elsewhere. A format can

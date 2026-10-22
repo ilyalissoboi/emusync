@@ -432,6 +432,7 @@ fn run(cli: Cli) -> AnyResult<ExitCode> {
                 platform: platform.clone(),
                 card: name.clone(),
                 read_only: *read_only,
+                replace: false,
             })?;
             let card = engine
                 .cards()?

@@ -314,7 +314,12 @@ ES_API es_status es_oauth_complete(es_client* c, const char* provider, const cha
 
 enum es_container_flags {
     ES_CF_READ_ONLY = 1u << 0,  /* upload from, never write to */
-    ES_CF_NO_UPLOAD = 1u << 1   /* receive only. Reserved: ES_E_INVALID_ARG in ABI version 1 */
+    ES_CF_NO_UPLOAD = 1u << 1,  /* receive only. Reserved: ES_E_INVALID_ARG in ABI version 1 */
+    ES_CF_REPLACE   = 1u << 2   /* the logical card already has a container on this device: move
+                                   it here (the old one is unregistered, its files left alone)
+                                   instead of failing. ES_E_BUSY while any session is open. For
+                                   hosts whose card can change place, like a Dolphin slot switched
+                                   between a raw card and a GCI folder. */
 };
 
 typedef struct es_container_desc {
@@ -337,8 +342,8 @@ typedef struct es_container_desc {
 
 /* Idempotent: re-adding the same location returns the existing id. Waits for the worker, and
    reads the container once to detect its format. ES_E_INVALID_ARG for an unknown format, a
-   directory that is not a folder card or GCI folder, or a logical card that already has a container on this
-   device. Publishes the logical card to the repository (in unit mode where an adapter exists,
+   directory that is not a folder card or GCI folder, or a logical card that already has a
+   container on this device (unless ES_CF_REPLACE, which moves the card here). Publishes the logical card to the repository (in unit mode where an adapter exists,
    else whole-file) unless it already exists, in which case the repository's mode is adopted. */
 ES_API es_status es_container_add(es_client* c, const es_container_desc* d, es_container_id* out);
 /* Unregisters a container (the file is left alone). Waits for the worker. ES_E_BUSY while a
