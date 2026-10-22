@@ -41,15 +41,21 @@ class SyncController(
     /**
      * Starts sync with the stored settings, or stops it when it is switched off or the settings
      * are incomplete. Blocks: never call it on the main thread. Returns null when sync is running
-     * or deliberately off, else a sentence for the user.
+     * or deliberately off, else a sentence for the user, including when stopping failed and sync
+     * may still be running.
      */
     @WorkerThread
     fun start(): String? {
         if (!isAvailable) return null
         val config = settings.config(appVersion)
         if (config == null) {
-            runCatching { backend.stop() }
-            return null
+            return runCatching { backend.stop() }.fold(
+                onSuccess = { null },
+                onFailure = { e ->
+                    Log.w(TAG, "stop failed", e)
+                    "Sync could not be stopped: ${e.message ?: e}"
+                },
+            )
         }
         return runCatching { backend.start(config) }.getOrElse { e ->
             Log.w(TAG, "start failed", e)
@@ -68,9 +74,11 @@ class SyncController(
     /** [start] in the background with nothing waiting for it, e.g. at app start. */
     fun startInBackground() = startAsync { error -> error?.let { Log.w(TAG, "not syncing: $it") } }
 
-    /** Stops sync, after any start already queued. Does not wait. */
+    /** Stops sync, after any start already queued. Does not wait; a failure is logged. */
     fun stopAsync() {
-        worker.execute { if (isAvailable) runCatching { backend.stop() } }
+        worker.execute {
+            if (isAvailable) runCatching { backend.stop() }.onFailure { Log.w(TAG, "stop failed", it) }
+        }
     }
 
     /** Asks for a sync now. */

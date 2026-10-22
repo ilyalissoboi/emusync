@@ -25,6 +25,7 @@ class SyncControllerTest {
         var started: SyncConfig? = null
         var startResult: String? = null
         var startError: Exception? = null
+        var stopError: Exception? = null
         @Volatile var running = false
 
         override fun start(config: SyncConfig): String? {
@@ -34,7 +35,11 @@ class SyncControllerTest {
             running = startResult == null
             return startResult
         }
-        override fun stop() { calls += "stop"; running = false }
+        override fun stop() {
+            calls += "stop"
+            stopError?.let { throw it }
+            running = false
+        }
         override val isRunning get() = running
         override fun syncNow() { calls += "syncNow" }
         override fun status() = "Synced just now"
@@ -76,6 +81,18 @@ class SyncControllerTest {
         settings.setEnabled(true)
         assertNull(controller.start())
         assertEquals(listOf("stop"), backend.calls)
+    }
+
+    /** Switched off while running, and the native side can't stop: the caller must hear of it. */
+    @Test
+    fun aFailedStopIsReported() {
+        val backend = FakeBackend().apply { stopError = IllegalStateException("worker stuck") }
+        val controller = SyncController(settings, backend, "1.0")
+        complete()
+        assertNull(controller.start())
+        settings.setEnabled(false)
+        assertEquals("Sync could not be stopped: worker stuck", controller.start())
+        assertTrue(controller.isRunning)
     }
 
     @Test

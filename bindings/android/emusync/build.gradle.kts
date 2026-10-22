@@ -56,7 +56,9 @@ dependencies {
 /**
  * Builds libemusync.so for each ABI with scripts/build-android.sh, the build CI checks
  * (scripts/check-android-so.sh), into `<outDir>/<abi>/libemusync.so`. Cargo decides what to
- * rebuild, so the task always runs; a no-op build takes about a second per ABI.
+ * rebuild, so the task always runs; a no-op build takes about a second per ABI. The output folder
+ * is emptied first: AGP packages all of it, and an ABI left from an earlier build with other
+ * `emusync.abis` would be packaged too, possibly out of date.
  */
 abstract class BuildEmusyncLibrary @Inject constructor(private val exec: ExecOperations) : DefaultTask() {
     @get:Input abstract val rustTargets: ListProperty<String>
@@ -73,9 +75,12 @@ abstract class BuildEmusyncLibrary @Inject constructor(private val exec: ExecOpe
     @TaskAction
     fun build() {
         val root = emusyncRoot.get().asFile
+        val out = outDir.get().asFile
+        out.deleteRecursively()
+        out.mkdirs()
         val args = mutableListOf(root.resolve("scripts/build-android.sh").path, "--api", apiLevel.get().toString())
         rustTargets.get().forEach { args += listOf("--target", it) }
-        args += listOf("--out", outDir.get().asFile.path)
+        args += listOf("--out", out.path)
         exec.exec {
             executable = bash.get()
             args(args)

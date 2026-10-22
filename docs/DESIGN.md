@@ -1713,8 +1713,9 @@ JNI of its own:
 
 - **The library:** a task runs `scripts/build-android.sh`, the build CI checks (§21), for each
   ABI (Gradle property `emusync.abis`, default `arm64-v8a,x86_64`; API 26; NDK 29.0.14206865
-  like ARMSX2) into a generated `jniLibs` directory of the variant. Cargo decides what to rebuild,
-  so the task always runs. On Windows it uses Git's bash (`emusync.bash` overrides it): a plain
+  like ARMSX2) into a generated `jniLibs` directory of the variant, emptied first so an ABI from
+  an earlier build with other ABIs isn't packaged too. Cargo decides what to rebuild, so the task
+  always runs. On Windows it uses Git's bash (`emusync.bash` overrides it): a plain
   `bash` there can be WSL's. Building the AAR therefore needs Rust with the Android targets;
   using it doesn't.
 - **The Prefab package:** AGP's Prefab publishing only publishes libraries its own CMake build
@@ -1747,7 +1748,7 @@ Package `io.github.ilyalissoboi.emusync`, `minSdk` 26:
   run on one thread of the controller's, in order, each reading the settings when it runs; a
   settings screen that closes right after a change can't cancel its restart. `start` stops sync
   when the settings are off or incomplete, and turns a backend exception into the sentence it
-  returns. `attachToAppLifecycle()` follows `ProcessLifecycleOwner` (the app's first activity
+  returns, a failed stop included (sync may still be running then). `attachToAppLifecycle()` follows `ProcessLifecycleOwner` (the app's first activity
   started, its last one stopped) and calls `SyncBackend.setAppBackgrounded` on the main thread,
   which must not block: what to do then depends on the emulator (ARMSX2 queues it behind the
   CPU thread's card flush). A host that follows its own activity calls `setAppBackgrounded`
