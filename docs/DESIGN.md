@@ -1725,7 +1725,7 @@ JNI of its own:
 ### 26.2 Building the AAR
 
 - **The library:** a task runs `scripts/build-android.sh`, the build CI checks (§21), for each
-  ABI (Gradle property `emusync.abis`, default `arm64-v8a,x86_64`; API 26; NDK 29.0.14206865
+  ABI (Gradle property `emusync.abis`, default `arm64-v8a,x86_64`; API 24; NDK 29.0.14206865
   like ARMSX2) into a generated `jniLibs` directory of the variant, emptied first so an ABI from
   an earlier build with other ABIs isn't packaged too. Cargo decides what to rebuild, so the task
   always runs. On Windows it uses Git's bash (`emusync.bash` overrides it): a plain
@@ -1735,18 +1735,20 @@ JNI of its own:
   links, and cargo links this one. So a task added with AGP's artifact API
   (`SingleArtifact.AAR` transform) writes the package into the finished AAR:
   `prefab/prefab.json` (schema 2, the workspace version), `prefab/modules/emusync/module.json`,
-  `include/emusync.h`, and `libs/android.<abi>/` with `abi.json` (API 26, NDK 29, STL `none`,
+  `include/emusync.h`, and `libs/android.<abi>/` with `abi.json` (API 24, NDK 29, STL `none`,
   shared) and the unstripped library. The copies in `jni/` are the ones AGP strips for APKs.
   Both pass `scripts/check-android-so.sh`.
 - **Consumers in the same build** can't take the Prefab package from the project, since it only
-  exists in the `.aar`, so `:prefab-test` depends on the `.aar` file. So does a host that copies
-  the `.aar` (CI uploads it as `emusync-aar`); a Maven publication is left for later. A file
+  exists in the `.aar`, so `:prefab-test` depends on the `.aar` file. So does a host: it
+  downloads the `.aar` of a release (26.5); a Maven publication is left for later. A file
   dependency doesn't bring the AAR's own dependency, `androidx.lifecycle:lifecycle-process`, so
   such a host adds it too.
 
 ### 26.3 The Kotlin API
 
-Package `io.github.ilyalissoboi.emusync`, `minSdk` 26:
+Package `io.github.ilyalissoboi.emusync`, `minSdk` 24 (Android 7, Dolphin's minimum). The
+library links only libc functions Android 7 has, but one: `getrandom` (Android 9), which is a
+weak reference the `getrandom` crate checks, falling back to the system call:
 
 - **`SyncSettings`:** on/off, storage address, access key ID and device name in
   SharedPreferences; the secret access key and the encryption passphrase sealed with AES-GCM
@@ -1786,3 +1788,11 @@ Instrumented, on CI's API 30 x86_64 emulator (`android-emulator` job, after the 
 
 Not done here: a Maven publication, WorkManager for uploads after the app is closed (roadmap
 item 13, when ARMSX2 moves to the AAR), and the SAF VFS (item 8).
+
+### 26.5 Releases
+
+A tag `vX.Y.Z` that matches the workspace version (`Cargo.toml`) runs `.github/workflows/release.yml`.
+It builds the AAR, checks it as CI does (the libraries, the header, and the Prefab version), and
+publishes a GitHub Release with `emusync-X.Y.Z.aar`, `emusync.h` and `SHA256SUMS`. A host pins a
+version and its checksum and downloads the `.aar` in its build, so neither the host's developers
+nor its CI need Rust. Tags are pushed by hand, after the commit they name has passed CI.

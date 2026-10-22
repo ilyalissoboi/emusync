@@ -23,7 +23,11 @@ val rustTargetForAbi = mapOf(
     "armeabi-v7a" to "armv7-linux-androideabi",
     "x86" to "i686-linux-android",
 )
-val minSdkLevel = 26
+/**
+ * Android 7, Dolphin's minimum. The library links only libc functions Android 7 has; its one newer
+ * one, getrandom (Android 9), is a weak reference the getrandom crate checks before calling.
+ */
+val minSdkLevel = 24
 val ndkVersionString = "29.0.14206865"
 
 /** The library version: the workspace's, from Cargo.toml. */

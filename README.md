@@ -351,7 +351,9 @@ cd bindings/android
 ./gradlew :emusync:assembleRelease       # emusync/build/outputs/aar/emusync-release.aar
 ```
 
-An app adds the `.aar` and the one library it depends on:
+Each release (a `vX.Y.Z` tag) publishes `emusync-X.Y.Z.aar` on the
+[Releases](https://github.com/ilyalissoboi/emusync/releases) page with its SHA-256; an app
+downloads a pinned version in its build. It adds the `.aar` and the one library it depends on:
 
 ```kotlin
 implementation(files("libs/emusync-release.aar"))
