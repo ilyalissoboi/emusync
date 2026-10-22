@@ -26,6 +26,8 @@ class SyncControllerTest {
         var startResult: String? = null
         var startError: Exception? = null
         var stopError: Exception? = null
+        /** Counted down by every stop, for tests that queue one with stopAsync(), which has no callback. */
+        val stopped = CountDownLatch(1)
         @Volatile var running = false
 
         override fun start(config: SyncConfig): String? {
@@ -37,6 +39,7 @@ class SyncControllerTest {
         }
         override fun stop() {
             calls += "stop"
+            stopped.countDown()
             stopError?.let { throw it }
             running = false
         }
@@ -63,6 +66,9 @@ class SyncControllerTest {
 
     @After
     fun cleanUp() {
+        // The context keeps handing out its cached instance after the file is deleted, with the old
+        // values: clear that too, synchronously.
+        context.getSharedPreferences(prefsName, Context.MODE_PRIVATE).edit().clear().commit()
         context.deleteSharedPreferences(prefsName)
         KeyStore.getInstance("AndroidKeyStore").apply { load(null) }.deleteEntry(keyAlias)
     }
@@ -152,6 +158,8 @@ class SyncControllerTest {
         controller.startAsync(report)
         controller.stopAsync()
         assertTrue(done.await(10, TimeUnit.SECONDS))
+        // The stop has no callback: it runs after the starts, possibly after their reports.
+        assertTrue(backend.stopped.await(10, TimeUnit.SECONDS))
         assertEquals(listOf(true, true, true), onMain)
         assertEquals("stop", backend.calls.last())
         assertEquals("start s3://two", backend.calls[backend.calls.size - 2])

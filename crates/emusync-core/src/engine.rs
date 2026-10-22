@@ -117,6 +117,10 @@ pub struct ContainerDesc {
     /// Logical card name; `None` = the file stem (`Mcd001.ps2` → `Mcd001`).
     pub card: Option<String>,
     pub read_only: bool,
+    /// A card that already has a container on this device moves to this location: the old
+    /// container is unregistered (left on disk) instead of the add failing. For hosts whose card
+    /// can change place, like a Dolphin slot switched between a raw card and a GCI folder.
+    pub replace: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -768,10 +772,17 @@ impl Engine {
         }
         let card_id = format!("{platform}:{name}");
         if let Some(c) = containers.iter().find(|c| c.card_id == card_id) {
-            return Err(Error::InvalidArg(format!(
-                "card {card_id} already has a container on this device ({}); pick another --name",
-                c.location
-            )));
+            if !desc.replace {
+                return Err(Error::InvalidArg(format!(
+                    "card {card_id} already has a container on this device ({}); pick another --name",
+                    c.location
+                )));
+            }
+            if self.busy.contains(c.id) {
+                return Err(Error::InvalidArg(format!("card {card_id} is in use at {}", c.location)));
+            }
+            log::info!("card {card_id} moves from {} to {loc}", c.location);
+            self.store.tx(|| self.store.delete_container(c.id))?;
         }
         let flags = if desc.read_only { CF_READ_ONLY } else { 0 };
         self.store.tx(|| {

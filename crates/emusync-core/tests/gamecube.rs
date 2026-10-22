@@ -236,6 +236,37 @@ fn a_deleted_card_comes_back_without_deleting_saves() {
     assert_eq!(pc.units().len(), 1, "the other device keeps the save");
 }
 
+/// A Dolphin slot switched from a raw card to a GCI folder: the card moves (`replace`), and the
+/// folder, empty at first, gets the card's saves.
+#[test]
+fn a_card_moves_from_a_raw_card_to_a_gci_folder() {
+    let remote = Arc::new(MemoryRemote::default());
+    let mut pc = Device::new(&remote, "windows", Layout::Raw);
+    let metroid = save(b"GM8E", b"01", "MetroidPrime A", 1, 1);
+    pc.game_writes(&[ApplyOp::Put(canonical(&metroid))]);
+    pc.engine.sync().unwrap();
+
+    let folder = pc.card.parent().unwrap().join("USA").join("Card A");
+    // Dolphin creates its region folders at startup; the card's own folder is created for it.
+    std::fs::create_dir_all(folder.parent().unwrap()).unwrap();
+    let desc = |replace| ContainerDesc {
+        location: folder.clone(),
+        format: Some("gc.gci".into()),
+        replace,
+        ..Default::default()
+    };
+    assert!(pc.engine.add_container(desc(false)).is_err(), "the card has a container");
+    pc.engine.add_container(desc(true)).unwrap();
+    let containers = pc.engine.containers().unwrap();
+    assert_eq!(containers.len(), 1);
+    assert_eq!(containers[0].format, "gc.gci");
+    assert!(pc.card.exists(), "the raw card is left on disk");
+
+    pc.engine.sync().unwrap();
+    let file = folder.join("01-GM8E-MetroidPrime A.gci");
+    assert_eq!(parse_gci(&std::fs::read(file).unwrap()).unwrap().data, metroid.data);
+}
+
 /// A card whose folder is gone too (a drive that isn't mounted, say) is not recreated on the
 /// disk underneath: it stays missing until its folder is back.
 #[test]
