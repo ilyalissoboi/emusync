@@ -12,7 +12,7 @@ android {
 
     defaultConfig {
         applicationId = "io.github.ilyalissoboi.emusync.prefabtest"
-        minSdk = 26
+        minSdk = 24
         targetSdk = 37
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         ndk {
