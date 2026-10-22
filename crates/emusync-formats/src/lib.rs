@@ -9,14 +9,17 @@
 //! - [`ps2::folder`] (`ps2.card.folder`): PCSX2 folder memory cards, with the same units.
 //! - [`gc::card`] (`gc.card`): GameCube memory card images (Dolphin's `.raw`), one unit per save.
 //! - [`gc::gci`] (`gc.gci`): Dolphin's GCI folders, with the same units.
+//! - [`psp`] (`psp.savedata`): a PSP memory stick's `SAVEDATA` folder, one unit per save folder.
 //!
 //! A container that is a directory on the host is handed to its adapter as a [`tree::Tree`]
-//! image ([`ContainerKind::Directory`]).
+//! image ([`ContainerKind::Directory`]), or, for a folder of save folders, as a tree image of
+//! the save folders the core is working on ([`ContainerKind::UnitDirs`]).
 
 use std::collections::BTreeMap;
 
 pub mod gc;
 pub mod ps2;
+pub mod psp;
 pub mod raw;
 pub mod tree;
 
@@ -24,6 +27,7 @@ pub use gc::card::GcCard;
 pub use gc::gci::GciFolder;
 pub use ps2::folder::Ps2Folder;
 pub use ps2::Ps2Card;
+pub use psp::PspSavedata;
 pub use raw::Raw;
 
 /// Name of the single unit of a container in whole-file mode (`ps2:Mcd001:@card`).
@@ -82,6 +86,11 @@ pub enum ContainerKind {
     File,
     /// A directory; the image is a [`tree::Tree`] of everything under it.
     Directory,
+    /// A directory whose subdirectories are the units, each named as its unit (a PSP
+    /// `SAVEDATA` folder). The core reads, checks and replaces each subdirectory on its own,
+    /// and leaves everything else in the directory alone (DESIGN §27). The adapter's image is a
+    /// [`tree::Tree`] of only the subdirectories at hand; in it, a unit is a root directory.
+    UnitDirs,
 }
 
 /// A container format. Mirrors the trait sketched in DESIGN §5, working on in-memory images.
@@ -118,6 +127,12 @@ pub trait ContainerFormat: Send + Sync {
     fn empty(&self, _file_name: &str) -> Option<Vec<u8>> {
         None
     }
+    /// [`ContainerKind::UnitDirs`] only: the size in bytes (all files in the subdirectory)
+    /// above which a subdirectory is not a unit: never read, synced, replaced or deleted. `None`:
+    /// no limit.
+    fn max_unit_size(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// Looks up an adapter by id.
@@ -128,18 +143,17 @@ pub fn by_id(id: &str) -> Option<&'static dyn ContainerFormat> {
         "ps2.card.folder" => Some(&Ps2Folder),
         "gc.card" => Some(&GcCard),
         "gc.gci" => Some(&GciFolder),
+        "psp.savedata" => Some(&PspSavedata),
         _ => None,
     }
 }
 
 /// Picks the adapter for a directory container from its [`tree::Tree`] image: a PCSX2 folder
-/// card (it has a `_pcsx2_superblock`), a Dolphin GCI folder (it has a valid `.gci` file), or
-/// nothing.
+/// card (it has a `_pcsx2_superblock`), a Dolphin GCI folder (it has a valid `.gci` file), a
+/// PSP `SAVEDATA` folder (a folder in it has a `PARAM.SFO`), or nothing.
 pub fn detect_dir(image: &[u8]) -> Option<&'static dyn ContainerFormat> {
-    if Ps2Folder.probe(image) == Confidence::Certain {
-        return Some(&Ps2Folder);
-    }
-    (GciFolder.probe(image) == Confidence::Certain).then_some(&GciFolder as &dyn ContainerFormat)
+    let dirs: [&'static dyn ContainerFormat; 3] = [&Ps2Folder, &GciFolder, &PspSavedata];
+    dirs.into_iter().find(|f| f.probe(image) == Confidence::Certain)
 }
 
 /// Picks the adapter for a card file: one whose format is recognised in the image, or whose

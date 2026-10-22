@@ -324,15 +324,17 @@ enum es_container_flags {
 
 typedef struct es_container_desc {
     uint32_t    struct_size;
-    const char* format;       /* "ps2.card", "ps2.card.folder", "gc.card", "gc.gci", "raw";
-                                 NULL = auto-detect (a PS2 card image or folder card, a GameCube
-                                 card image or Dolphin GCI folder, else "raw": whole-file only).
-                                 Reserved: "ps1.card", "sram", "dir". */
+    const char* format;       /* "ps2.card", "ps2.card.folder", "gc.card", "gc.gci",
+                                 "psp.savedata", "raw"; NULL = auto-detect (a PS2 card image or
+                                 folder card, a GameCube card image or Dolphin GCI folder, a PSP
+                                 memory stick's SAVEDATA folder by its name, else "raw":
+                                 whole-file only). Reserved: "ps1.card", "sram", "dir". */
     const char* location;     /* native path */
-    const char* platform;     /* "ps2", "ps1", "gc", ... ; NULL = inferred from format/extension */
+    const char* platform;     /* "ps2", "ps1", "gc", "psp", ... ; NULL = inferred from format/extension */
     const char* card;         /* logical card name, e.g. "Mcd001". NULL = the file or folder stem
                                  (a Dolphin GCI folder GC/USA/Card A: "MemoryCardA.USA", the raw
-                                 card's stem). Set it when stems differ between emulators. */
+                                 card's stem; a SAVEDATA folder: "SAVEDATA"). Set it when stems
+                                 differ between emulators. */
     const char* title_scope;  /* must be NULL in ABI version 1 (shared containers only): a
                                  per-game container returns ES_E_INVALID_ARG */
     uint32_t    flags;        /* es_container_flags */
@@ -341,8 +343,9 @@ typedef struct es_container_desc {
 #define ES_CONTAINER_DESC_INIT { sizeof(es_container_desc), NULL, NULL, NULL, NULL, NULL, 0u }
 
 /* Idempotent: re-adding the same location returns the existing id. Waits for the worker, and
-   reads the container once to detect its format. ES_E_INVALID_ARG for an unknown format, a
-   directory that is not a folder card or GCI folder, or a logical card that already has a
+   reads the container once to detect its format (not a SAVEDATA folder, which is known by its
+   name). ES_E_INVALID_ARG for an unknown format, a
+   directory that is not a folder card, GCI folder or SAVEDATA folder, or a logical card that already has a
    container on this device (unless ES_CF_REPLACE, which moves the card here). Publishes the logical card to the repository (in unit mode where an adapter exists,
    else whole-file) unless it already exists, in which case the repository's mode is adopted. */
 ES_API es_status es_container_add(es_client* c, const es_container_desc* d, es_container_id* out);

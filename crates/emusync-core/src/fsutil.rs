@@ -272,6 +272,26 @@ pub fn replace_dir(dir: &Path, tree: &Tree) -> io::Result<()> {
     finish(dir, &old, &journal)
 }
 
+/// Removes the directory `dir` as one step: it is renamed to `<dir>.emusync-old`, which is
+/// then deleted ([`recover_dir_replace`] deletes what an interruption leaves). A failed rename
+/// (on Windows, a file in it that another program holds open) leaves `dir` as it was.
+pub fn remove_dir(dir: &Path) -> io::Result<()> {
+    recover_dir_replace(dir)?;
+    let old = old_path(dir);
+    fs::rename(dir, &old)?;
+    if let Some(parent) = dir.parent() {
+        sync_dir(parent)?;
+    }
+    fs::remove_dir_all(&old)
+}
+
+/// Sets a directory's modification time, best effort (as [`write_tree`] does for those in it).
+pub fn set_dir_mtime(dir: &Path, secs: i64) {
+    if let Ok(f) = open_dir_for_times(dir) {
+        let _ = f.set_modified(system_time(secs));
+    }
+}
+
 fn finish(dir: &Path, old: &Path, journal: &Path) -> io::Result<()> {
     if let Some(parent) = dir.parent() {
         sync_dir(parent)?;
@@ -282,14 +302,18 @@ fn finish(dir: &Path, old: &Path, journal: &Path) -> io::Result<()> {
     fs::remove_file(journal)
 }
 
-/// Completes or discards a [`replace_dir`] that was interrupted. With a journal, the new tree
-/// was complete before anything was renamed, so the replace is rolled forward; without one,
-/// a leftover temp tree is incomplete and is removed.
+/// Completes or discards a [`replace_dir`] that was interrupted, or finishes a [`remove_dir`].
+/// With a journal, the new tree was complete before anything was renamed, so the replace is
+/// rolled forward; without one, a leftover temp tree is incomplete and is removed, and so is an
+/// old tree (only `remove_dir` leaves one without a journal).
 pub fn recover_dir_replace(dir: &Path) -> io::Result<()> {
     let (tmp, old, journal) = (temp_path(dir), old_path(dir), journal_path(dir));
     if !journal.exists() {
         if tmp.exists() {
             fs::remove_dir_all(&tmp)?;
+        }
+        if old.exists() {
+            fs::remove_dir_all(&old)?;
         }
         return Ok(());
     }

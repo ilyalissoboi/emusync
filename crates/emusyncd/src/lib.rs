@@ -113,10 +113,11 @@ enum RemoteCmd {
 #[derive(Subcommand)]
 enum CardCmd {
     /// Register a memory card: a card file (PS2 .ps2, GameCube .raw), a PCSX2 folder card (a
-    /// directory with a _pcsx2_superblock) or a Dolphin GCI folder (GC/<region>/Card A). The
-    /// logical card name defaults to the file stem, so Mcd001.ps2 on every device is the same
-    /// card, whether it is a file or a folder; a GCI folder GC/USA/Card A is MemoryCardA.USA, the
-    /// same card as Dolphin's MemoryCardA.USA.raw.
+    /// directory with a _pcsx2_superblock), a Dolphin GCI folder (GC/<region>/Card A) or a PSP
+    /// memory stick's PSP/SAVEDATA folder. The logical card name defaults to the file stem, so
+    /// Mcd001.ps2 on every device is the same card, whether it is a file or a folder; a GCI
+    /// folder GC/USA/Card A is MemoryCardA.USA, the same card as Dolphin's MemoryCardA.USA.raw;
+    /// every SAVEDATA folder is psp:SAVEDATA.
     Add {
         path: PathBuf,
         /// Logical card name (default: file stem, e.g. Mcd001).
@@ -312,11 +313,36 @@ fn target_of(unit: &str) -> String {
     }
 }
 
+/// A PSP `SAVEDATA` folder, one save folder at a time: it can hold GBs of game data.
+fn inspect_savedata(path: &Path) -> AnyResult<()> {
+    use emusync_core::unitdirs;
+    let fmt: &dyn emusync_formats::ContainerFormat = &emusync_formats::PspSavedata;
+    let max = fmt.max_unit_size();
+    let listing = unitdirs::list(path, max)?;
+    println!("{}: PSP memory stick saves, format {}", path.display(), fmt.id());
+    if listing.units.is_empty() {
+        println!("no saves");
+    }
+    for u in &listing.units {
+        for s in fmt.extract_all(&unitdirs::read_unit(path, &u.name)?.encode())? {
+            println!("  {:<32} {:>10}  {}", s.name, human_size(s.bytes.len() as u64), fmt.titles(&s.name).join(", "));
+        }
+    }
+    for name in &listing.oversize {
+        println!("  {name:<32} over {}, not synced (game data?)", human_size(max.unwrap_or_default()));
+    }
+    Ok(())
+}
+
 fn inspect(path: &Path) -> AnyResult<()> {
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    if path.is_dir() && emusync_formats::psp::is_savedata_folder(&name) {
+        return inspect_savedata(path);
+    }
     let (image, fmt) = if path.is_dir() {
         let image = emusync_core::fsutil::read_tree(path)?.encode();
         let fmt = emusync_formats::detect_dir(&image).ok_or(
-            "not a memory card folder: neither a PCSX2 folder card (no _pcsx2_superblock) nor a Dolphin GCI folder (no .gci files)",
+            "not a memory card folder: not a PCSX2 folder card (no _pcsx2_superblock), a Dolphin GCI folder (no .gci files) or a PSP SAVEDATA folder",
         )?;
         (image, fmt)
     } else {
