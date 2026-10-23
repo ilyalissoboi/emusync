@@ -841,7 +841,7 @@ checksum = "0e9c71c2167ca323c882b99918929403426e2373ea17242ff5653e0d5e1058be"
 
 [[package]]
 name = "emusync-core"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "argon2",
  "blake3",
@@ -866,7 +866,7 @@ dependencies = [
 
 [[package]]
 name = "emusync-ffi"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "cc",
  "emusync-core",
@@ -879,14 +879,14 @@ dependencies = [
 
 [[package]]
 name = "emusync-formats"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "emusync-remote"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "aws-credential-types",
  "aws-sigv4",
@@ -900,7 +900,7 @@ dependencies = [
 
 [[package]]
 name = "emusyncd"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "clap",

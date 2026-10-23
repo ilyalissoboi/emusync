@@ -1803,10 +1803,21 @@ item 13, when ARMSX2 moves to the AAR), and a Kotlin SAF implementation of `es_v
 ### 26.5 Releases
 
 A tag `vX.Y.Z` that matches the workspace version (`Cargo.toml`) runs `.github/workflows/release.yml`.
-It builds the AAR, checks it as CI does (the libraries, the header, and the Prefab version), and
-publishes a GitHub Release with `emusync-X.Y.Z.aar`, `emusync.h` and `SHA256SUMS`. A host pins a
-version and its checksum and downloads the `.aar` in its build, so neither the host's developers
-nor its CI need Rust. Tags are pushed by hand, after the commit they name has passed CI.
+It builds the AAR and checks it as CI does: the libraries, the header, and the Prefab version.
+Since 0.2.0 it also builds the desktop libraries with `scripts/build-desktop.sh` and checks
+them as CI's desktop job does. Then it publishes a GitHub Release with:
+
+- `emusync-X.Y.Z.aar`;
+- `emusync-X.Y.Z-windows-x64.zip`: `bin/emusync.dll` with its `.pdb`, `lib/emusync.lib` (the
+  import library), and `include/emusync.h`;
+- `emusync-X.Y.Z-linux-x86_64.tar.gz` and `emusync-X.Y.Z-macos-universal.tar.gz`: `lib/`
+  and `include/`;
+- `emusync.h` and `SHA256SUMS`.
+
+A host pins a version and its checksum, and downloads what it needs in its build. That way
+neither its developers nor its CI need Rust: Dolphin's Android build takes the AAR, and
+PPSSPP's Visual Studio build takes the Windows package. Tags are pushed by hand, after the
+commit they name has passed CI.
 
 ## 27. Implementation notes (PSP saves)
 

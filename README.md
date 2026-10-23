@@ -261,6 +261,11 @@ example; CI builds it on Windows (Visual Studio generator), macOS (universal) an
 smoke test against the deployed library, checks it, and uploads each package as a
 `libemusync-desktop-<os>` artifact.
 
+Each release (a `vX.Y.Z` tag, from 0.2.0) also publishes these packages, so a build can download
+a pinned one and check its SHA-256 instead of running cargo: `emusync-X.Y.Z-windows-x64.zip`,
+`emusync-X.Y.Z-linux-x86_64.tar.gz` and `emusync-X.Y.Z-macos-universal.tar.gz`, listed in the
+release's `SHA256SUMS`.
+
 ## Keeping an emulator's keys in the system's credential store
 
 An emulator that embeds emusync has S3 keys, and maybe an encryption passphrase, to keep between
