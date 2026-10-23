@@ -19,7 +19,7 @@ Android port does. Repositories can be [end-to-end encrypted](#end-to-end-encryp
 | Crate | Purpose |
 |---|---|
 | `emusync-core` | Data model, version DAG, SQLite state, sync engine |
-| `emusync-formats` | Container format adapters: `ps2.card` (PS2 memory card file system), `ps2.card.folder` (PCSX2 folder cards), `gc.card` (GameCube card images), `gc.gci` (Dolphin GCI folders), `psp.savedata` (PSP memory stick saves), `raw` |
+| `emusync-formats` | Container format adapters: `ps2.card` (PS2 memory card file system), `ps2.card.folder` (PCSX2 folder cards), `gc.card` (GameCube card images), `gc.gci` (Dolphin GCI folders), `psp.savedata` (PSP memory stick saves), `ps1.card` (PS1 memory cards: raw, `.gme`, `.mem`), `raw` |
 | `emusync-remote` | `Remote` trait, S3 backend (SigV4 + rustls), in-memory remote, conformance suite |
 | `emusync-ffi` | C ABI v1 (`include/emusync.h`): static library, or shared with `cargo rustc -p emusync-ffi --lib --crate-type cdylib` ([desktop](#building-for-windows-macos-and-linux), [Android](#building-for-android)) |
 | `emusyncd` | The `emusync` command-line tool, including the `emusync watch` sidecar; `emusyncw`, the same tool without a console window on Windows |

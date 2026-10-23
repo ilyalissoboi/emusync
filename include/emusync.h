@@ -350,10 +350,11 @@ enum es_container_flags {
 typedef struct es_container_desc {
     uint32_t    struct_size;
     const char* format;       /* "ps2.card", "ps2.card.folder", "gc.card", "gc.gci",
-                                 "psp.savedata", "raw"; NULL = auto-detect (a PS2 card image or
-                                 folder card, a GameCube card image or Dolphin GCI folder, a PSP
-                                 memory stick's SAVEDATA folder by its name, else "raw":
-                                 whole-file only). Reserved: "ps1.card", "sram", "dir". */
+                                 "psp.savedata", "ps1.card", "raw"; NULL = auto-detect (a PS2
+                                 card image or folder card, a GameCube card image or Dolphin GCI
+                                 folder, a PSP memory stick's SAVEDATA folder by its name, a PS1
+                                 card: raw, .gme or .mem, else "raw": whole-file only).
+                                 Reserved: "sram", "dir". */
     const char* location;     /* native path, or with es_config.vfs a location of the host's */
     const char* platform;     /* "ps2", "ps1", "gc", "psp", ... ; NULL = inferred from format/extension */
     const char* card;         /* logical card name, e.g. "Mcd001". NULL = the file or folder stem

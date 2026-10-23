@@ -10,6 +10,8 @@
 //! - [`gc::card`] (`gc.card`): GameCube memory card images (Dolphin's `.raw`), one unit per save.
 //! - [`gc::gci`] (`gc.gci`): Dolphin's GCI folders, with the same units.
 //! - [`psp`] (`psp.savedata`): a PSP memory stick's `SAVEDATA` folder, one unit per save folder.
+//! - [`ps1`] (`ps1.card`): PlayStation memory cards (raw, DexDrive `.gme`, Connectix `.mem`), one
+//!   unit per save.
 //!
 //! A container that is a directory on the host is handed to its adapter as a [`tree::Tree`]
 //! image ([`ContainerKind::Directory`]), or, for a folder of save folders, as a tree image of
@@ -18,6 +20,7 @@
 use std::collections::BTreeMap;
 
 pub mod gc;
+pub mod ps1;
 pub mod ps2;
 pub mod psp;
 pub mod raw;
@@ -25,6 +28,7 @@ pub mod tree;
 
 pub use gc::card::GcCard;
 pub use gc::gci::GciFolder;
+pub use ps1::Ps1Card;
 pub use ps2::folder::Ps2Folder;
 pub use ps2::Ps2Card;
 pub use psp::PspSavedata;
@@ -144,6 +148,7 @@ pub fn by_id(id: &str) -> Option<&'static dyn ContainerFormat> {
         "gc.card" => Some(&GcCard),
         "gc.gci" => Some(&GciFolder),
         "psp.savedata" => Some(&PspSavedata),
+        "ps1.card" => Some(&Ps1Card),
         _ => None,
     }
 }
@@ -168,6 +173,13 @@ pub fn detect(file_name: &str, image: &[u8]) -> &'static dyn ContainerFormat {
     // A GameCube card is recognised by its header's checksum and size field (it has no magic).
     if GcCard.probe(image) == Confidence::Certain {
         return &GcCard;
+    }
+    // A PS1 card is recognised by its MC header and its checksum, whatever the file is called
+    // (RetroArch's Beetle and SwanStation keep theirs as `.srm`).
+    if Ps1Card.probe(image) == Confidence::Certain
+        || (infer_platform(file_name) == "ps1" && Ps1Card.probe(image) == Confidence::Maybe)
+    {
+        return &Ps1Card;
     }
     &Raw
 }
@@ -205,5 +217,10 @@ mod tests {
         let gc = gc::card::blank_card(4, [1; 12], 0, false);
         assert_eq!(detect("MemoryCardA.USA.raw", &gc).id(), "gc.card");
         assert_eq!(detect("SRAM.raw", &[0; 68]).id(), "raw");
+        let ps1 = ps1::blank_card();
+        assert_eq!(detect("shared_card_1.mcd", &ps1).id(), "ps1.card");
+        assert_eq!(detect("Beetle PSX.srm", &ps1).id(), "ps1.card");
+        assert_eq!(detect("epsxe000.mcr", &vec![0; ps1.len()]).id(), "ps1.card", "unformatted, by its name");
+        assert_eq!(detect("game.srm", &vec![0; ps1.len()]).id(), "raw", "128 KiB of cartridge SRAM");
     }
 }
