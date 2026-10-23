@@ -175,9 +175,10 @@ pub fn detect(file_name: &str, image: &[u8]) -> &'static dyn ContainerFormat {
         return &GcCard;
     }
     // A PS1 card is recognised by its MC header and its checksum, whatever the file is called
-    // (RetroArch's Beetle and SwanStation keep theirs as `.srm`).
+    // (RetroArch's Beetle and SwanStation keep theirs as `.srm`); an unformatted one by its
+    // name, or by the magic of a `.gme` or `.mem` container.
     if Ps1Card.probe(image) == Confidence::Certain
-        || (infer_platform(file_name) == "ps1" && Ps1Card.probe(image) == Confidence::Maybe)
+        || (Ps1Card.probe(image) == Confidence::Maybe && (infer_platform(file_name) == "ps1" || ps1::has_header(image)))
     {
         return &Ps1Card;
     }
@@ -222,5 +223,8 @@ mod tests {
         assert_eq!(detect("Beetle PSX.srm", &ps1).id(), "ps1.card");
         assert_eq!(detect("epsxe000.mcr", &vec![0; ps1.len()]).id(), "ps1.card", "unformatted, by its name");
         assert_eq!(detect("game.srm", &vec![0; ps1.len()]).id(), "raw", "128 KiB of cartridge SRAM");
+        let mut mem = b"VgsM".to_vec();
+        mem.resize(0x40 + ps1.len(), 0);
+        assert_eq!(detect("card.mem", &mem).id(), "ps1.card", "an unformatted Connectix card, by its magic");
     }
 }

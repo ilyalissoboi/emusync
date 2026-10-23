@@ -2074,7 +2074,10 @@ A card is 128 KB: 16 blocks of 8 KB, each 64 frames of 128 bytes. Block 0 is the
 - **States:** `0x51` first block of a save, `0x52` middle, `0x53` last. `0xA0` a block unused
   since formatting. `0xA1`, `0xA2`, `0xA3` a deleted save's blocks: the BIOS deletes a save
   by marking its entries and leaves its data, so it can be undeleted.
-- **Broken-sector list:** frames 16 to 35, with replacement data in 36 to 55. Kept as it is.
+- **Broken-sector list:** frames 16 to 35, with replacement data in 36 to 55: a sector listed
+  there is read from its replacement frame instead. Only a worn real card lists any (every
+  emulated card checked lists none), and emusync doesn't read through the list, so a card that
+  lists a sector isn't synced.
 - **Checksums:** each directory frame ends with the XOR of its other 127 bytes. They are
   written correctly, but a wrong one alone doesn't fail `validate`: DuckStation doesn't check
   them either, and a card that works in the emulator should sync.
@@ -2096,12 +2099,16 @@ and there was no real file to check it against.
 - each save's chain is well formed: links stay on the card, reach only `0x52`/`0x53` blocks,
   the last block is `0x53`, no loop, no block in two chains;
 - no in-use block outside a chain (a `0x52` whose first block is gone);
-- every save has a name, and no two saves have the same one.
+- every save has a name, and no two saves have the same one;
+- a save's size field is its chain's size (whole blocks), as the BIOS and emulators write it;
+  a canonical unit is held to the same;
+- the broken-sector list is empty.
 
 **Detection.** `probe` is `Certain` for a container whose header is `MC` with a correct
 checksum, `Maybe` for one of the three sizes that isn't formatted. `detect` tries it after the
 PS2 and GameCube adapters, by content, since RetroArch's PS1 cards are `.srm` files like
-cartridge SRAM; an unformatted file is `ps1.card` only with a PS1 extension.
+cartridge SRAM; an unformatted file is `ps1.card` only with a PS1 extension or inside a `.gme`
+or `.mem` container, known by its magic.
 
 **Writing** (`apply`), folded into one rewrite of the directory:
 

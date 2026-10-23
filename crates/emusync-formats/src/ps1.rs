@@ -44,6 +44,9 @@ const DELETED_FIRST: u32 = 0xA1;
 const DELETED_MIDDLE: u32 = 0xA2;
 const DELETED_LAST: u32 = 0xA3;
 const NO_NEXT: u16 = 0xFFFF;
+/// Frames of the broken-sector list, and the entry that lists no sector.
+const BROKEN_LIST: Range<usize> = 16..36;
+const NO_SECTOR: u32 = 0xFFFF_FFFF;
 
 // Directory entry fields.
 const STATE: Range<usize> = 0x00..0x04;
@@ -126,6 +129,11 @@ fn split(image: &[u8]) -> Result<(Variant, &[u8])> {
     Ok((v, &image[v.header_len()..]))
 }
 
+/// Whether an image is a `.gme` or `.mem` container by its size and magic, formatted or not.
+pub fn has_header(image: &[u8]) -> bool {
+    matches!(Variant::of(image), Some(Variant::Gme | Variant::Vgs))
+}
+
 fn formatted(card: &[u8]) -> bool {
     card.starts_with(b"MC")
 }
@@ -170,7 +178,8 @@ impl Save {
         self.data.len() / BLOCK
     }
 
-    /// Checks the save can go on a card: a name that fits, 1 to 15 whole blocks.
+    /// Checks the save can go on a card: a name that fits, 1 to 15 whole blocks, and a size
+    /// field that says so (the BIOS and every emulator write the chain's size there).
     pub fn check(&self) -> Result<()> {
         if self.name.is_empty() || self.name.len() > NAME.len() || self.name.contains(&0) {
             return Err(invalid(format!("save name {:?} doesn't fit a directory entry", self.unit_name())));
@@ -180,6 +189,14 @@ impl Save {
                 "save {:?} has {} bytes, not 1 to 15 blocks",
                 self.unit_name(),
                 self.data.len()
+            )));
+        }
+        if self.size as usize != self.data.len() {
+            return Err(invalid(format!(
+                "save {:?} has {} block(s), but its size field says {} bytes",
+                self.unit_name(),
+                self.blocks(),
+                self.size
             )));
         }
         Ok(())
@@ -195,6 +212,14 @@ impl Card {
     fn parse(card: &[u8]) -> Result<Card> {
         if !formatted(card) {
             return Err(invalid("the card is not formatted (its header has no MC)"));
+        }
+        // A listed sector's contents are in its replacement frame, not where the save's blocks
+        // say. Emulated cards never list one; only a worn real card does, and its saves would
+        // read wrong, so such a card isn't synced.
+        if let Some(f) = BROKEN_LIST.into_iter().find(|&f| le32(&card[f * FRAME..], 0..4) != NO_SECTOR) {
+            return Err(invalid(format!(
+                "the card lists broken sectors (frame {f}), which emusync doesn't read through: not synced"
+            )));
         }
         let mut owner: [Option<usize>; DATA_BLOCKS + 1] = [None; DATA_BLOCKS + 1];
         for b in 1..=DATA_BLOCKS {
@@ -241,6 +266,7 @@ impl Card {
             if save.name.is_empty() {
                 return Err(invalid(format!("the save in block {first} has no name")));
             }
+            save.check()?;
             if saves.iter().any(|(_, s)| s.name == save.name) {
                 return Err(invalid(format!("two saves named {:?}", save.unit_name())));
             }
@@ -718,6 +744,8 @@ mod tests {
             assert!(decode(&Canonical { bytes: c.bytes[..n].to_vec(), ..c.clone() }).is_err(), "truncated to {n}");
         }
         assert!(decode(&Canonical { name: "other".into(), ..c.clone() }).is_err());
+        let wrong_size = Save { size: BLOCK as u32, ..a.clone() };
+        assert!(decode(&canonical(&wrong_size)).is_err(), "a size field that isn't the data's");
         // A name of 21 characters has no NUL on the card, and still round-trips.
         let long = save("BASLUS-00067ABCDEFGHI", 1, 1);
         assert_eq!(long.name.len(), 21);
@@ -752,6 +780,12 @@ mod tests {
             ("last block not 0x53", set(&img, 3, &|e| e[0] = 0x52)),
             ("orphan block", set(&img, 1, &|e| e[NEXT].copy_from_slice(&NO_NEXT.to_le_bytes()))),
             ("no name", set(&img, 4, &|e| e[NAME].fill(0))),
+            (
+                "size field not the chain's",
+                set(&img, 1, &|e| e[SIZE].copy_from_slice(&(2 * BLOCK as u32).to_le_bytes())),
+            ),
+            ("size field not whole blocks", set(&img, 4, &|e| e[SIZE].copy_from_slice(&100u32.to_le_bytes()))),
+            ("a broken sector listed", set(&img, 20, &|e| e[0..4].copy_from_slice(&(64 + 3u32).to_le_bytes()))),
             ("same name twice", set(&img, 4, &|e| e[NAME][..13].copy_from_slice(b"BASLUS-00001A"))),
             ("shared block", {
                 // Block 4 (save b) also claims save a's second block.
