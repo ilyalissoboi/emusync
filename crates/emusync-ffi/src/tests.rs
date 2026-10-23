@@ -377,7 +377,7 @@ fn containers_and_card_modes() {
         d.flags = 0;
         d.struct_size = 4;
         assert_eq!(es_container_add(c, &d, &mut id), ES_E_ABI);
-        assert_eq!(add(c, &sram, Some("ps1.card")), Err(ES_E_INVALID_ARG), "format not in this build");
+        assert_eq!(add(c, &sram, Some("sram")), Err(ES_E_INVALID_ARG), "format not in this build");
 
         assert_eq!(es_container_remove(c, sid), ES_OK);
         assert_eq!(es_container_remove(c, sid), ES_E_NOT_FOUND);

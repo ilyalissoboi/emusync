@@ -36,6 +36,13 @@ fn dolphin_card_name(v: &dyn Vfs, dir: &str) -> Option<String> {
     formats::gc::gci::dolphin_card_name(&region, &folder)
 }
 
+/// Whether a card file that doesn't exist yet is a raw PS1 card by its name (`.mcd`, `.mcr`),
+/// so it is registered as `ps1.card` and created when saves arrive for it (DESIGN §29.3).
+fn missing_ps1_card(file_name: &str) -> bool {
+    let ext = file_name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
+    matches!(ext.as_str(), "mcd" | "mcr")
+}
+
 /// Reads a container's image: a file's bytes, or a directory as a tree image (DESIGN §19).
 /// With `recover`, an interrupted replace is completed first (for files, only through a VFS
 /// other than the native one, which replaces files with a journal too).
@@ -726,7 +733,9 @@ impl Engine {
     /// folder `<region>/Card A` is card `MemoryCardA.<region>` unless named, the same card as
     /// Dolphin's raw card `MemoryCardA.<region>.raw`. A folder named `SAVEDATA`, whether it
     /// exists yet or not, is a PSP memory stick's (`psp.savedata`, card `psp:SAVEDATA`), and is
-    /// not read here: it can hold GBs of game data.
+    /// not read here: it can hold GBs of game data. A PS1 card (`ps1.card`) is platform `ps1`
+    /// whatever its extension; one that doesn't exist yet is taken for a PS1 card if it is a
+    /// `.mcd` or `.mcr`.
     pub fn add_container(&mut self, desc: ContainerDesc) -> Result<i64> {
         let v = self.vfs();
         // A native path is made absolute; another VFS's location is taken as it is.
@@ -760,6 +769,8 @@ impl Engine {
             None => match v.read(&loc) {
                 Ok(image) => formats::detect(&file_name, &image).id().to_string(),
                 Err(_) if formats::infer_platform(&file_name) == "ps2" => "ps2.card".into(),
+                // DuckStation's and ePSXe's names for a card they haven't created yet.
+                Err(_) if missing_ps1_card(&file_name) => "ps1.card".into(),
                 Err(_) => "raw".into(),
             },
         };
@@ -788,6 +799,8 @@ impl Engine {
             "ps2.card.folder" => "ps2".to_string(),
             "gc.card" | "gc.gci" => "gc".to_string(),
             "psp.savedata" => "psp".to_string(),
+            // Whatever the file is called (Beetle's `.srm`).
+            "ps1.card" => "ps1".to_string(),
             _ => formats::infer_platform(&file_name).to_string(),
         });
         let name = match &desc.card {

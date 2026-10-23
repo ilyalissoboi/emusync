@@ -119,7 +119,7 @@ the host gets an error and the image is left alone.
 | Platform | Container formats (local) | Save unit | Title identity |
 |---|---|---|---|
 | PS2 | `.ps2` raw MCFS image (8–64 MB, with ECC); PCSX2 folder card | Root directory on the card (`BASLUS-20312…`) | Disc serial (`SLUS-20312`) |
-| PS1 | `.mcd`/`.mcr`/`.srm` raw 128 KB; `.gme`/`.vgs`/`.vmp` headered | Save block chain (1–15 blocks) | Serial in the block name |
+| PS1 | `.mcd`/`.mcr`/`.srm` raw 128 KB; `.gme`/`.mem` headered (§29) | Save: a chain of 1–15 blocks | Serial in the save's name |
 | GameCube | `.raw` card image; Dolphin GCI folder | GCI file | Game code + maker code |
 | Cartridge systems | `.srm`, `.sav`, `.eep`, `.fla` (RetroArch, mGBA, …) | The whole file, normalised | ROM hash (No-Intro SHA-1/CRC) |
 | PSP | `PSP/SAVEDATA` folder (§27) | Save folder (`ULUS10041S0`) | Product code (`ULUS10041`) |
@@ -158,8 +158,8 @@ Each format adapter turns a unit into a **canonical form**:
 - PS2: a sorted list of `(path, mode bits, size, bytes)` from the save directory. Directory and
   file timestamps are kept as **metadata** and left out of the content hash, so a game that
   rewrites identical bytes does not create a new version.
-- PS1: the save's data blocks in order, plus title/frame metadata. Block-link fields are
-  rebuilt on apply and left out of the hash.
+- PS1: the save's name and size field and its data blocks in chain order (§29.2). Where the
+  blocks are and the links between them are rebuilt on apply and left out of the hash.
 - Raw SRAM: the bytes with emulator-specific padding and trailers removed (for example mGBA's
   RTC footer or RetroArch's rounding to a power of two). The trailers are kept as metadata so
   they can be restored on the same emulator.
@@ -333,8 +333,8 @@ Every apply follows the same steps, whatever the format:
 
 ### 5.3 Other v1 and v2 adapters
 
-- `ps1.card`: raw 128 KB images plus headered variants. Units are block chains. Apply rebuilds
-  the directory frames and link fields.
+- `ps1.card`: raw 128 KB images and the DexDrive and Connectix headered variants. Units are
+  saves (block chains). Apply rebuilds the directory frames and link fields (§29).
 - `gc.card` / `gc.gci`: GameCube raw card images and Dolphin GCI folders, with the same units
   (§25).
 - `sram`: normalises cartridge save files between emulators (v2, with a quirk table for each
@@ -837,9 +837,11 @@ event and released explicitly. `es_abi_version()` lets a host refuse a mismatche
 Thor, against desktop PCSX2), end-to-end encryption (§22) with passphrase entry in ARMSX2's
 settings, the desktop build of the shared library (§23), host secrets in the system's
 credential store (§24), the PCSX2 desktop integration (the fork in `ilyalissoboi/pcsx2`; two-way
-sync verified against ARMSX2), the GameCube adapters (§25, ahead of M4), and the Android AAR
-(§26). **Open:** the SAF VFS and the C++ RAII wrapper `bindings/cpp/emusync.hpp`; the roadmap
-below orders them.
+sync verified against ARMSX2), the GameCube adapters (§25, ahead of M4), the Android AAR
+(§26), and the SAF VFS (§28). **Open:** the C++ RAII wrapper `bindings/cpp/emusync.hpp`. Ahead
+of M4, also done: the Dolphin integration (desktop and Android, the fork in
+`ilyalissoboi/dolphin`), PSP saves (§27) and the PPSSPP integration (`ilyalissoboi/ppsspp`,
+desktop and Android, verified between Windows and an AYN Thor), and the PS1 adapter (§29).
 
 **Roadmap (October 2026).** Memory cards come before save states (M3). In this order, with the
 dependencies each item needs placed before it:
@@ -2054,3 +2056,122 @@ On SAF, `set_mtime` is NULL, so a file written by emusync keeps the time it was 
   - The C layout test covers `es_vfs` and `es_vfs_stat`.
 
 Not done here: a host implementation. PPSSPP's comes with its integration (item 9).
+
+## 29. Implementation notes (PS1 cards)
+
+One adapter, `emusync_formats::ps1` (`ps1.card`), checked against the PS1 memory card layout
+documented in psx-spx (nocash) and against what DuckStation reads and writes
+(`memory_card_image.cpp`, read for interoperability only: DuckStation's licence forbids reuse).
+
+### 29.1 The card
+
+A card is 128 KB: 16 blocks of 8 KB, each 64 frames of 128 bytes. Block 0 is the card's own:
+
+- **Header:** frame 0, `MC`. Frame 63 (the write test) is a copy of it.
+- **Directory:** frames 1 to 15, one entry for each data block 1 to 15. An entry has a state,
+  the save's size in bytes and its name (both only in the save's first block), and the next
+  block of the save's chain (`0xFFFF` at the end).
+- **States:** `0x51` first block of a save, `0x52` middle, `0x53` last. `0xA0` a block unused
+  since formatting. `0xA1`, `0xA2`, `0xA3` a deleted save's blocks: the BIOS deletes a save
+  by marking its entries and leaves its data, so it can be undeleted.
+- **Broken-sector list:** frames 16 to 35, with replacement data in 36 to 55: a sector listed
+  there is read from its replacement frame instead. Only a worn real card lists any (every
+  emulated card checked lists none), and emusync doesn't read through the list, so a card that
+  lists a sector isn't synced.
+- **Checksums:** each directory frame ends with the XOR of its other 127 bytes. They are
+  written correctly, but a wrong one alone doesn't fail `validate`: DuckStation doesn't check
+  them either, and a card that works in the emulator should sync.
+
+**Containers.** Every emulator that keeps a PS1 card as a file uses the raw 128 KB image:
+DuckStation (`.mcd`), ePSXe and mednafen (`.mcr`), Beetle and SwanStation in RetroArch
+(`.srm`), PCSX2 and ARMSX2. Two headered variants are read and written too, with their header
+kept: DexDrive's `.gme` (3904 bytes of header, `123-456-STD`) and Connectix Virtual Game
+Station's `.mem` (64 bytes, `VgsM`). A `.gme` header holds copies of the directory states and
+links, which are updated, and a description for each block, cleared when its block changes.
+PSP and PS3 `.VMP` cards are left for later: every write needs their signature recomputed,
+and there was no real file to check it against.
+
+**Validation** (a card that fails is never synced or written, §5 step 1):
+
+- the container is one of the three sizes, with the `.gme` or `.mem` magic for those;
+- the header starts with `MC` (an unformatted card fails);
+- every directory state is one of the seven above;
+- each save's chain is well formed: links stay on the card, reach only `0x52`/`0x53` blocks,
+  the last block is `0x53`, no loop, no block in two chains;
+- no in-use block outside a chain (a `0x52` whose first block is gone);
+- every save has a name, and no two saves have the same one;
+- a save's size field is its chain's size (whole blocks), as the BIOS and emulators write it;
+  a canonical unit is held to the same;
+- the broken-sector list is empty.
+
+**Detection.** `probe` is `Certain` for a container whose header is `MC` with a correct
+checksum, `Maybe` for one of the three sizes that isn't formatted. `detect` tries it after the
+PS2 and GameCube adapters, by content, since RetroArch's PS1 cards are `.srm` files like
+cartridge SRAM; an unformatted file is `ps1.card` only with a PS1 extension or inside a `.gme`
+or `.mem` container, known by its magic.
+
+**Writing** (`apply`), folded into one rewrite of the directory:
+
+- a deleted save's entries are marked `0xA1`/`0xA2`/`0xA3`, its data left, as the BIOS does;
+- a written save takes, in order: the blocks of the save it replaces, blocks unused since
+  formatting, then whole deleted saves. A deleted save is overwritten only whole, the rest of
+  its entries cleared, so nothing that can be undeleted runs into another save's blocks;
+- untouched saves keep their blocks and entries;
+- written entries are zeroed apart from their fields, with a fresh checksum;
+- `NoSpace` when the card's 15 blocks don't fit the save.
+
+### 29.2 Saves and their canonical form
+
+A save is identified by its name, up to 20 characters, as on the console: the BIOS refuses a
+second save with the same name. Its unit name is the name, bytes mapped one to one to
+Latin-1. A save's name is the game's serial behind a region code (`BA` America, `BE` Europe,
+`BI` Japan) and up to 8 characters of the game's own (`BASCUS-94163FF7-S01`). Its title key is
+the serial: `ps1:SCUS-94163`. A PocketStation program has `P` for the serial's `-`, and its key
+has the `-`.
+
+The canonical bytes are a magic (`ES-P1U01`), the 21-byte name field, the size field, and the
+data blocks in chain order. Those are what the game wrote: the first block starts with the
+title frame (`SC`, icon flag, Shift JIS title, palette), then the icons and the data. Nothing
+is moved to meta: a PS1 card keeps no times.
+
+### 29.3 In the core
+
+- Platform `ps1`, whatever the file's extension.
+- Card names are file stems, as elsewhere (§2.1). Emulators name their cards differently
+  (DuckStation's `shared_card_1.mcd`, ePSXe's `epsxe000.mcr`, RetroArch's `<game>.srm`), so
+  matching two of them needs the card name given, which the sidecar profile (roadmap item 11)
+  will do for DuckStation.
+- **Missing cards are created** (as in §25.4): DuckStation formats a card in memory when its
+  file doesn't exist and writes it on the first save, so `empty` gives a card formatted the way
+  DuckStation does it. A `.mcd` or `.mcr` that doesn't exist yet is registered as `ps1.card`. A
+  missing `.gme` or `.mem` stays missing.
+
+### 29.4 Tests
+
+- **Unit tests:**
+  - a blank card matches DuckStation's format (header checksum `0x0E`, a free entry's `0xA0`,
+    the write-test frame);
+  - title keys, including PocketStation names;
+  - round trips, replacing and deleting (the BIOS's deleted states, data kept);
+  - untouched saves keep their blocks, and unused blocks are used before deleted saves, which
+    go whole;
+  - full cards, and a 21-character name without its NUL;
+  - `.gme` and `.mem` keep their header, and a `.gme`'s directory copies and descriptions
+    follow;
+  - every corruption the reader refuses, and a wrong checksum alone accepted;
+  - a deleted save the BIOS partly overwrote is free space.
+- **`tests/ps1.rs`:**
+  - DuckStation's `.mcd` and RetroArch's `.srm`, bound to one card, sync both ways, deletions
+    included, and offline saves of different games merge;
+  - a DexDrive `.gme` syncs with a raw card and keeps its header;
+  - a missing `.mcr` is created for the saves synced to it.
+- **Real cards,** checked locally and not committed: 41 card files from DuckStation (its
+  `shared_card_1.mcd` and per-game cards), ePSXe, PCSX2, PCSX-R and RetroArch (Beetle's `.srm`
+  and `.mcr`), 19 saves on 5 of them, the rest formatted and empty.
+  - All were detected as `ps1.card` and validated.
+  - Re-putting every save of a card left the file byte for byte the same, so emusync writes
+    directory entries exactly as those emulators do.
+  - Copying all saves to a blank card, deleting one, and merging each card into the next (or
+    `NoSpace` when they didn't fit) kept every save.
+  - `emusync card inspect` lists them with their title keys, PocketStation-style names
+    (`BASLUSP00892…`) included.
