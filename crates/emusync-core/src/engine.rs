@@ -1997,6 +1997,9 @@ impl Engine {
     /// either finds its own earlier write or writes the same bytes.
     fn push(&self, remote: &dyn Remote, report: &mut SyncReport) -> Result<()> {
         let cipher = self.cipher()?;
+        // A rename is published even when nothing is queued; other devices pick it up with
+        // our next segment.
+        self.publish_device_json(remote, &self.device_id()?, false)?;
         let seg: PendingSegment = match self.store.meta("pending_segment")? {
             Some(s) => serde_json::from_str(&s)?,
             None => {
@@ -2020,7 +2023,7 @@ impl Engine {
         let seq = loop {
             let dev = self.device_id()?;
             let seq = self.next_seq()?;
-            self.ensure_device_json(remote, &dev)?;
+            self.publish_device_json(remote, &dev, true)?;
             let key = segment_key(&dev, seq);
             // Encrypted for the key it is written under; a fresh nonce on every attempt.
             let body = match cipher {
@@ -2080,24 +2083,63 @@ impl Engine {
         Ok(())
     }
 
-    fn ensure_device_json(&self, remote: &dyn Remote, dev: &str) -> Result<()> {
-        let flag = format!("device_json:{dev}");
-        if self.store.meta(&flag)?.is_some() {
+    /// Writes `devices/<dev>/device.json` when it doesn't carry the current device name: with
+    /// the first segment (`first`), create-only, and after a rename, as an overwrite of this
+    /// device's own object. The name last written is kept in meta, so this costs no request
+    /// while the name stays the same.
+    fn publish_device_json(&self, remote: &dyn Remote, dev: &str, first: bool) -> Result<()> {
+        let name = self.device_name()?;
+        let published_key = format!("device_json_name:{dev}");
+        let published = self.store.meta(&published_key)?;
+        if published.as_deref() == Some(name.as_str()) {
             return Ok(());
         }
-        let body = serde_json::json!({
-            "name": self.device_name()?,
-            "emulator": self.opts.emulator_id,
-            "os": std::env::consts::OS,
-            "created": Hlc { ms: Hlc::wall_ms(), counter: 0 }.to_string(),
-        });
+        // Written by a version that didn't record the name: rewrite it once.
+        let exists = published.is_some() || self.store.meta(&format!("device_json:{dev}"))?.is_some();
+        if !exists && !first {
+            return Ok(());
+        }
         let key = format!("devices/{dev}/device.json");
-        let body = match self.cipher()? {
-            Some(c) => c.seal(&key, body.to_string().as_bytes()),
-            None => body.to_string().into_bytes(),
+        // A rewrite keeps `created` and anything a newer version added; only the name changes.
+        let old = if exists { self.read_device_json(remote, dev)? } else { None };
+        let mut body = match old {
+            Some(serde_json::Value::Object(m)) => m,
+            _ => serde_json::Map::from_iter([
+                ("emulator".into(), self.opts.emulator_id.clone().into()),
+                ("os".into(), std::env::consts::OS.into()),
+                ("created".into(), Hlc { ms: Hlc::wall_ms(), counter: 0 }.to_string().into()),
+            ]),
         };
-        create_only(remote, &key, &body, self.conditional_writes)?;
-        self.store.set_meta(&flag, "1")
+        body.insert("name".into(), name.clone().into());
+        let body = serde_json::Value::Object(body).to_string();
+        let body = match self.cipher()? {
+            Some(c) => c.seal(&key, body.as_bytes()),
+            None => body.into_bytes(),
+        };
+        if exists {
+            remote.put(&key, &body, false)?;
+        } else {
+            create_only(remote, &key, &body, self.conditional_writes)?;
+        }
+        self.store.set_meta(&published_key, &name)
+    }
+
+    /// Another device's `device.json`, or `None` if it is missing, doesn't decrypt or isn't JSON.
+    fn read_device_json(&self, remote: &dyn Remote, dev: &str) -> Result<Option<serde_json::Value>> {
+        let key = format!("devices/{dev}/device.json");
+        let body = match (remote.get(&key)?, self.cipher()?) {
+            (Some(b), Some(c)) => c.open(&key, &b).ok(),
+            (b, _) => b,
+        };
+        Ok(body.and_then(|b| serde_json::from_slice(&b).ok()))
+    }
+
+    fn refresh_device_name(&self, remote: &dyn Remote, dev: &str) -> Result<()> {
+        let name = self.read_device_json(remote, dev)?.and_then(|v| v.get("name")?.as_str().map(str::to_string));
+        match name {
+            Some(name) => self.store.set_device_name(dev, &name),
+            None => Ok(()),
+        }
     }
 
     fn remint_device(&self, old: &str, seq: u64) -> Result<String> {
@@ -2133,21 +2175,13 @@ impl Engine {
             if dev == me || uuid::Uuid::parse_str(&dev).is_err() {
                 continue;
             }
-            if self.store.device_name(&dev)?.is_none() {
-                let key = format!("devices/{dev}/device.json");
-                let body = match (remote.get(&key)?, cipher) {
-                    (Some(b), Some(c)) => c.open(&key, &b).ok(),
-                    (b, _) => b,
-                };
-                if let Some(body) = body {
-                    let name = serde_json::from_slice::<serde_json::Value>(&body)
-                        .ok()
-                        .and_then(|v| v.get("name").and_then(|n| n.as_str()).map(str::to_string));
-                    if let Some(name) = name {
-                        self.store.set_device_name(&dev, &name)?;
-                    }
-                }
+            // A renamed device rewrites its `device.json` no later than its next segment, so a
+            // known name is re-read only after new segments arrived (DESIGN §16).
+            let known = self.store.device_name(&dev)?.is_some();
+            if !known {
+                self.refresh_device_name(remote, &dev)?;
             }
+            let mut fresh = false;
             let cursor = self.store.cursor(&dev)?;
             // Segments are numbered contiguously from 1. With delayed or out-of-order listing a
             // later segment can show up before an earlier one; stop at the gap rather than move
@@ -2164,6 +2198,7 @@ impl Engine {
                 }
                 let Some(mut body) = remote.get(&key)? else { break };
                 expected += 1;
+                fresh = true;
                 if let Some(c) = cipher {
                     // Not written with this repository's key (or altered): nothing in it can be
                     // trusted, so it is skipped like a malformed record.
@@ -2190,6 +2225,9 @@ impl Engine {
                     }
                     self.store.set_cursor(&dev, &key)
                 })?;
+            }
+            if fresh && known {
+                self.refresh_device_name(remote, &dev)?;
             }
         }
         Ok(())

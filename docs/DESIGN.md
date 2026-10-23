@@ -377,7 +377,7 @@ emusync/v1/
   repo.json                       format version, repo id, KDF params, wrapped key (if E2E)
   blobs/<hh>/<hash>               immutable zstd(+encrypted) chunks, content-addressed
   devices/<device-id>/
-    device.json                   name, platform, emulator, last-seen
+    device.json                   name, platform, emulator, created; rewritten on a rename
     log/<seq:016x>.ndjson         append-only log segments; each segment is immutable once written
     compact/<seq:016x>.json       optional snapshot of everything this device has published up to seq
 ```
@@ -436,7 +436,7 @@ operations are used:
 
 | Operation | Used for |
 |---|---|
-| `PutObject` with `If-None-Match: *` | Every write: blobs, log segments, compaction snapshots, `device.json`. Writes are create-only. |
+| `PutObject` with `If-None-Match: *` | Every write: blobs, log segments, compaction snapshots, the first `device.json`. Writes are create-only, except that a renamed device overwrites its own `device.json` (plain `PutObject`). |
 | `GetObject` | Fetching blobs, segments and snapshots |
 | `ListObjectsV2` with `prefix` + `start-after` | Finding new log segments past each device's cursor. Zero-padded hex sequence numbers make lexical order equal log order. |
 | `HeadObject` | Rare existence checks during repair |
@@ -459,7 +459,8 @@ rule on the server:
 
 **Consistency.** AWS S3 has strong read-after-write and list-after-write consistency, so a pull
 straight after another device's push sees it. Some S3-compatible services list with a delay.
-The protocol tolerates that, because every write is an append: an object that isn't visible
+The protocol tolerates that, because every write is an append (a renamed device's
+`device.json` aside, which is only a label): an object that isn't visible
 yet is fetched on the next cycle, and a missing object is never read as a deletion.
 
 **Credentials.**
@@ -911,16 +912,25 @@ Where the M0 code differs from or pins down the design above:
 7. **Lost responses.** A segment's body is fixed before the first upload attempt. On `412` the
    existing object is fetched and compared, so a write whose response was lost is not
    mistaken for a cloned device id.
-8. **Not yet implemented:** compaction snapshots and garbage collection (new devices replay
-   full logs), `device.json` last-seen updates (it is written once), sessions and leases
+8. **Device names.** `device.json` is written create-only before a device's first segment.
+   The name it last wrote is kept in the local meta (`device_json_name:<id>`); when the device
+   name differs (a rename through `EngineOptions::device_name`), the next push rewrites the
+   object over the old one, keeping its other fields, even if nothing else is queued. A data
+   directory from before the name was recorded rewrites it once. Other devices read a
+   `device.json` when they first see the device and again after a pull that read new segments
+   from it, so a quiet cycle costs no extra GET; a rename shows up elsewhere with the renamed
+   device's next upload, and relabels its earlier versions too. In an encrypted repository the
+   rewrite is sealed like every other object (§22).
+9. **Not yet implemented:** compaction snapshots and garbage collection (new devices replay
+   full logs), a last-seen time in `device.json`, sessions and leases
    (`Engine::set_busy` routes results to the inbox instead), the size+mtime fingerprint
    shortcut (cards are re-hashed each scan), and the FFI beyond version/status functions (now
    in §20).
-9. **Platform details.** HTTP is `ureq` 2 with rustls/ring. On Windows the atomic replace is
-   `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` (via `std::fs::rename`) rather than `ReplaceFileW`.
-   Devices are discovered with one delimiter LIST of `devices/` per cycle. The conditional-write
-   probe leaves a small `_probe/<uuid>` object.
-10. **CLI.** S3 credentials come from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` /
+10. **Platform details.** HTTP is `ureq` 2 with rustls/ring. On Windows the atomic replace is
+    `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` (via `std::fs::rename`) rather than `ReplaceFileW`.
+    Devices are discovered with one delimiter LIST of `devices/` per cycle. The conditional-write
+    probe leaves a small `_probe/<uuid>` object.
+11. **CLI.** S3 credentials come from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` /
     `AWS_SESSION_TOKEN` and are never stored. `emusync sync` defaults to the `ask` policy
     (`--policy newest` for unattended use).
 

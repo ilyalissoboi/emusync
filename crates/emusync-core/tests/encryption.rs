@@ -116,6 +116,13 @@ fn two_devices_sync_through_an_encrypted_repository() {
     let names: Vec<String> = b.engine.history("Mcd001").unwrap().into_iter().map(|e| e.device).collect();
     assert!(names.iter().any(|n| n == "windows"), "{names:?}");
 
+    // A rename rewrites device.json, still sealed, and reaches B with A's next segment.
+    a.engine = open(&a.data, "Living room PC");
+    a.engine.attach_remote(remote.clone());
+    a.engine.sync().unwrap();
+    let dev = format!("devices/{}/device.json", a.engine.device_id().unwrap());
+    assert!(!contains(&remote.raw_get(&dev).unwrap(), b"Living room PC"));
+
     // Edits flow both ways; only the changed chunks upload.
     let mut a2 = a1.clone();
     a2[300_000..300_064].copy_from_slice(&[7; 64]);
@@ -125,6 +132,8 @@ fn two_devices_sync_through_an_encrypted_repository() {
     let r = b.engine.sync().unwrap();
     assert_eq!(r.applied.len(), 1);
     assert_eq!(b.read(), a2);
+    let names: Vec<String> = b.engine.history("Mcd001").unwrap().into_iter().map(|e| e.device).collect();
+    assert_eq!(names, ["Living room PC"; 2], "{names:?}");
     let b3 = card_image(3);
     b.write(&b3);
     b.engine.sync().unwrap();
