@@ -1173,3 +1173,103 @@ fn a_host_vfs_holds_the_cards() {
     drop(phone);
     drop(mem);
 }
+
+/// A host VFS that can hold the worker inside a call, and counts calls.
+struct Gate {
+    mem: emusync_core::vfs::MemoryVfs,
+    hold: Mutex<bool>,
+    cv: Condvar,
+    inside: std::sync::atomic::AtomicBool,
+    calls: AtomicUsize,
+}
+
+impl Gate {
+    unsafe fn enter<'a>(u: *mut c_void) -> (&'a Gate, *mut c_void) {
+        let g = &*(u as *const Gate);
+        g.calls.fetch_add(1, Ordering::SeqCst);
+        let mut hold = g.hold.lock().unwrap();
+        while *hold {
+            g.inside.store(true, Ordering::SeqCst);
+            hold = g.cv.wait(hold).unwrap();
+        }
+        (g, &g.mem as *const _ as *mut c_void)
+    }
+}
+
+mod gated {
+    use super::*;
+    macro_rules! wrap {
+        ($name:ident($($arg:ident: $t:ty),*) -> $r:ty) => {
+            pub unsafe extern "C" fn $name(u: *mut c_void, $($arg: $t),*) -> $r {
+                let (_, m) = Gate::enter(u);
+                host::$name(m, $($arg),*)
+            }
+        };
+    }
+    wrap!(stat(p: *const c_char, out: *mut es_vfs_stat) -> c_int);
+    wrap!(list(p: *const c_char, cb: es_vfs_entry_fn, ctx: *mut c_void) -> c_int);
+    wrap!(read(p: *const c_char, sink: es_vfs_sink_fn, ctx: *mut c_void) -> c_int);
+    wrap!(write(p: *const c_char, data: *const c_void, len: usize) -> c_int);
+    wrap!(mkdir(p: *const c_char) -> c_int);
+    wrap!(rename(p: *const c_char, n: *const c_char) -> c_int);
+    wrap!(remove(p: *const c_char) -> c_int);
+    wrap!(join(d: *const c_char, n: *const c_char, out: *mut c_char, cap: usize) -> usize);
+    wrap!(parent(p: *const c_char, out: *mut c_char, cap: usize) -> usize);
+    wrap!(name(p: *const c_char, out: *mut c_char, cap: usize) -> usize);
+}
+
+/// `es_client_destroy` that times out while the worker is inside a VFS call waits for that
+/// call, and no VFS function is called once it has returned, though the worker goes on.
+#[test]
+fn no_vfs_call_after_destroy_returns() {
+    use emusync_core::vfs::{MemoryVfs, Vfs};
+    let gate = Box::new(Gate {
+        mem: MemoryVfs::with_root("/tree/memcards"),
+        hold: Mutex::new(false),
+        cv: Condvar::new(),
+        inside: false.into(),
+        calls: AtomicUsize::new(0),
+    });
+    gate.mem.write("/tree/memcards/Mcd001.ps2", &blank_card(8192, true, T)).unwrap();
+    let mut vfs = host_vfs(std::ptr::null());
+    vfs.user = &*gate as *const Gate as *mut c_void;
+    vfs.stat = Some(gated::stat);
+    vfs.list = Some(gated::list);
+    vfs.read = Some(gated::read);
+    vfs.write = Some(gated::write);
+    vfs.mkdir = Some(gated::mkdir);
+    vfs.rename = Some(gated::rename);
+    vfs.remove = Some(gated::remove);
+    vfs.join = Some(gated::join);
+    vfs.parent = Some(gated::parent);
+    vfs.name = Some(gated::name);
+    let dir = tempfile::tempdir().unwrap();
+    let data = cstr(dir.path().join("data").to_str().unwrap());
+    let mut cfg = config_init();
+    cfg.data_dir = data.as_ptr();
+    cfg.vfs = &vfs;
+    let mut c = std::ptr::null_mut();
+    assert_eq!(unsafe { es_client_create(&cfg, &mut c) }, ES_OK);
+    add(c, Path::new("/tree/memcards/Mcd001.ps2"), None).unwrap();
+
+    // The next VFS call holds the worker.
+    *gate.hold.lock().unwrap() = true;
+    assert_eq!(unsafe { es_sync_now(c) }, ES_PENDING);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !gate.inside.load(Ordering::SeqCst) {
+        assert!(Instant::now() < deadline, "the worker never called the VFS");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let client = c as usize;
+    let destroy = std::thread::spawn(move || unsafe { es_client_destroy(client as *mut Client, 50) });
+    // Destroy has timed out on the worker and waits for the call in progress.
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(!destroy.is_finished());
+    *gate.hold.lock().unwrap() = false;
+    gate.cv.notify_all();
+    destroy.join().unwrap();
+    let after = gate.calls.load(Ordering::SeqCst);
+    // The worker finishes its sync and shuts down without calling into the host again.
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(gate.calls.load(Ordering::SeqCst), after);
+}

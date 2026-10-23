@@ -129,10 +129,11 @@ pub unsafe extern "C" fn es_client_create(cfg: *const es_config, out: *mut *mut 
         let device_name = opt_str(cfg.device_name, "device_name")?;
         let emulator_id = opt_str(cfg.emulator_id, "emulator_id")?;
         opt_str(cfg.emulator_version, "emulator_version")?;
-        // Copied: the host keeps `user` and the functions valid until es_client_destroy.
+        // Copied: the host keeps `user` and the functions valid until es_client_destroy, which
+        // stops every call into them (HostVfs goes through the callback gate).
         let vfs = match unsafe { cfg.vfs.as_ref() } {
             None => None,
-            Some(v) => Some(Arc::new(crate::vfs::HostVfs::new(v).map_err(invalid)?)),
+            Some(v) => Some(Arc::new(crate::vfs::HostVfs::new(v, cb.clone()).map_err(invalid)?)),
         };
         let policy = match cfg.conflict_policy {
             ES_POLICY_ASK => ConflictPolicy::Ask,

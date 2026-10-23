@@ -26,8 +26,9 @@
  *    (normally nothing; at worst a network operation) and return ES_TIMEOUT, having had no
  *    effect, if it doesn't.
  *  - The library never calls into the host from its own threads except for: the log callback,
- *    the event `wake` notifier, and the credential provider. Callbacks must not throw or unwind,
- *    and must not call back into emusync. None runs after es_client_destroy returns.
+ *    the event `wake` notifier, the credential provider, and the VFS (es_vfs). Callbacks must
+ *    not throw or unwind, and must not call back into emusync. None runs after
+ *    es_client_destroy returns, which waits for one in progress.
  *  - No Rust panic crosses the ABI: an internal error returns ES_E_INTERNAL.
  */
 #ifndef EMUSYNC_H
@@ -182,7 +183,9 @@ typedef struct es_config {
     const char*        emulator_id;       /* e.g. "pcsx2", "armsx2", "emusyncd"; NULL = "emusync" */
     const char*        emulator_version;
     const es_vfs*      vfs;               /* NULL = native paths. Else copied: `user` and the
-                                             functions stay valid until es_client_destroy.
+                                             functions stay valid until es_client_destroy
+                                             returns; none is called after that, even if
+                                             the worker is still finishing a sync.
                                              ES_E_INVALID_ARG if a function but set_mtime is
                                              NULL. */
     es_conflict_policy conflict_policy;

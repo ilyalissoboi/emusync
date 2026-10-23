@@ -1987,6 +1987,10 @@ implementation; the AAR could ship one later, bridged through JNI.
 - **The host's side:** `es_client_create` copies the struct and checks that every function but
   `set_mtime` is set. The functions are called from the client's worker thread, one call at a
   time.
+- **After destroy:** every call goes through the client's callback gate, as the log callback
+  and the credential provider do. So none runs once `es_client_destroy` returns, even when its
+  timeout left the worker finishing a sync in the background; the worker then gets errors.
+  Destroy waits for a call in progress.
 - **`HostVfs` (`emusync-ffi/src/vfs.rs`)** adapts the struct to the trait.
 
 ### 28.4 What changes on storage without times
