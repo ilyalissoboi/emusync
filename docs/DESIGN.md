@@ -122,7 +122,7 @@ the host gets an error and the image is left alone.
 | PS1 | `.mcd`/`.mcr`/`.srm` raw 128 KB; `.gme`/`.vgs`/`.vmp` headered | Save block chain (1–15 blocks) | Serial in the block name |
 | GameCube | `.raw` card image; Dolphin GCI folder | GCI file | Game code + maker code |
 | Cartridge systems | `.srm`, `.sav`, `.eep`, `.fla` (RetroArch, mGBA, …) | The whole file, normalised | ROM hash (No-Intro SHA-1/CRC) |
-| PSP | `SAVEDATA/<dir>` | Directory | Directory prefix (`ULUS10041`) |
+| PSP | `PSP/SAVEDATA` folder (§27) | Save folder (`ULUS10041S0`) | Product code (`ULUS10041`) |
 | Anything else | Any file or directory | The whole file or directory (opaque) | Set by the host |
 
 ```
@@ -340,7 +340,8 @@ Every apply follows the same steps, whatever the format:
   (§25).
 - `sram`: normalises cartridge save files between emulators (v2, with a quirk table for each
   emulator).
-- `dir`: any directory tree as one unit (PSP `SAVEDATA/*`, Citra/Azahar and others).
+- `psp.savedata`: a PSP memory stick's `SAVEDATA` folder, one unit per save folder (§27).
+- `dir`: any directory tree as one unit (Citra/Azahar and others).
 - `raw`: any single file as one opaque unit. This always works, and it implements whole-file
   mode for cards (§2.1). For whole-file cards, apply still goes through the steps above, and
   step 1 runs the card's format adapter when one exists, so a corrupt image is never published or
@@ -852,7 +853,7 @@ dependencies each item needs placed before it:
    integrations below instead of each copying ARMSX2's.
 6. **Dolphin integration**, desktop and Android (one codebase; Android keeps its data in
    app-specific storage, so no SAF).
-7. PSP: a `SAVEDATA` adapter, one unit per save directory.
+7. PSP: the `psp.savedata` adapter, one unit per save folder, with folders of save folders in the core (§27).
 8. The SAF VFS (`es_vfs`): PPSSPP's Android memory stick can be a user-picked `content://` folder.
 9. **PPSSPP integration**, desktop and Android.
 10. PS1: the `ps1.card` adapter.
@@ -1807,3 +1808,116 @@ It builds the AAR, checks it as CI does (the libraries, the header, and the Pref
 publishes a GitHub Release with `emusync-X.Y.Z.aar`, `emusync.h` and `SHA256SUMS`. A host pins a
 version and its checksum and downloads the `.aar` in its build, so neither the host's developers
 nor its CI need Rust. Tags are pushed by hand, after the commit they name has passed CI.
+
+## 27. Implementation notes (PSP saves)
+
+Roadmap item 7: the `psp.savedata` adapter, and folders of save folders in the core.
+
+### 27.1 The memory stick
+
+As read in PPSSPP's source (`Core/Dialog/SavedataParam.cpp`):
+
+- **Saves:** a save is the folder `PSP/SAVEDATA/<gameName><saveName>`, for example
+  `ULUS10041S0`: the game's product code, then the name the game gives the save. It holds:
+  - `PARAM.SFO`: the title, the save's title and detail, its directory name, and a file list
+    with hashes;
+  - the icons and the background (`ICON0.PNG`, `ICON1.PMF`, `PIC1.PNG`, `SND0.AT3`);
+  - the game's data files.
+
+  A secure save is encrypted with the game's key, not the device's, so a copied folder loads on
+  another PSP or in PPSSPP. Some games also write folders there with their own file I/O.
+- **Install data:** game data installed from the disc (PPSSPP's `PSPGamedataInstallDialog`) goes
+  to the same folder, as `<gameName><dataName>`. Its `PARAM.SFO` has the same `CATEGORY "MS"` as
+  a save, but no file list. It is often hundreds of MB.
+- **Other files:** on Android, PPSSPP creates `SAVEDATA/.nomedia`.
+- **Cached `PARAM.SFO`:** PPSSPP caches each save's `PARAM.SFO` (`LoadCachedSFO`). The PPSSPP
+  integration (item 9) has to drop that cache when it replaces a save folder while the
+  emulator runs, or replace save folders only between sessions.
+
+### 27.2 The adapter (`psp.savedata`)
+
+- **Units:** a unit is a save folder, named as the folder. A folder whose first nine characters
+  are a product code (four capitals, five digits) has the title `psp:<code>`, for example
+  `psp:ULUS10041`.
+- **Canonical form:** the folder's tree image (§19.3), with paths relative to the folder and
+  every modification time zero, so the same save on two devices hashes the same.
+  - The times travel in the `psp.mtimes` meta, one line per entry (`<seconds> <path>`, the
+    folder itself as `.`).
+  - Apply restores them: PPSSPP and the PSP show a save's date from them.
+- **Registration:**
+  - A folder named `SAVEDATA`, in any case, is registered as `psp.savedata` by its name,
+    without being read, even if it doesn't exist yet.
+  - Its card is `psp:SAVEDATA` on every device.
+  - `empty()` gives an empty folder, so a missing `SAVEDATA` is created when saves arrive, if
+    its `PSP` folder exists (§25.4).
+- **What isn't a unit:**
+  - A folder over `MAX_SAVE_SIZE`, 32 MiB, is install data, not a save. Saves are rarely over
+    2 MB.
+  - Files directly in `SAVEDATA` aren't units either.
+
+  Neither is read, synced, replaced or deleted.
+
+### 27.3 Folders of save folders in the core (`ContainerKind::UnitDirs`)
+
+A §19 directory container is read whole on every scan and replaced whole on every apply. A
+memory stick can hold hundreds of saves and GBs of install data, so `SAVEDATA` is a third kind
+of container, whose subdirectories are the units. `emusync-core::unitdirs` handles each save
+folder on its own:
+
+- **Scan.**
+  - **Listing:** the folders are listed from file metadata alone: each folder's *signature*
+    is a BLAKE3 hash of every entry's path, kind, size and modification time (in ns).
+  - **Reads:** a folder is read and extracted only if its signature differs from the one
+    recorded when it was last read (the `unit_signatures` table), or if it has none.
+  - **Recent writes:** a folder with an entry modified in the last 3 s gets no recorded
+    signature, so the next scan reads it again (git's rule for racy timestamps).
+  - **Over the size limit:** a folder over the limit still counts as present, so a save that
+    grows past the limit isn't deleted on other devices.
+  - **The image hash:** the scan returns a hash of every folder's name and signature, in
+    place of the image hash.
+- **Apply.**
+  - **The check:** the listing's hash must still be the one the scan returned.
+  - **Each change, on its own:**
+    1. Read that save folder.
+    2. Run the adapter on an image holding only it.
+    3. Check the result holds exactly the version, or nothing for a deletion.
+    4. Keep a snapshot of the old save.
+    5. Replace the folder with `fsutil::replace_dir`, or remove it with `fsutil::remove_dir`:
+       a rename to `<name>.emusync-old`, then a delete.
+    6. Record the local unit and its new signature.
+
+    A change that fails holds back only itself.
+- **Recovery.**
+  - **At scan:** while the container isn't busy, each scratch sibling inside it
+    (`<name>.emusync-tmp`, `-old` or `-swap`) is recovered as in §19.3.
+  - **A leftover `-old`:** `recover_dir_replace` now also deletes an `-old` tree that has no
+    journal. Only `remove_dir` leaves one, since `replace_dir` writes its journal before it
+    renames anything.
+- **What the core does without reading every save:**
+  - It refuses whole-file mode for these containers.
+  - `cards()` and `emusync card inspect` list the save folders.
+- **Limit:** a save rewritten in place with every size and modification time unchanged isn't
+  seen until it changes again.
+  - The 3 s rule covers rewrites within one timestamp tick of the last read, even on FAT (2 s
+    ticks).
+  - It doesn't cover a game that writes the same size and then sets the old time back.
+    rsync's quick check makes the same trade.
+
+### 27.4 Tests
+
+- **Adapter (`psp.rs`):** units are the folders, with titles; times are meta and come back on
+  apply; put and delete; bad names and content are refused.
+- **`unitdirs`:**
+  - listing skips files, scratch folders and folders over the limit;
+  - signatures follow changes;
+  - folders are read, written and removed one by one;
+  - an interrupted removal is finished.
+- **Engine (`tests/psp.rs`):**
+  - two memory sticks exchange new, changed and deleted saves, while 33 MB of install data and
+    `.nomedia` stay untouched;
+  - a missing `SAVEDATA` is created;
+  - a folder with unchanged metadata isn't read again;
+  - whole-file mode is refused.
+
+Not done here: testing against PPSSPP itself, which comes with its integration (roadmap
+item 9), and Android's `content://` memory sticks (item 8).

@@ -8,7 +8,8 @@ Amazon S3 or any S3-compatible service: saves of different games played offline 
 devices merge without conflicts, and every save has its own version history. PCSX2 folder
 cards hold the same saves, so a folder card on one device syncs with a `.ps2` file on another.
 GameCube cards sync per save too, whether Dolphin keeps them as `.raw` images or GCI folders
-(see [GameCube cards](#gamecube-cards)). Other card formats sync as whole files (byte-identical mirrors). `emusync watch` keeps
+(see [GameCube cards](#gamecube-cards)), and so do PSP saves, one save folder at a time (see
+[PSP saves](#psp-saves)). Other card formats sync as whole files (byte-identical mirrors). `emusync watch` keeps
 unmodified PCSX2 in sync with no manual steps, and `emusync service install` starts it at
 every login. Emulators embed it through the C ABI (`include/emusync.h`, ABI v1), as the ARMSX2
 Android port does. Repositories can be [end-to-end encrypted](#end-to-end-encryption).
@@ -18,7 +19,7 @@ Android port does. Repositories can be [end-to-end encrypted](#end-to-end-encryp
 | Crate | Purpose |
 |---|---|
 | `emusync-core` | Data model, version DAG, SQLite state, sync engine |
-| `emusync-formats` | Container format adapters: `ps2.card` (PS2 memory card file system), `ps2.card.folder` (PCSX2 folder cards), `gc.card` (GameCube card images), `gc.gci` (Dolphin GCI folders), `raw` |
+| `emusync-formats` | Container format adapters: `ps2.card` (PS2 memory card file system), `ps2.card.folder` (PCSX2 folder cards), `gc.card` (GameCube card images), `gc.gci` (Dolphin GCI folders), `psp.savedata` (PSP memory stick saves), `raw` |
 | `emusync-remote` | `Remote` trait, S3 backend (SigV4 + rustls), in-memory remote, conformance suite |
 | `emusync-ffi` | C ABI v1 (`include/emusync.h`): static library, or shared with `cargo rustc -p emusync-ffi --lib --crate-type cdylib` ([desktop](#building-for-windows-macos-and-linux), [Android](#building-for-android)) |
 | `emusyncd` | The `emusync` command-line tool, including the `emusync watch` sidecar; `emusyncw`, the same tool without a console window on Windows |
@@ -69,6 +70,24 @@ device finds them. (`emusync card add` takes only a card that exists.) Saves are
 they are on (Phantasy Star Online, F-Zero GX) work on every card: emusync rewrites the card's
 serial into them as Dolphin does. Sync with Dolphin closed: it keeps the card in memory while a
 game runs. Details: [DESIGN §25](docs/DESIGN.md#25-implementation-notes-gamecube-cards).
+
+## PSP saves
+
+A PSP memory stick keeps each save in its own folder under `PSP/SAVEDATA` (`ULUS10041S0`: the
+game's product code and the save's name), on a real PSP and in PPSSPP alike. Every device's
+`SAVEDATA` folder is the same logical card, `psp:SAVEDATA`, and each save folder syncs on its
+own:
+
+```sh
+emusync card add ~/.config/ppsspp/PSP/SAVEDATA      # PPSSPP's memory stick on Linux
+emusync card inspect PSP/SAVEDATA                   # list the saves
+```
+
+Only the save folders that changed are read or written, so a memory stick full of saves stays
+quick to sync. Folders over 32 MiB are game data that games install from the disc, not saves:
+they are left alone and never uploaded. Files directly in `SAVEDATA` aren't synced either. A
+missing `SAVEDATA` folder is created when saves arrive, if its `PSP` folder exists. Details:
+[DESIGN §27](docs/DESIGN.md#27-implementation-notes-psp-saves).
 
 ## End-to-end encryption
 

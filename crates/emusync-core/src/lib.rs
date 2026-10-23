@@ -25,6 +25,7 @@ mod keystore;
 pub mod model;
 pub mod secrets;
 mod store;
+pub mod unitdirs;
 
 pub use crypto::KdfParams;
 pub use engine::LOCKED;

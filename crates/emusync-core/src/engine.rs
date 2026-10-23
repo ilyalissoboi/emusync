@@ -15,6 +15,7 @@ use crate::model::{
     content_id, parse_record, split_unit, unit_id, whole_file_unit, CardMode, CardRecord, LogRecord, VersionRecord,
 };
 use crate::store::{ContainerRow, LocalUnit, Store, StoredVersion, CF_READ_ONLY};
+use crate::unitdirs;
 use emusync_formats::{self as formats, ApplyOp, Canonical, ContainerFormat, ContainerKind, FormatError};
 use emusync_remote::{create_only, probe_conditional_writes, PutOutcome, Remote, RemoteError};
 use serde::{Deserialize, Serialize};
@@ -38,7 +39,9 @@ fn dolphin_card_name(dir: &Path) -> Option<String> {
 fn read_image(path: &Path, fmt: &dyn ContainerFormat, recover: bool) -> std::io::Result<Vec<u8>> {
     match fmt.kind() {
         ContainerKind::File => fs::read(path),
-        ContainerKind::Directory => {
+        // The engine works on each save folder of these on its own (`unitdirs`); this reads them
+        // all, for a caller that needs every unit.
+        ContainerKind::Directory | ContainerKind::UnitDirs => {
             if recover {
                 fsutil::recover_dir_replace(path)?;
             }
@@ -56,6 +59,11 @@ fn write_image(path: &Path, fmt: &dyn ContainerFormat, image: &[u8]) -> std::io:
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
             fsutil::replace_dir(path, &tree)
         }
+        // Never replaced whole: it holds folders that aren't units, written per unit instead.
+        ContainerKind::UnitDirs => Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            format!("{} is written one save folder at a time", path.display()),
+        )),
     }
 }
 
@@ -704,7 +712,9 @@ impl Engine {
     /// it has a `_pcsx2_superblock`, as a Dolphin GCI folder (`gc.gci`, platform `gc`) if it has
     /// a valid `.gci` file or is Dolphin's `Card A`/`Card B` folder, and refused otherwise. A GCI
     /// folder `<region>/Card A` is card `MemoryCardA.<region>` unless named, the same card as
-    /// Dolphin's raw card `MemoryCardA.<region>.raw`.
+    /// Dolphin's raw card `MemoryCardA.<region>.raw`. A folder named `SAVEDATA`, whether it
+    /// exists yet or not, is a PSP memory stick's (`psp.savedata`, card `psp:SAVEDATA`), and is
+    /// not read here: it can hold GBs of game data.
     pub fn add_container(&mut self, desc: ContainerDesc) -> Result<i64> {
         let location = std::path::absolute(&desc.location)?;
         let loc = location.to_string_lossy().into_owned();
@@ -715,6 +725,7 @@ impl Engine {
         let is_dir = location.is_dir();
         let format = match &desc.format {
             Some(f) => f.clone(),
+            None if formats::psp::is_savedata_folder(&file_name) && !location.is_file() => "psp.savedata".into(),
             None if is_dir => {
                 let image = fsutil::read_tree(&location)?.encode();
                 match formats::detect_dir(&image) {
@@ -736,7 +747,7 @@ impl Engine {
         };
         let fmt = formats::by_id(&format)
             .ok_or_else(|| Error::InvalidArg(format!("format {format:?} is not available in this build")))?;
-        if location.exists() && is_dir != (fmt.kind() == ContainerKind::Directory) {
+        if location.exists() && is_dir != (fmt.kind() != ContainerKind::File) {
             return Err(Error::InvalidArg(format!(
                 "{loc} is {}, which format {format:?} can't use",
                 if is_dir { "a directory" } else { "a file" }
@@ -758,11 +769,14 @@ impl Engine {
         let platform = desc.platform.clone().unwrap_or_else(|| match fmt.id() {
             "ps2.card.folder" => "ps2".to_string(),
             "gc.card" | "gc.gci" => "gc".to_string(),
+            "psp.savedata" => "psp".to_string(),
             _ => formats::infer_platform(&file_name).to_string(),
         });
         let name = match &desc.card {
             Some(n) => n.clone(),
             None if fmt.id() == "gc.gci" => dolphin_card_name(&location).unwrap_or_else(|| file_name.clone()),
+            // Every device's memory stick is the same card, whatever case its folder shows.
+            None if fmt.id() == "psp.savedata" => "SAVEDATA".to_string(),
             None => location.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
         };
         for (what, v) in [("platform", &platform), ("card name", &name)] {
@@ -819,6 +833,16 @@ impl Engine {
         }
         let containers: Vec<ContainerRow> =
             self.store.containers()?.into_iter().filter(|c| c.card_id == card_id).collect();
+        if mode == CardMode::WholeFile {
+            for c in &containers {
+                if self.format_of(c)?.kind() == ContainerKind::UnitDirs {
+                    return Err(Error::InvalidArg(format!(
+                        "{} is a folder of save folders, which syncs per save only",
+                        c.location
+                    )));
+                }
+            }
+        }
         if mode == CardMode::Units {
             for c in &containers {
                 if !self.format_of(c)?.supports_units() {
@@ -898,6 +922,13 @@ impl Engine {
             let c = containers.iter().find(|c| c.card_id == card_id);
             // What the card file holds right now, so saves that haven't synced yet show up too.
             let on_card: Option<HashMap<String, Vec<String>>> = match (c, mode) {
+                // Save folders are listed by name, without reading them.
+                (Some(c), CardMode::Units) if self.format_of(c)?.kind() == ContainerKind::UnitDirs => {
+                    let fmt = self.format_of(c)?;
+                    unitdirs::list(Path::new(&c.location), fmt.max_unit_size())
+                        .ok()
+                        .map(|l| l.units.iter().map(|u| (unit_id(&card_id, &u.name), fmt.titles(&u.name))).collect())
+                }
                 (Some(c), CardMode::Units) => self.format_of(c).ok().and_then(|fmt| {
                     let image = read_image(Path::new(&c.location), fmt, false).ok()?;
                     let units = fmt.extract_all(&image).ok()?;
@@ -1086,6 +1117,9 @@ impl Engine {
         }
         let path = Path::new(&c.location);
         let fmt = self.format_of(c)?;
+        if fmt.kind() == ContainerKind::UnitDirs {
+            return self.scan_unit_dirs(c, fmt, report);
+        }
         // An interrupted replace of a folder card is finished first, unless the emulator has it.
         let image = match read_image(path, fmt, !self.busy.contains(c.id)) {
             Ok(b) => b,
@@ -1164,6 +1198,83 @@ impl Engine {
             }
         }
         Ok(Some(content_id(&image)))
+    }
+
+    /// [`Self::scan`] for a folder of save folders (DESIGN §27): a save folder is read only if
+    /// its files' sizes or times changed since it was last read. Returns the hash of the listing
+    /// (names and signatures), which [`Self::apply_unit_dirs`] checks again.
+    fn scan_unit_dirs(
+        &self,
+        c: &ContainerRow,
+        fmt: &dyn ContainerFormat,
+        report: &mut SyncReport,
+    ) -> Result<Option<String>> {
+        let card_unit = whole_file_unit(&c.card_id);
+        let path = Path::new(&c.location);
+        let mut block = |kind, reason: String| {
+            report.blocked.push(Blocked { unit: card_unit.clone(), container: c.id, kind, reason });
+            Ok(None)
+        };
+        if self.card_mode(&c.card_id)? != CardMode::Units {
+            return block(BlockKind::Unsupported, "a folder of save folders syncs per save only".into());
+        }
+        if !path.is_dir() {
+            if !path.exists() && self.creatable(c, fmt)?.is_some() {
+                // As in `scan`: created by `apply` if saves arrive for it.
+                for (unit, _) in self.store.local_units_of(c.id)? {
+                    self.store.delete_local_unit(&unit, c.id)?;
+                }
+                return Ok(Some(MISSING_CREATABLE.to_string()));
+            }
+            return block(BlockKind::Missing, format!("{} is not a folder that exists", c.location));
+        }
+        let listed = if self.busy.contains(c.id) {
+            unitdirs::list(path, fmt.max_unit_size())
+        } else {
+            unitdirs::recover(path).and_then(|()| unitdirs::list(path, fmt.max_unit_size()))
+        };
+        let listing = match listed {
+            Ok(l) => l,
+            Err(e) if fsutil::is_locked(&e) => return block(BlockKind::Busy, LOCKED.into()),
+            Err(e) => return block(BlockKind::Io, format!("cannot read {}: {e}", c.location)),
+        };
+        // A folder over the limit is still there: one that grows past it isn't deleted elsewhere.
+        let mut present: HashSet<String> = listing.oversize.iter().map(|n| unit_id(&c.card_id, n)).collect();
+        for name in &listing.oversize {
+            let max = fmt.max_unit_size().unwrap_or_default() >> 20;
+            log::info!("{}: {name} is over {max} MiB, so it is not a save (game data?): not synced", c.location);
+        }
+        for u in &listing.units {
+            let unit = unit_id(&c.card_id, &u.name);
+            present.insert(unit.clone());
+            let known =
+                self.store.local_unit(&unit, c.id)?.is_some_and(|l| l.content_hash != ABSENT && l.base.is_some());
+            if known && u.settled && self.store.unit_signature(&unit, c.id)?.as_deref() == Some(u.signature.as_str()) {
+                continue;
+            }
+            let read = unitdirs::read_unit(path, &u.name)
+                .map_err(Error::from)
+                .and_then(|tree| Ok(fmt.extract_all(&tree.encode())?));
+            let canon = match read {
+                Ok(units) => units.into_iter().find(|x| x.name == u.name),
+                Err(e) => {
+                    let kind = match &e {
+                        Error::Io(io) if fsutil::is_locked(io) => BlockKind::Busy,
+                        Error::Io(_) => BlockKind::Io,
+                        _ => BlockKind::Invalid,
+                    };
+                    let reason = format!("cannot read {}: {e}", u.name);
+                    report.blocked.push(Blocked { unit, container: c.id, kind, reason });
+                    continue;
+                }
+            };
+            // Not a save, by the adapter.
+            let Some(canon) = canon else { continue };
+            self.snapshot_unit(c, &unit, &canon.bytes, canon.meta, fmt.titles(&u.name), report)?;
+            self.store.set_unit_signature(&unit, c.id, u.settled.then_some(u.signature.as_str()))?;
+        }
+        self.scan_deletions(c, &present, report)?;
+        Ok(Some(listing.manifest))
     }
 
     /// Saves that were on the card at the last sync and are gone now. Normally each becomes a
@@ -1458,6 +1569,9 @@ impl Engine {
         }
         let path = Path::new(&c.location);
         let fmt = self.format_of(c)?;
+        if fmt.kind() == ContainerKind::UnitDirs {
+            return self.apply_unit_dirs(c, fmt, image_hash, pending, online, report);
+        }
         // 1. Read the current container. It must still be what we scanned (and validated). A
         // missing one that the scan reconciled as empty is created by the write below.
         let mut creating = false;
@@ -1575,6 +1689,134 @@ impl Engine {
             Ok(())
         })?;
         for (unit, t) in applied {
+            report.applied.push(Applied { unit, version: t.rec.id, container: c.id, location: c.location.clone() });
+        }
+        Ok(())
+    }
+
+    /// [`Self::apply`] for a folder of save folders (DESIGN §27): each change replaces or
+    /// removes one save folder, crash-safely and on its own, so one that fails holds back only
+    /// itself. The folder's listing must still be what the scan saw.
+    fn apply_unit_dirs(
+        &self,
+        c: &ContainerRow,
+        fmt: &dyn ContainerFormat,
+        image_hash: &str,
+        pending: Vec<(String, StoredVersion)>,
+        online: bool,
+        report: &mut SyncReport,
+    ) -> Result<()> {
+        let path = Path::new(&c.location);
+        let mut creating = false;
+        match unitdirs::list(path, fmt.max_unit_size()) {
+            Ok(l) if l.manifest == image_hash => {}
+            Ok(_) => {
+                for (unit, _) in &pending {
+                    report.blocked.push(Blocked {
+                        unit: unit.clone(),
+                        container: c.id,
+                        kind: BlockKind::Changed,
+                        reason: "folder changed during sync; it will be snapshotted next cycle".into(),
+                    });
+                }
+                return Ok(());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && image_hash == MISSING_CREATABLE => {
+                if self.creatable(c, fmt)?.is_none() {
+                    return Err(e.into());
+                }
+                creating = true;
+            }
+            Err(e) if fsutil::is_locked(&e) => {
+                for (unit, t) in &pending {
+                    self.block(c, unit, &t.rec.id, BlockKind::Busy, LOCKED.into(), report)?;
+                }
+                return Ok(());
+            }
+            Err(e) => return Err(e.into()),
+        }
+        for (unit, t) in pending {
+            let name = split_unit(&unit).map(|(_, n)| n).unwrap_or_default().to_string();
+            let op = if t.rec.tombstone {
+                ApplyOp::Delete(name.clone())
+            } else {
+                match self.assemble(&t.rec, online) {
+                    Ok(bytes) => ApplyOp::Put(Canonical { name: name.clone(), bytes, meta: t.rec.meta.clone() }),
+                    Err(e) => {
+                        let reason = format!("content not available: {e}");
+                        self.block(c, &unit, &t.rec.id, BlockKind::Unavailable, reason, report)?;
+                        continue;
+                    }
+                }
+            };
+            // 1. The save folder as it is (none yet: an empty image).
+            let current = match unitdirs::read_unit(path, &name) {
+                Ok(tree) => tree.encode(),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => formats::tree::Tree::default().encode(),
+                Err(e) => {
+                    let kind = if fsutil::is_locked(&e) { BlockKind::Busy } else { BlockKind::Io };
+                    self.block(c, &unit, &t.rec.id, kind, format!("cannot read {name}: {e}"), report)?;
+                    continue;
+                }
+            };
+            // 2. The folder with the change.
+            let image = match fmt.apply(&current, std::slice::from_ref(&op)) {
+                Ok(i) => i,
+                Err(e) => {
+                    let reason = format!("cannot write this save: {e}");
+                    self.block(c, &unit, &t.rec.id, BlockKind::Invalid, reason, report)?;
+                    continue;
+                }
+            };
+            // 3. It holds exactly the version, or nothing for a deletion.
+            let got = fmt.validate(&image).and_then(|()| fmt.extract_all(&image));
+            let ok = match (&got, &op) {
+                (Ok(units), ApplyOp::Delete(_)) => units.is_empty(),
+                (Ok(units), ApplyOp::Put(_)) => {
+                    units.len() == 1 && units[0].name == name && content_id(&units[0].bytes) == t.rec.content
+                }
+                (Err(_), _) => false,
+            };
+            if !ok {
+                return Err(Error::Integrity(format!("rebuilt {name} in {} is not the expected save", c.location)));
+            }
+            // 4. Keep what we are about to overwrite.
+            if let Some(before) = fmt.extract_all(&current)?.into_iter().find(|u| u.name == name) {
+                let base = self.store.local_unit(&unit, c.id)?.and_then(|l| l.base);
+                self.snapshot(&unit, c.id, &before.bytes, base.as_deref())?;
+            }
+            // 5. Replace or remove the folder, unless the emulator took the container meanwhile.
+            let tree = formats::tree::Tree::decode(&image)?;
+            let written = self.busy.write_unless_busy(c.id, || {
+                if creating && !path.exists() {
+                    log::info!("creating {} for the saves synced to it", c.location);
+                    fs::create_dir(path)?;
+                }
+                match op {
+                    ApplyOp::Delete(_) => unitdirs::remove_unit(path, &name),
+                    ApplyOp::Put(_) => unitdirs::write_unit(path, &name, &tree),
+                }
+            });
+            let failure = match written {
+                None => Some((BlockKind::Busy, "container is in use".to_string())),
+                Some(Err(e)) => Some((BlockKind::Io, format!("cannot write {name} in {}: {e}", c.location))),
+                Some(Ok(())) => None,
+            };
+            if let Some((kind, reason)) = failure {
+                self.block(c, &unit, &t.rec.id, kind, reason, report)?;
+                continue;
+            }
+            // 6. Record it, with the folder's signature so the next scan needn't read it.
+            let signature = match t.rec.tombstone {
+                true => None,
+                false => unitdirs::settled_signature(path, &name).ok().flatten(),
+            };
+            self.store.tx(|| {
+                let wanted = if t.rec.tombstone { ABSENT } else { t.rec.content.as_str() };
+                self.store.set_local_unit(&unit, c.id, wanted, Some(&t.rec.id))?;
+                self.store.set_unit_signature(&unit, c.id, signature.as_deref())?;
+                self.store.inbox_remove(&unit, c.id)
+            })?;
             report.applied.push(Applied { unit, version: t.rec.id, container: c.id, location: c.location.clone() });
         }
         Ok(())

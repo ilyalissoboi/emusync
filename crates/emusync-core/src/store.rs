@@ -25,6 +25,12 @@ CREATE TABLE IF NOT EXISTS local_units (
     base_version TEXT,
     PRIMARY KEY (unit_id, container_id)
 );
+CREATE TABLE IF NOT EXISTS unit_signatures (
+    unit_id TEXT NOT NULL,
+    container_id INTEGER NOT NULL,
+    signature TEXT NOT NULL,
+    PRIMARY KEY (unit_id, container_id)
+);
 CREATE TABLE IF NOT EXISTS versions (
     id TEXT PRIMARY KEY,
     unit_id TEXT NOT NULL,
@@ -203,6 +209,7 @@ impl Store {
     pub fn delete_container(&self, id: i64) -> Result<()> {
         self.conn.execute("DELETE FROM containers WHERE id = ?1", [id])?;
         self.conn.execute("DELETE FROM local_units WHERE container_id = ?1", [id])?;
+        self.conn.execute("DELETE FROM unit_signatures WHERE container_id = ?1", [id])?;
         self.conn.execute("DELETE FROM inbox WHERE container_id = ?1", [id])?;
         self.conn.execute("UPDATE conflicts SET open = 0 WHERE container_id = ?1", [id])?;
         Ok(())
@@ -264,6 +271,34 @@ impl Store {
     pub fn delete_local_unit(&self, unit: &str, container: i64) -> Result<()> {
         self.conn
             .execute("DELETE FROM local_units WHERE unit_id = ?1 AND container_id = ?2", params![unit, container])?;
+        self.set_unit_signature(unit, container, None)
+    }
+
+    /// The file-metadata signature of a unit folder when its content was last read (DESIGN §27).
+    pub fn unit_signature(&self, unit: &str, container: i64) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT signature FROM unit_signatures WHERE unit_id = ?1 AND container_id = ?2",
+                params![unit, container],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Records a unit folder's signature; `None` forgets it, so the folder is read next time.
+    pub fn set_unit_signature(&self, unit: &str, container: i64, signature: Option<&str>) -> Result<()> {
+        match signature {
+            Some(s) => self.conn.execute(
+                "INSERT INTO unit_signatures (unit_id, container_id, signature) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(unit_id, container_id) DO UPDATE SET signature = excluded.signature",
+                params![unit, container, s],
+            )?,
+            None => self.conn.execute(
+                "DELETE FROM unit_signatures WHERE unit_id = ?1 AND container_id = ?2",
+                params![unit, container],
+            )?,
+        };
         Ok(())
     }
 
