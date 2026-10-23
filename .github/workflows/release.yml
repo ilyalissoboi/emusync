@@ -1,6 +1,10 @@
-# A GitHub Release for a version tag (vX.Y.Z, matching the workspace version in Cargo.toml),
-# with the Android AAR that hosts download by version and checksum (DESIGN §26.5):
-#   emusync-X.Y.Z.aar, emusync.h, SHA256SUMS
+# A GitHub Release for a version tag (vX.Y.Z, matching the workspace version in Cargo.toml), with
+# the libraries hosts download by version and checksum (DESIGN §26.5):
+#   emusync-X.Y.Z.aar                     Android (arm64-v8a, x86_64), the Kotlin API and Prefab
+#   emusync-X.Y.Z-windows-x64.zip         bin/emusync.dll, lib/emusync.lib, include/emusync.h
+#   emusync-X.Y.Z-linux-x86_64.tar.gz     lib/libemusync.so, include/emusync.h
+#   emusync-X.Y.Z-macos-universal.tar.gz  lib/libemusync.dylib (arm64, x86_64), include/emusync.h
+#   emusync.h, SHA256SUMS
 name: Release
 
 on:
@@ -11,11 +15,11 @@ permissions:
   contents: write
 
 jobs:
-  release:
-    name: Release ${{ github.ref_name }}
+  version:
+    name: Check the tag
     runs-on: ubuntu-latest
-    env:
-      NDK_VERSION: 29.0.14206865
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
       - name: The tag is the workspace version
@@ -27,6 +31,15 @@ jobs:
             exit 1
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  aar:
+    name: Android AAR
+    needs: version
+    runs-on: ubuntu-latest
+    env:
+      NDK_VERSION: 29.0.14206865
+    steps:
+      - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android, x86_64-linux-android
@@ -43,20 +56,88 @@ jobs:
       - name: Check the AAR
         run: |
           mkdir aar && unzip -q bindings/android/emusync/build/outputs/aar/emusync-release.aar -d aar
-          grep -q "\"version\":\"${{ steps.version.outputs.version }}\"" aar/prefab/prefab.json
+          grep -q "\"version\":\"${{ needs.version.outputs.version }}\"" aar/prefab/prefab.json
           cmp aar/prefab/modules/emusync/include/emusync.h include/emusync.h
           export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/$NDK_VERSION"
           scripts/check-android-so.sh aar/prefab/modules/emusync/libs/android.arm64-v8a/libemusync.so \
             aar/prefab/modules/emusync/libs/android.x86_64/libemusync.so \
             aar/jni/arm64-v8a/libemusync.so aar/jni/x86_64/libemusync.so
+      - name: Stage
+        run: |
+          mkdir dist
+          cp bindings/android/emusync/build/outputs/aar/emusync-release.aar "dist/emusync-${{ needs.version.outputs.version }}.aar"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-aar
+          path: dist/
+
+  # The desktop libraries, built and checked as CI's desktop job does (scripts/build-desktop.sh),
+  # for hosts whose build doesn't run cargo (PPSSPP's Visual Studio solution).
+  desktop:
+    name: Desktop (${{ matrix.name }})
+    needs: version
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            name: windows-x64
+            package_args: ""
+          - os: ubuntu-latest
+            name: linux-x86_64
+            package_args: ""
+          - os: macos-latest
+            name: macos-universal
+            package_args: --target aarch64-apple-darwin --target x86_64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.os == 'macos-latest' && 'aarch64-apple-darwin, x86_64-apple-darwin' || '' }}
+      - name: Build with scripts/build-desktop.sh
+        shell: bash
+        run: scripts/build-desktop.sh --out pkg ${{ matrix.package_args }}
+      - name: Check the library
+        shell: bash
+        run: |
+          cmp pkg/include/emusync.h include/emusync.h
+          case "$RUNNER_OS" in
+            Linux) scripts/check-desktop-lib.sh pkg/lib/libemusync.so ;;
+            macOS) scripts/check-desktop-lib.sh pkg/lib/libemusync.dylib "arm64 x86_64" ;;
+            Windows) test -f pkg/bin/emusync.dll && test -f pkg/lib/emusync.lib ;;
+          esac
+      - name: Archive
+        shell: bash
+        run: |
+          mkdir dist
+          name="emusync-${{ needs.version.outputs.version }}-${{ matrix.name }}"
+          if [ "$RUNNER_OS" = Windows ]; then
+            (cd pkg && 7z a -tzip "../dist/$name.zip" bin lib include > /dev/null)
+          else
+            tar -C pkg -czf "dist/$name.tar.gz" lib include
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.name }}
+          path: dist/
+
+  publish:
+    name: Publish ${{ github.ref_name }}
+    needs: [version, aar, desktop]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          v=${{ steps.version.outputs.version }}
-          mkdir dist
-          cp bindings/android/emusync/build/outputs/aar/emusync-release.aar "dist/emusync-$v.aar"
+          v=${{ needs.version.outputs.version }}
           cp include/emusync.h dist/
           (cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS)
           gh release create "$GITHUB_REF_NAME" dist/* --title "emusync $v" --notes \
-            "Android AAR (arm64-v8a, x86_64; minSdk 24): libemusync.so for the host's native code as jniLibs and a Prefab package, and the Kotlin API. See the README's \"The Android AAR\" section and DESIGN §26."
+            "Android AAR (arm64-v8a, x86_64; minSdk 24): libemusync.so for the host's native code as jniLibs and a Prefab package, and the Kotlin API. Desktop libraries: Windows x64 (emusync.dll and its import library), Linux x86_64 and macOS (universal). See the README and DESIGN §26.5."
