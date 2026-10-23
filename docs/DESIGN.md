@@ -377,7 +377,7 @@ emusync/v1/
   repo.json                       format version, repo id, KDF params, wrapped key (if E2E)
   blobs/<hh>/<hash>               immutable zstd(+encrypted) chunks, content-addressed
   devices/<device-id>/
-    device.json                   name, platform, emulator, last-seen
+    device.json                   name, platform, emulator, created; rewritten after a rename
     log/<seq:016x>.ndjson         append-only log segments; each segment is immutable once written
     compact/<seq:016x>.json       optional snapshot of everything this device has published up to seq
 ```
@@ -386,6 +386,7 @@ Log records (one JSON object per line):
 
 ```json
 {"op":"card","card":"ps2:Mcd001","mode":"units","hlc":"2026-10-12T19:40:00.000Z/0000"}
+{"op":"device","name":"AYN Thor","hlc":"2026-10-23T05:00:00.000Z/0000"}
 {"op":"version","unit":"ps2:Mcd001:BASLUS-20062GTA3","id":"b3:…","parents":["b3:…"],
  "content":"b3:…","chunks":["b3:…"],"size":91136,"meta":{"title":"GTA III","mtime":"…"},
  "hlc":"2026-10-18T11:02:07.120Z/0003","playtime_ms":5520000,"titles":["ps2:SLUS-20062"]}
@@ -436,7 +437,7 @@ operations are used:
 
 | Operation | Used for |
 |---|---|
-| `PutObject` with `If-None-Match: *` | Every write: blobs, log segments, compaction snapshots, `device.json`. Writes are create-only. |
+| `PutObject` with `If-None-Match: *` | Every write: blobs, log segments, compaction snapshots, the first `device.json`. Writes are create-only, except that a renamed device overwrites its own `device.json` (plain `PutObject`). |
 | `GetObject` | Fetching blobs, segments and snapshots |
 | `ListObjectsV2` with `prefix` + `start-after` | Finding new log segments past each device's cursor. Zero-padded hex sequence numbers make lexical order equal log order. |
 | `HeadObject` | Rare existence checks during repair |
@@ -459,7 +460,8 @@ rule on the server:
 
 **Consistency.** AWS S3 has strong read-after-write and list-after-write consistency, so a pull
 straight after another device's push sees it. Some S3-compatible services list with a delay.
-The protocol tolerates that, because every write is an append: an object that isn't visible
+The protocol tolerates that, because every write is an append (a renamed device's
+`device.json` aside, which is only a label): an object that isn't visible
 yet is fetched on the next cycle, and a missing object is never read as a deletion.
 
 **Credentials.**
@@ -911,16 +913,34 @@ Where the M0 code differs from or pins down the design above:
 7. **Lost responses.** A segment's body is fixed before the first upload attempt. On `412` the
    existing object is fetched and compared, so a write whose response was lost is not
    mistaken for a cloned device id.
-8. **Not yet implemented:** compaction snapshots and garbage collection (new devices replay
-   full logs), `device.json` last-seen updates (it is written once), sessions and leases
+8. **Device names.** `device.json` is written create-only before a device's first segment.
+   A rename (a different `EngineOptions::device_name` at `Engine::open`) is announced in the
+   device's own log, with a `{"op":"device","name":"…","hlc":"…"}` record queued at the next
+   push, even if nothing else is: the latest one in a log names that device, and its earlier
+   versions too. Other devices get it with the segment, so a rename costs them no request,
+   and it can't be lost to a `device.json` that isn't visible yet. Once the record is in a
+   segment under the device's id, the device rewrites its `device.json` (a plain overwrite,
+   keeping every field but `name`) for devices that join later and for earlier versions,
+   which skip the record. The order matters for a restored backup given another name: its
+   segment collides first, so it is reminted (§6.2) before it writes anything with the new
+   name, and the original's `device.json` stays its own. Local meta keeps the name last
+   logged (`logged_name:<id>`) and the name in `device.json` (`device_json_name:<id>`). A
+   data directory from before them has only the `device_json:<id>` flag; it logs its name
+   once and rewrites `device.json`. A device reads another's `device.json` when it doesn't
+   know the name yet, and once for every device after upgrading to this version
+   (`device_names_reread`), since it may have skipped `device` records before. In an
+   encrypted repository the record is inside the sealed segment and the rewrite is sealed
+   like every other object (§22).
+9. **Not yet implemented:** compaction snapshots and garbage collection (new devices replay
+   full logs), a last-seen time in `device.json`, sessions and leases
    (`Engine::set_busy` routes results to the inbox instead), the size+mtime fingerprint
    shortcut (cards are re-hashed each scan), and the FFI beyond version/status functions (now
    in §20).
-9. **Platform details.** HTTP is `ureq` 2 with rustls/ring. On Windows the atomic replace is
-   `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` (via `std::fs::rename`) rather than `ReplaceFileW`.
-   Devices are discovered with one delimiter LIST of `devices/` per cycle. The conditional-write
-   probe leaves a small `_probe/<uuid>` object.
-10. **CLI.** S3 credentials come from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` /
+10. **Platform details.** HTTP is `ureq` 2 with rustls/ring. On Windows the atomic replace is
+    `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` (via `std::fs::rename`) rather than `ReplaceFileW`.
+    Devices are discovered with one delimiter LIST of `devices/` per cycle. The conditional-write
+    probe leaves a small `_probe/<uuid>` object.
+11. **CLI.** S3 credentials come from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` /
     `AWS_SESSION_TOKEN` and are never stored. `emusync sync` defaults to the `ask` policy
     (`--policy newest` for unattended use).
 

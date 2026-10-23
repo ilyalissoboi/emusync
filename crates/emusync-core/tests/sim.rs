@@ -359,6 +359,15 @@ fn cloned_device_id_is_reminted() {
     assert_all_readable(&c, &c.versions());
     a.sync();
     assert_eq!(a.versions(), c.versions());
+
+    // The clone's other name went out under its new id only; the original keeps its own.
+    assert_eq!(a.device_json(&remote)["name"], "phone");
+    let names: Vec<(String, String)> =
+        c.engine.history("Mcd001").unwrap().into_iter().map(|e| (e.version.id, e.device)).collect();
+    let by_clone = clone_engine.history("Mcd001").unwrap().into_iter().find(|e| e.is_local).unwrap().version.id;
+    for (id, device) in names {
+        assert_eq!(device, if id == by_clone { "phone 2" } else { "phone" }, "{id}");
+    }
 }
 
 fn copy_dir(from: &Path, to: &Path) {
@@ -610,4 +619,118 @@ fn a_data_dir_stays_bound_to_its_remote() {
     a.engine.add_remote(a.link.clone()).expect("re-adding the same remote is fine");
     let err = a.engine.add_remote(Arc::new(OtherRemote(MemoryRemote::default()))).unwrap_err();
     assert!(err.to_string().contains("already bound"), "{err}");
+}
+
+impl Device {
+    /// Reopens the engine on the same data directory under another name, as an app does after
+    /// the user renames the device.
+    fn rename(&mut self, name: &str) {
+        self.engine = open_engine(&self.data, name, ConflictPolicy::Ask);
+        self.engine.attach_remote(self.link.clone());
+    }
+
+    fn device_json(&self, remote: &MemoryRemote) -> serde_json::Value {
+        let key = format!("devices/{}/device.json", self.engine.device_id().unwrap());
+        serde_json::from_slice(&remote.raw_get(&key).unwrap()).unwrap()
+    }
+
+    fn history_devices(&self) -> BTreeSet<String> {
+        self.engine.history("Mcd001").unwrap().into_iter().map(|e| e.device).collect()
+    }
+}
+
+#[test]
+fn a_renamed_device_shows_its_new_name_elsewhere() {
+    let remote = Arc::new(MemoryRemote::default());
+    let a1 = card_image(100);
+    // The default name where no host name is set, as on Android.
+    let mut a = Device::new(&remote, "unknown device", &a1, ConflictPolicy::Ask);
+    a.sync();
+    let mut b = Device::new(&remote, "pc", &a1, ConflictPolicy::Ask);
+    b.sync();
+    assert_eq!(b.history_devices(), ["unknown device".to_string()].into());
+    let created = a.device_json(&remote)["created"].clone();
+
+    // The rename goes out at the next cycle, though no save is queued: a `device` record in a
+    // segment of its own, then device.json rewritten under the id that segment proved ours.
+    a.rename("AYN Thor");
+    let puts = remote.puts.load(Ordering::SeqCst);
+    let r = a.sync();
+    assert_eq!(r.uploaded_versions, 0);
+    assert_eq!(remote.puts.load(Ordering::SeqCst) - puts, 2);
+    let dj = a.device_json(&remote);
+    assert_eq!(dj["name"], "AYN Thor");
+    assert_eq!(dj["created"], created);
+    // ...and only once.
+    let puts = remote.puts.load(Ordering::SeqCst);
+    a.sync();
+    assert_eq!(remote.puts.load(Ordering::SeqCst), puts);
+
+    // B learns it from that segment alone, without reading device.json, and A's earlier
+    // versions get the new name too.
+    let gets = remote.gets.load(Ordering::SeqCst);
+    b.sync();
+    assert_eq!(remote.gets.load(Ordering::SeqCst) - gets, 1);
+    assert_eq!(b.history_devices(), ["AYN Thor".to_string()].into());
+    let gets = remote.gets.load(Ordering::SeqCst);
+    b.sync();
+    assert_eq!(remote.gets.load(Ordering::SeqCst), gets);
+
+    let mut a2 = a1.clone();
+    a2[1000..1064].copy_from_slice(&[9; 64]);
+    a.write(&a2);
+    a.sync();
+    b.sync();
+    assert_eq!(b.read(), a2);
+    assert_eq!(b.engine.history("Mcd001").unwrap().len(), 2);
+    assert_eq!(b.history_devices(), ["AYN Thor".to_string()].into());
+
+    // A device that joins later reads the new name straight away.
+    let mut c = Device::new(&remote, "laptop", &a2, ConflictPolicy::Ask);
+    c.sync();
+    assert_eq!(c.history_devices(), ["AYN Thor".to_string()].into());
+}
+
+#[test]
+fn devices_from_before_rename_tracking_catch_up() {
+    let remote = Arc::new(MemoryRemote::default());
+    let a1 = card_image(101);
+    let mut a = Device::new(&remote, "unknown device", &a1, ConflictPolicy::Ask);
+    a.sync();
+    let mut b = Device::new(&remote, "pc", &a1, ConflictPolicy::Ask);
+    b.sync();
+
+    // A as an earlier version left it: device.json written once with the old name, a flag
+    // instead of the name it wrote, and the device renamed since. It announces the name once.
+    let id = a.engine.device_id().unwrap();
+    let db = rusqlite::Connection::open(a.data.join("state.db")).unwrap();
+    db.execute(
+        "DELETE FROM meta WHERE key IN (?1, ?2)",
+        [format!("device_json_name:{id}"), format!("logged_name:{id}")],
+    )
+    .unwrap();
+    db.execute("INSERT INTO meta (key, value) VALUES (?1, '1')", [format!("device_json:{id}")]).unwrap();
+    db.execute("UPDATE meta SET value = 'AYN Thor' WHERE key = 'device_name'", []).unwrap();
+    a.engine = Engine::open(&a.data, EngineOptions::default()).unwrap();
+    a.engine.attach_remote(a.link.clone());
+    assert_eq!(a.engine.device_name().unwrap(), "AYN Thor");
+    a.sync();
+    assert_eq!(a.device_json(&remote)["name"], "AYN Thor");
+    let puts = remote.puts.load(Ordering::SeqCst);
+    a.sync();
+    assert_eq!(remote.puts.load(Ordering::SeqCst), puts);
+    b.sync();
+    assert_eq!(b.history_devices(), ["AYN Thor".to_string()].into());
+
+    // B as an earlier version would be after that pull: the `device` record skipped, the old
+    // name kept. Once upgraded, it reads every device.json once more.
+    let db = rusqlite::Connection::open(b.data.join("state.db")).unwrap();
+    db.execute("DELETE FROM meta WHERE key = 'device_names_reread'", []).unwrap();
+    db.execute("UPDATE devices SET name = 'unknown device' WHERE id = ?1", [&id]).unwrap();
+    b.rename("pc");
+    b.sync();
+    assert_eq!(b.history_devices(), ["AYN Thor".to_string()].into());
+    let gets = remote.gets.load(Ordering::SeqCst);
+    b.sync();
+    assert_eq!(remote.gets.load(Ordering::SeqCst), gets);
 }

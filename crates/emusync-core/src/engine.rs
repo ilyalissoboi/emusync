@@ -12,7 +12,8 @@ use crate::fsutil;
 use crate::hlc::Hlc;
 use crate::keystore;
 use crate::model::{
-    content_id, parse_record, split_unit, unit_id, whole_file_unit, CardMode, CardRecord, LogRecord, VersionRecord,
+    content_id, parse_record, split_unit, unit_id, whole_file_unit, CardMode, CardRecord, DeviceRecord, LogRecord,
+    VersionRecord,
 };
 use crate::store::{ContainerRow, LocalUnit, Store, StoredVersion, CF_READ_ONLY};
 use crate::unitdirs;
@@ -1997,11 +1998,12 @@ impl Engine {
     /// either finds its own earlier write or writes the same bytes.
     fn push(&self, remote: &dyn Remote, report: &mut SyncReport) -> Result<()> {
         let cipher = self.cipher()?;
+        self.log_rename(&self.device_id()?)?;
         let seg: PendingSegment = match self.store.meta("pending_segment")? {
             Some(s) => serde_json::from_str(&s)?,
             None => {
                 let rows = self.store.outbox()?;
-                let Some(last) = rows.last() else { return Ok(()) };
+                let Some(last) = rows.last() else { return self.update_device_json(remote) };
                 let body: String = rows.iter().map(|(_, l)| format!("{l}\n")).collect();
                 let seg = PendingSegment { body, last_outbox_id: last.0 };
                 self.store.set_meta("pending_segment", &serde_json::to_string(&seg)?)?;
@@ -2020,7 +2022,7 @@ impl Engine {
         let seq = loop {
             let dev = self.device_id()?;
             let seq = self.next_seq()?;
-            self.ensure_device_json(remote, &dev)?;
+            self.create_device_json(remote, &dev)?;
             let key = segment_key(&dev, seq);
             // Encrypted for the key it is written under; a fresh nonce on every attempt.
             let body = match cipher {
@@ -2053,7 +2055,7 @@ impl Engine {
         report.uploaded_versions += units.len();
         report.uploaded.extend(units);
         self.clean_staging()?;
-        Ok(())
+        self.update_device_json(remote)
     }
 
     fn upload_blob(&self, remote: &dyn Remote, id: &str, report: &mut SyncReport) -> Result<()> {
@@ -2080,24 +2082,99 @@ impl Engine {
         Ok(())
     }
 
-    fn ensure_device_json(&self, remote: &dyn Remote, dev: &str) -> Result<()> {
-        let flag = format!("device_json:{dev}");
-        if self.store.meta(&flag)?.is_some() {
+    /// Whether `devices/<dev>/device.json` has been written. Versions before names were tracked
+    /// left only the `device_json:<dev>` flag.
+    fn device_json_written(&self, dev: &str) -> Result<bool> {
+        Ok(self.store.meta(&format!("device_json_name:{dev}"))?.is_some()
+            || self.store.meta(&format!("device_json:{dev}"))?.is_some())
+    }
+
+    /// Queues a `device` record when the device name isn't the one last announced under `dev`
+    /// (DESIGN §16). It travels in our next segment, so it reaches the other devices without a
+    /// request of theirs, and only under an id whose segment we managed to write: a restored
+    /// backup given another name is reminted before anyone reads its new name.
+    fn log_rename(&self, dev: &str) -> Result<()> {
+        if !self.device_json_written(dev)? {
+            return Ok(()); // the first device.json carries the name
+        }
+        let name = self.device_name()?;
+        let key = format!("logged_name:{dev}");
+        if self.store.meta(&key)?.as_deref() == Some(name.as_str()) {
             return Ok(());
         }
-        let body = serde_json::json!({
-            "name": self.device_name()?,
-            "emulator": self.opts.emulator_id,
-            "os": std::env::consts::OS,
-            "created": Hlc { ms: Hlc::wall_ms(), counter: 0 }.to_string(),
-        });
+        let rec = LogRecord::Device(DeviceRecord { name: name.clone(), hlc: self.tick()? });
+        self.store.tx(|| {
+            self.store.outbox_push(&rec.to_line())?;
+            self.store.set_meta(&key, &name)
+        })
+    }
+
+    /// Writes `devices/<dev>/device.json`, create-only, before the first segment under `dev`.
+    fn create_device_json(&self, remote: &dyn Remote, dev: &str) -> Result<()> {
+        if self.device_json_written(dev)? {
+            return Ok(());
+        }
+        let name = self.device_name()?;
+        let body = serde_json::Map::from_iter([
+            ("name".into(), name.clone().into()),
+            ("emulator".into(), self.opts.emulator_id.clone().into()),
+            ("os".into(), std::env::consts::OS.into()),
+            ("created".into(), Hlc { ms: Hlc::wall_ms(), counter: 0 }.to_string().into()),
+        ]);
         let key = format!("devices/{dev}/device.json");
-        let body = match self.cipher()? {
-            Some(c) => c.seal(&key, body.to_string().as_bytes()),
-            None => body.to_string().into_bytes(),
+        create_only(remote, &key, &self.seal_device_json(&key, body)?, self.conditional_writes)?;
+        self.store.tx(|| {
+            self.store.set_meta(&format!("device_json_name:{dev}"), &name)?;
+            self.store.set_meta(&format!("logged_name:{dev}"), &name)
+        })
+    }
+
+    /// Rewrites our `device.json` after a rename, for devices that read the name only from
+    /// there: those that join later, and earlier versions. Called once everything queued, the
+    /// `device` record included, is in a segment under the current id, so the id is ours.
+    /// `created` and any fields a newer version added are kept; only the name changes.
+    fn update_device_json(&self, remote: &dyn Remote) -> Result<()> {
+        let dev = self.device_id()?;
+        let name = self.device_name()?;
+        let published = format!("device_json_name:{dev}");
+        if !self.device_json_written(&dev)? || self.store.meta(&published)?.as_deref() == Some(name.as_str()) {
+            return Ok(());
+        }
+        let mut body = match self.read_device_json(remote, &dev)? {
+            Some(serde_json::Value::Object(m)) => m,
+            _ => serde_json::Map::new(),
         };
-        create_only(remote, &key, &body, self.conditional_writes)?;
-        self.store.set_meta(&flag, "1")
+        body.insert("name".into(), name.clone().into());
+        let key = format!("devices/{dev}/device.json");
+        remote.put(&key, &self.seal_device_json(&key, body)?, false)?;
+        self.store.set_meta(&published, &name)
+    }
+
+    fn seal_device_json(&self, key: &str, body: serde_json::Map<String, serde_json::Value>) -> Result<Vec<u8>> {
+        let body = serde_json::Value::Object(body).to_string();
+        Ok(match self.cipher()? {
+            Some(c) => c.seal(key, body.as_bytes()),
+            None => body.into_bytes(),
+        })
+    }
+
+    /// Another device's `device.json`, or `None` if it is missing, doesn't decrypt or isn't JSON.
+    fn read_device_json(&self, remote: &dyn Remote, dev: &str) -> Result<Option<serde_json::Value>> {
+        let key = format!("devices/{dev}/device.json");
+        let body = match (remote.get(&key)?, self.cipher()?) {
+            (Some(b), Some(c)) => c.open(&key, &b).ok(),
+            (b, _) => b,
+        };
+        Ok(body.and_then(|b| serde_json::from_slice(&b).ok()))
+    }
+
+    /// Takes another device's name from its `device.json`. False if there was none to read.
+    fn refresh_device_name(&self, remote: &dyn Remote, dev: &str) -> Result<bool> {
+        let name = self.read_device_json(remote, dev)?.and_then(|v| v.get("name")?.as_str().map(str::to_string));
+        match name {
+            Some(name) => self.store.set_device_name(dev, &name).map(|()| true),
+            None => Ok(false),
+        }
     }
 
     fn remint_device(&self, old: &str, seq: u64) -> Result<String> {
@@ -2128,25 +2205,18 @@ impl Engine {
     fn pull(&self, remote: &dyn Remote, report: &mut SyncReport) -> Result<()> {
         let cipher = self.cipher()?;
         let me = self.device_id()?;
+        // Versions before `device` records skipped them in the segments they read, so every
+        // name is read once more from device.json, which a renamed device keeps up to date.
+        let reread = self.store.meta("device_names_reread")?.is_none();
+        let mut reread_all = true;
         for dev in remote.list_dirs("devices/")? {
             // Device ids end up in keys and the DB: accept only UUID-shaped names.
             if dev == me || uuid::Uuid::parse_str(&dev).is_err() {
                 continue;
             }
-            if self.store.device_name(&dev)?.is_none() {
-                let key = format!("devices/{dev}/device.json");
-                let body = match (remote.get(&key)?, cipher) {
-                    (Some(b), Some(c)) => c.open(&key, &b).ok(),
-                    (b, _) => b,
-                };
-                if let Some(body) = body {
-                    let name = serde_json::from_slice::<serde_json::Value>(&body)
-                        .ok()
-                        .and_then(|v| v.get("name").and_then(|n| n.as_str()).map(str::to_string));
-                    if let Some(name) = name {
-                        self.store.set_device_name(&dev, &name)?;
-                    }
-                }
+            // After that, renames arrive as `device` records in the log (DESIGN §16).
+            if reread || self.store.device_name(&dev)?.is_none() {
+                reread_all &= self.refresh_device_name(remote, &dev)?;
             }
             let cursor = self.store.cursor(&dev)?;
             // Segments are numbered contiguously from 1. With delayed or out-of-order listing a
@@ -2192,6 +2262,9 @@ impl Engine {
                 })?;
             }
         }
+        if reread && reread_all {
+            self.store.set_meta("device_names_reread", "1")?;
+        }
         Ok(())
     }
 
@@ -2208,6 +2281,10 @@ impl Engine {
                         }
                     }
                 }
+            }
+            LogRecord::Device(d) => {
+                self.observe(d.hlc)?;
+                self.store.set_device_name(origin, &d.name)?;
             }
             LogRecord::Version(v) => {
                 self.observe(v.hlc)?;
