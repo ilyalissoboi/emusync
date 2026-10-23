@@ -377,7 +377,7 @@ emusync/v1/
   repo.json                       format version, repo id, KDF params, wrapped key (if E2E)
   blobs/<hh>/<hash>               immutable zstd(+encrypted) chunks, content-addressed
   devices/<device-id>/
-    device.json                   name, platform, emulator, created; rewritten on a rename
+    device.json                   name, platform, emulator, created; rewritten after a rename
     log/<seq:016x>.ndjson         append-only log segments; each segment is immutable once written
     compact/<seq:016x>.json       optional snapshot of everything this device has published up to seq
 ```
@@ -386,6 +386,7 @@ Log records (one JSON object per line):
 
 ```json
 {"op":"card","card":"ps2:Mcd001","mode":"units","hlc":"2026-10-12T19:40:00.000Z/0000"}
+{"op":"device","name":"AYN Thor","hlc":"2026-10-23T05:00:00.000Z/0000"}
 {"op":"version","unit":"ps2:Mcd001:BASLUS-20062GTA3","id":"b3:…","parents":["b3:…"],
  "content":"b3:…","chunks":["b3:…"],"size":91136,"meta":{"title":"GTA III","mtime":"…"},
  "hlc":"2026-10-18T11:02:07.120Z/0003","playtime_ms":5520000,"titles":["ps2:SLUS-20062"]}
@@ -913,14 +914,23 @@ Where the M0 code differs from or pins down the design above:
    existing object is fetched and compared, so a write whose response was lost is not
    mistaken for a cloned device id.
 8. **Device names.** `device.json` is written create-only before a device's first segment.
-   The name it last wrote is kept in the local meta (`device_json_name:<id>`); when the device
-   name differs (a rename through `EngineOptions::device_name`), the next push rewrites the
-   object over the old one, keeping its other fields, even if nothing else is queued. A data
-   directory from before the name was recorded rewrites it once. Other devices read a
-   `device.json` when they first see the device and again after a pull that read new segments
-   from it, so a quiet cycle costs no extra GET; a rename shows up elsewhere with the renamed
-   device's next upload, and relabels its earlier versions too. In an encrypted repository the
-   rewrite is sealed like every other object (§22).
+   A rename (a different `EngineOptions::device_name` at `Engine::open`) is announced in the
+   device's own log, with a `{"op":"device","name":"…","hlc":"…"}` record queued at the next
+   push, even if nothing else is: the latest one in a log names that device, and its earlier
+   versions too. Other devices get it with the segment, so a rename costs them no request,
+   and it can't be lost to a `device.json` that isn't visible yet. Once the record is in a
+   segment under the device's id, the device rewrites its `device.json` (a plain overwrite,
+   keeping every field but `name`) for devices that join later and for earlier versions,
+   which skip the record. The order matters for a restored backup given another name: its
+   segment collides first, so it is reminted (§6.2) before it writes anything with the new
+   name, and the original's `device.json` stays its own. Local meta keeps the name last
+   logged (`logged_name:<id>`) and the name in `device.json` (`device_json_name:<id>`). A
+   data directory from before them has only the `device_json:<id>` flag; it logs its name
+   once and rewrites `device.json`. A device reads another's `device.json` when it doesn't
+   know the name yet, and once for every device after upgrading to this version
+   (`device_names_reread`), since it may have skipped `device` records before. In an
+   encrypted repository the record is inside the sealed segment and the rewrite is sealed
+   like every other object (§22).
 9. **Not yet implemented:** compaction snapshots and garbage collection (new devices replay
    full logs), a last-seen time in `device.json`, sessions and leases
    (`Engine::set_busy` routes results to the inbox instead), the size+mtime fingerprint

@@ -38,6 +38,14 @@ pub struct CardRecord {
     pub hlc: Hlc,
 }
 
+/// `device` log record: the device that wrote the log took this name. The latest record in a
+/// device's log wins over the name in its `device.json` (DESIGN §16).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceRecord {
+    pub name: String,
+    pub hlc: Hlc,
+}
+
 /// `version` log record: one node of a unit's version DAG.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VersionRecord {
@@ -92,6 +100,7 @@ impl VersionRecord {
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum LogRecord {
     Card(CardRecord),
+    Device(DeviceRecord),
     Version(VersionRecord),
 }
 
@@ -114,7 +123,7 @@ pub fn parse_record(line: &[u8]) -> Result<Option<LogRecord>, RecordError> {
     let value: Value = serde_json::from_slice(line).map_err(|e| RecordError::Malformed(e.to_string()))?;
     let op = value.get("op").and_then(Value::as_str).unwrap_or_default().to_string();
     match op.as_str() {
-        "card" | "version" => {}
+        "card" | "device" | "version" => {}
         _ => return Ok(None),
     }
     if op == "version" {
@@ -275,5 +284,9 @@ mod tests {
         .unwrap()
         .unwrap();
         assert!(matches!(card, LogRecord::Card(CardRecord { mode: CardMode::WholeFile, .. })));
+        let line = br#"{"op":"device","name":"AYN Thor","hlc":"2026-10-23T05:00:00.000Z/0000"}"#;
+        let device = parse_record(line).unwrap().unwrap();
+        assert!(matches!(&device, LogRecord::Device(DeviceRecord { name, .. }) if name == "AYN Thor"));
+        assert_eq!(device.to_line().as_bytes(), line);
     }
 }
