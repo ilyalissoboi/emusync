@@ -16,9 +16,11 @@ fn sibling(path: &Path, suffix: &str) -> PathBuf {
 /// Whether an I/O error means another program has the file open in a way that keeps others
 /// out. On Windows, PCSX2 opens card files, and the files of a folder card's loaded saves,
 /// without sharing for as long as a game runs (`ERROR_SHARING_VIOLATION`,
-/// `ERROR_LOCK_VIOLATION`). Other systems have no such mandatory locks.
+/// `ERROR_LOCK_VIOLATION`). Other systems have no such mandatory locks. A host's VFS reports
+/// one with [`crate::vfs::InUse`].
 pub fn is_locked(e: &io::Error) -> bool {
-    cfg!(windows) && matches!(e.raw_os_error(), Some(32 | 33))
+    (cfg!(windows) && matches!(e.raw_os_error(), Some(32 | 33)))
+        || e.get_ref().is_some_and(|inner| inner.is::<crate::vfs::InUse>())
 }
 
 pub fn temp_path(path: &Path) -> PathBuf {
@@ -172,7 +174,7 @@ pub fn read_tree(dir: &Path) -> io::Result<Tree> {
 }
 
 /// Writes `tree` into the new directory `dir`, fsyncing every file.
-fn system_time(secs: i64) -> SystemTime {
+pub fn system_time(secs: i64) -> SystemTime {
     if secs >= 0 {
         UNIX_EPOCH + Duration::from_secs(secs as u64)
     } else {

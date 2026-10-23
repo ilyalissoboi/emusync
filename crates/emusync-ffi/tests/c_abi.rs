@@ -160,6 +160,10 @@ fn struct_layouts_match_the_header() {
         log_user,
         log_level
     );
+    s!(es_vfs_stat);
+    f!(es_vfs_stat, mtime_unix_ms, is_dir);
+    s!(es_vfs);
+    f!(es_vfs, user, stat, list, read, write, mkdir, rename, remove, set_mtime, join, parent, name);
     s!(es_credentials);
     f!(es_credentials, kind, access_key_id, secret_access_key, session_token, expires_unix_ms, bearer_token);
     s!(es_credential_provider);

@@ -299,9 +299,8 @@ Every apply follows the same steps, whatever the format:
    the apply.
 4. Save the previous unit versions to the local snapshot store.
 5. Write `name.emusync-tmp`, fsync it, and atomically replace the original (`rename` on POSIX,
-   `ReplaceFileW` on Windows). Where atomic replace isn't available (SAF), use a journalled
-   copy: write the temp file, record the intent in the DB, copy over the original, verify, and
-   clear the intent. Interrupted copies are rolled forward on the next start.
+   `ReplaceFileW` on Windows). Where atomic replace isn't available (SAF), the file is replaced
+   with a journal of renames, as directories are, rolled forward after a crash (§28.2).
 
 ### 5.1 `ps2.card`: raw MCFS image (PCSX2, ARMSX2, AetherSX2/NetherSX2, real-hardware dumps)
 
@@ -655,7 +654,7 @@ States are a separate class from saves, and opt-in for each client:
 **VFS abstraction:** if the host passes no VFS, native paths are used. A host-supplied
 `es_vfs` lets it route every container access through its own I/O, for SAF on Android, a
 sandbox, or an in-memory card during tests. The library's private `data_dir` always uses
-native paths.
+native paths. Implemented in §28: the host implements the callbacks in C.
 
 ---
 
@@ -854,7 +853,8 @@ dependencies each item needs placed before it:
 6. **Dolphin integration**, desktop and Android (one codebase; Android keeps its data in
    app-specific storage, so no SAF).
 7. PSP: the `psp.savedata` adapter, one unit per save folder, with folders of save folders in the core (§27).
-8. The SAF VFS (`es_vfs`): PPSSPP's Android memory stick can be a user-picked `content://` folder.
+8. The SAF VFS (`es_vfs`): PPSSPP's Android memory stick can be a user-picked `content://` folder
+   (§28; the host implements the callbacks).
 9. **PPSSPP integration**, desktop and Android.
 10. PS1: the `ps1.card` adapter.
 11. **DuckStation on desktop** through the sidecar (a `duckstation` profile). DuckStation is
@@ -1245,8 +1245,7 @@ pins down §3.2, §6.4, §10 and §12:
    them when the remote answers 401/403, after which `S3Remote` retries the request once
    (`CredentialProvider::invalidate`). The `es_credentials` buffer is zeroed before the call
    and wiped after. Only `ES_CRED_S3` is accepted.
-9. **Not implemented, refused with `ES_E_INVALID_ARG`:** custom VFS (`es_config.vfs` must be
-   NULL), `ES_POLICY_PREFER_LOCAL` / `PREFER_REMOTE` (if two devices each prefer their own copy,
+9. **Not implemented, refused with `ES_E_INVALID_ARG`:** `ES_POLICY_PREFER_LOCAL` / `PREFER_REMOTE` (if two devices each prefer their own copy,
    their automatic merges never converge; needs a design), per-game containers (`title_scope`),
    `ES_CF_NO_UPLOAD`, OAuth (`es_oauth_*`) and save states
    (`es_state_*`, M3). Leases don't exist yet, so `other_device_active` is always empty and
@@ -1799,7 +1798,7 @@ Instrumented, on CI's API 30 x86_64 emulator (`android-emulator` job, after the 
   app's sandbox.
 
 Not done here: a Maven publication, WorkManager for uploads after the app is closed (roadmap
-item 13, when ARMSX2 moves to the AAR), and the SAF VFS (item 8).
+item 13, when ARMSX2 moves to the AAR), and a Kotlin SAF implementation of `es_vfs` (§28.1).
 
 ### 26.5 Releases
 
@@ -1920,4 +1919,107 @@ folder on its own:
   - whole-file mode is refused.
 
 Not done here: testing against PPSSPP itself, which comes with its integration (roadmap
-item 9), and Android's `content://` memory sticks (item 8).
+item 9). Android's `content://` memory sticks go through a host's `es_vfs` (§28).
+
+## 28. Implementation notes (host storage: `es_vfs`)
+
+Roadmap item 8. On Android 11 and later, an app can reach shared storage only through folders
+the user picks with the Storage Access Framework. PPSSPP keeps its memory stick in one of those,
+as `content://` documents, which have no file paths. The engine now reaches every container
+through a VFS, so a host can keep its containers in such storage.
+
+### 28.1 Who implements what
+
+The host implements the storage operations in C (`es_vfs`), and emusync never calls Java. PPSSPP
+already has a native SAF layer (`Android_ListContentUri`, `Android_CreateFile`,
+`Android_RenameFileTo`, file descriptors for documents) behind its `File::` and `Path` APIs, so
+its integration (item 9) wraps those. A host without SAF code of its own would need a Kotlin
+implementation; the AAR could ship one later, bridged through JNI.
+
+### 28.2 The core: `emusync-core::vfs`
+
+- **The trait:** `Vfs` has primitives:
+  - reading: `stat`, `list` (entries with their metadata), `read` (a whole file);
+  - writing: `write` (create or truncate, durable), `create_dir`, `rename` (within a
+    directory, never over something), `remove` (a file, or a directory with everything in
+    it), and `set_mtime` (best effort);
+  - location arithmetic: `join`, `parent`, `name`.
+
+  A location is a string only the VFS composes: a native path, or a URI.
+- **Built on them:** the trait builds `read_tree`, `replace_dir`, `replace_file`, `recover` and
+  `remove_dir` from the primitives.
+  - Files now use the same journalled renames as directories (§19.3): write `<name>.emusync-tmp`,
+    write the journal `<name>.emusync-swap`, rename `<name>` to `<name>.emusync-old`, rename the
+    new one to `<name>`, then remove the old one and the journal.
+  - SAF can't rename over a document, so the old "journalled copy" plan of §5, step 5 isn't
+    needed.
+  - `recover` rolls an interrupted replace forward or back, for files and directories alike.
+- **`NativeVfs`, the default:** it keeps the code from before, overriding the built operations
+  with `fsutil`. Files are still replaced with one atomic `rename`, with the same fsyncs and
+  the same Windows lock detection.
+- **`MemoryVfs`, for tests:** it holds everything in memory, can't set times and never renames
+  over anything, as SAF behaves.
+- **Where it is used:**
+  - `EngineOptions::vfs` selects the VFS. The engine's container reads and writes, detection
+    in `add_container`, `creatable`, whole-file metadata and `unitdirs` (§27) all go through
+    it.
+  - Only a native location is made absolute when a container is added.
+  - The data directory stays native.
+- **Locked files:** a VFS reports a file another program holds with `vfs::InUse`, which
+  `fsutil::is_locked` recognises, so the card waits instead of failing.
+- **A failed read:** when a host's storage fails to read a card file, only that card is held
+  back, as for directories. It doesn't abort the cycle.
+
+### 28.3 The C ABI
+
+- **Reserved until now:** `es_config.vfs` was reserved, and refused with `ES_E_INVALID_ARG`, so
+  no host could have used the old `es_vfs` layout. It is redefined here within ABI version 1.
+  - The old layout was handle-based: `open`, `read_at`, `sync`, `replace`, `sibling`.
+  - The new one is whole-file and name-based: `stat`, `list`, `read` (through a sink),
+    `write`, `mkdir`, `rename`, `remove`, `set_mtime` (may be NULL), `join`, `parent` and
+    `name`.
+  - The C layout test checks the new structs.
+- **Status codes:** the functions return `ES_OK`, `ES_E_NOT_FOUND`, `ES_E_BUSY` or `ES_E_IO`.
+  - `ES_E_NOT_FOUND` matters, for example for a card that doesn't exist yet.
+  - `ES_E_BUSY` becomes `InUse`.
+- **Strings:** the string functions write into a caller's buffer and return the length needed,
+  so emusync calls again with a larger buffer.
+- **The host's side:** `es_client_create` copies the struct and checks that every function but
+  `set_mtime` is set. The functions are called from the client's worker thread, one call at a
+  time.
+- **After destroy:** every call goes through the client's callback gate, as the log callback
+  and the credential provider do. So none runs once `es_client_destroy` returns, even when its
+  timeout left the worker finishing a sync in the background; the worker then gets errors.
+  Destroy waits for a call in progress.
+- **`HostVfs` (`emusync-ffi/src/vfs.rs`)** adapts the struct to the trait.
+
+### 28.4 What changes on storage without times
+
+On SAF, `set_mtime` is NULL, so a file written by emusync keeps the time it was written at.
+
+- **Folder cards and GCI folders:** they read back with new times, which only changes the
+  container's image hash, not its saves.
+- **PSP saves:** they keep their `psp.mtimes` meta (§27.2). PPSSPP shows the date of the
+  write, not of the save.
+- **Signatures:** a save folder's signature (§27.3) is recorded from what the storage reports
+  after the write, so it stays valid.
+
+### 28.5 Tests
+
+- **`vfs` unit tests:**
+  - files and directories are replaced, and removed;
+  - the protocol, interrupted after each step, recovers for both;
+  - native paths, including times and scratch names.
+- **`unitdirs`:** read, write and remove run on the native file system and on `MemoryVfs`.
+- **Engine (`tests/vfs.rs`):** a device whose storage is a `MemoryVfs` syncs with a native one:
+  - a PS2 card file both ways;
+  - an empty Dolphin GCI folder, recognised by its place (`GC/USA/Card A`) through the VFS's
+    `name` and `parent`, which receives a save;
+  - a PSP `SAVEDATA`, created under `PSP` and synced both ways;
+  - a card replace interrupted on the VFS, finished at the next scan.
+- **FFI:** `es_client_create` checks the struct.
+  - C callbacks written in Rust over a `MemoryVfs` back a client whose card exists only behind
+    them: it receives a save, its own save reaches the PC, and nothing is left behind.
+  - The C layout test covers `es_vfs` and `es_vfs_stat`.
+
+Not done here: a host implementation. PPSSPP's comes with its integration (item 9).

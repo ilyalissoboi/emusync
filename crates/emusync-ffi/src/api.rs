@@ -129,9 +129,12 @@ pub unsafe extern "C" fn es_client_create(cfg: *const es_config, out: *mut *mut 
         let device_name = opt_str(cfg.device_name, "device_name")?;
         let emulator_id = opt_str(cfg.emulator_id, "emulator_id")?;
         opt_str(cfg.emulator_version, "emulator_version")?;
-        if !cfg.vfs.is_null() {
-            return Err(invalid("a custom VFS is not supported yet (pass NULL for native paths)"));
-        }
+        // Copied: the host keeps `user` and the functions valid until es_client_destroy, which
+        // stops every call into them (HostVfs goes through the callback gate).
+        let vfs = match unsafe { cfg.vfs.as_ref() } {
+            None => None,
+            Some(v) => Some(Arc::new(crate::vfs::HostVfs::new(v, cb.clone()).map_err(invalid)?)),
+        };
         let policy = match cfg.conflict_policy {
             ES_POLICY_ASK => ConflictPolicy::Ask,
             ES_POLICY_NEWEST => ConflictPolicy::Newest,
@@ -141,7 +144,13 @@ pub unsafe extern "C" fn es_client_create(cfg: *const es_config, out: *mut *mut 
             return Err(invalid(format!("unknown es_config flags {:#x}", cfg.flags)));
         }
         // Containers in a session are snapshotted only when the host says they are quiet.
-        let mut opts = EngineOptions { device_name, policy, scan_busy: false, ..Default::default() };
+        let mut opts = EngineOptions {
+            device_name,
+            policy,
+            scan_busy: false,
+            vfs: vfs.map(|v| v as Arc<dyn emusync_core::vfs::Vfs>),
+            ..Default::default()
+        };
         if let Some(id) = emulator_id {
             opts.emulator_id = id;
         }
