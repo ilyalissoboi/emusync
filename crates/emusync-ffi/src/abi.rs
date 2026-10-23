@@ -75,7 +75,7 @@ pub struct es_config {
     pub device_name: *const c_char,
     pub emulator_id: *const c_char,
     pub emulator_version: *const c_char,
-    pub vfs: *const c_void,
+    pub vfs: *const es_vfs,
     pub conflict_policy: c_int,
     pub flags: u32,
     pub snapshot_budget_bytes: u64,
@@ -93,6 +93,35 @@ pub struct es_credentials {
     pub session_token: [c_char; 4096],
     pub expires_unix_ms: i64,
     pub bearer_token: [c_char; 4096],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct es_vfs_stat {
+    pub size: u64,
+    pub mtime_unix_ms: i64,
+    pub is_dir: u8,
+}
+
+pub type es_vfs_entry_fn = Option<unsafe extern "C" fn(*mut c_void, *const c_char, *const es_vfs_stat)>;
+pub type es_vfs_sink_fn = Option<unsafe extern "C" fn(*mut c_void, *const c_void, usize)>;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct es_vfs {
+    pub struct_size: u32,
+    pub user: *mut c_void,
+    pub stat: Option<unsafe extern "C" fn(*mut c_void, *const c_char, *mut es_vfs_stat) -> c_int>,
+    pub list: Option<unsafe extern "C" fn(*mut c_void, *const c_char, es_vfs_entry_fn, *mut c_void) -> c_int>,
+    pub read: Option<unsafe extern "C" fn(*mut c_void, *const c_char, es_vfs_sink_fn, *mut c_void) -> c_int>,
+    pub write: Option<unsafe extern "C" fn(*mut c_void, *const c_char, *const c_void, usize) -> c_int>,
+    pub mkdir: Option<unsafe extern "C" fn(*mut c_void, *const c_char) -> c_int>,
+    pub rename: Option<unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char) -> c_int>,
+    pub remove: Option<unsafe extern "C" fn(*mut c_void, *const c_char) -> c_int>,
+    pub set_mtime: Option<unsafe extern "C" fn(*mut c_void, *const c_char, i64) -> c_int>,
+    pub join: Option<unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char, *mut c_char, usize) -> usize>,
+    pub parent: Option<unsafe extern "C" fn(*mut c_void, *const c_char, *mut c_char, usize) -> usize>,
+    pub name: Option<unsafe extern "C" fn(*mut c_void, *const c_char, *mut c_char, usize) -> usize>,
 }
 
 #[repr(C)]

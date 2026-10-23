@@ -315,16 +315,17 @@ fn target_of(unit: &str) -> String {
 
 /// A PSP `SAVEDATA` folder, one save folder at a time: it can hold GBs of game data.
 fn inspect_savedata(path: &Path) -> AnyResult<()> {
-    use emusync_core::unitdirs;
+    use emusync_core::{unitdirs, vfs::NativeVfs};
     let fmt: &dyn emusync_formats::ContainerFormat = &emusync_formats::PspSavedata;
     let max = fmt.max_unit_size();
-    let listing = unitdirs::list(path, max)?;
+    let dir = path.to_string_lossy();
+    let listing = unitdirs::list(&NativeVfs, &dir, max)?;
     println!("{}: PSP memory stick saves, format {}", path.display(), fmt.id());
     if listing.units.is_empty() {
         println!("no saves");
     }
     for u in &listing.units {
-        for s in fmt.extract_all(&unitdirs::read_unit(path, &u.name)?.encode())? {
+        for s in fmt.extract_all(&unitdirs::read_unit(&NativeVfs, &dir, &u.name)?.encode())? {
             println!("  {:<32} {:>10}  {}", s.name, human_size(s.bytes.len() as u64), fmt.titles(&s.name).join(", "));
         }
     }

@@ -383,6 +383,16 @@ CI builds it, checks the libraries inside, runs its instrumented tests and a Pre
 ([`prefab-test`](bindings/android/prefab-test)) on an emulator, and uploads it as the
 `emusync-aar` artifact.
 
+### Cards in storage without file paths (SAF)
+
+On Android 11 and later, an emulator may keep its cards in a folder the user picked through the
+Storage Access Framework, whose `content://` documents have no file paths. The host then passes
+its own storage functions in `es_config.vfs` (`es_vfs` in [`emusync.h`](include/emusync.h):
+stat, list, read, write, mkdir, rename, remove, and location arithmetic), and every container
+location is one of its own. emusync never renames over a file, so SAF's `renameDocument` is
+enough: a card is replaced with a journal of renames that survives a crash. Details:
+[DESIGN §28](docs/DESIGN.md#28-implementation-notes-host-storage-es_vfs).
+
 ## Tests
 
 ```sh

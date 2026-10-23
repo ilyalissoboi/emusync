@@ -102,37 +102,56 @@ typedef enum es_log_level { ES_LOG_ERROR, ES_LOG_WARN, ES_LOG_INFO, ES_LOG_DEBUG
 typedef void (*es_log_fn)(void* user, es_log_level level, const char* target, const char* msg);
 
 /* ------------------------------------------------------------------------------------------ */
-/* Optional VFS (e.g. Android SAF content:// URIs). Reserved: ABI version 1 accepts only NULL  */
-/* (native paths) in es_config.vfs and returns ES_E_INVALID_ARG otherwise.                    */
+/* Optional VFS: the host's own storage for containers (DESIGN §28), e.g. Android SAF         */
+/* content:// documents, which have no file paths. With es_config.vfs set, every container    */
+/* location (es_container_desc.location) is the host's: emusync never touches it except       */
+/* through these functions, and never composes locations itself (join/parent/name). The      */
+/* data_dir stays a native path.                                                              */
+/*                                                                                            */
+/* Functions returning int return ES_OK, ES_E_NOT_FOUND (nothing at that location: emusync    */
+/* relies on it, e.g. for a card that doesn't exist yet), ES_E_BUSY (another program holds    */
+/* the file: the card waits for the next sync) or ES_E_IO. They are called from emusync's     */
+/* threads, never at once for one client (attach the thread to the JVM if needed), and must   */
+/* not call back into emusync. Strings are UTF-8 and valid only during the call.             */
 /* ------------------------------------------------------------------------------------------ */
 
 typedef struct es_vfs_stat {
-    uint64_t size;
-    int64_t  mtime_unix_ms;
+    uint64_t size;            /* bytes, for a file */
+    int64_t  mtime_unix_ms;   /* modification time */
     uint8_t  is_dir;
 } es_vfs_stat;
 
-typedef enum es_vfs_open_mode { ES_VFS_READ = 1, ES_VFS_WRITE_TRUNCATE = 2 } es_vfs_open_mode;
+typedef void (*es_vfs_entry_fn)(void* ctx, const char* name, const es_vfs_stat* st);
+typedef void (*es_vfs_sink_fn)(void* ctx, const void* data, size_t len);
 
 typedef struct es_vfs {
     uint32_t struct_size;
     void*    user;
-    int  (*open)(void* user, const char* uri, es_vfs_open_mode mode, void** out_handle);
-    int  (*read_at)(void* user, void* handle, uint64_t offset, void* buf, size_t len, size_t* out_read);
-    int  (*write)(void* user, void* handle, const void* buf, size_t len);
-    int  (*sync)(void* user, void* handle);                          /* fsync equivalent */
-    int  (*close)(void* user, void* handle);
-    int  (*stat)(void* user, const char* uri, es_vfs_stat* out);
-    /* Replace `dst` with `src` atomically if possible. If the platform cannot (SAF), return
-       ES_E_IO and the library falls back to its journalled-copy protocol. May be NULL. */
-    int  (*replace)(void* user, const char* src_uri, const char* dst_uri);
-    int  (*remove)(void* user, const char* uri);
-    int  (*mkdir)(void* user, const char* uri);
-    /* Enumerate children of a directory; `cb` is called once per entry name. */
-    int  (*list)(void* user, const char* dir_uri,
-                 void (*cb)(void* cb_user, const char* name, const es_vfs_stat* st), void* cb_user);
-    /* Produce a sibling URI for temp files (e.g. "<dir>/<name>.emusync-tmp"). */
-    int  (*sibling)(void* user, const char* uri, const char* suffix, char* out, size_t out_cap);
+    int  (*stat)(void* user, const char* path, es_vfs_stat* out);
+    /* Calls `entry` once per entry of the directory (its name, not a path), in any order. */
+    int  (*list)(void* user, const char* dir, es_vfs_entry_fn entry, void* ctx);
+    /* Reads the whole file, handing it to `sink` in one or more pieces, in order. */
+    int  (*read)(void* user, const char* path, es_vfs_sink_fn sink, void* ctx);
+    /* Creates or truncates the file and writes `data`; durable (fsync) before it returns. */
+    int  (*write)(void* user, const char* path, const void* data, size_t len);
+    int  (*mkdir)(void* user, const char* path);
+    /* Renames a file or directory within its directory. Nothing is at `new_name`: emusync
+       never renames over something, so SAF's renameDocument is enough. Replacing a card
+       uses a journal of renames that a crash can't break (DESIGN §19.3, §28). */
+    int  (*rename)(void* user, const char* path, const char* new_name);
+    /* Removes a file, or a directory with everything in it. */
+    int  (*remove)(void* user, const char* path);
+    /* Sets a modification time. May be NULL (SAF can't): saves then keep the time they are
+       written at. */
+    int  (*set_mtime)(void* user, const char* path, int64_t mtime_unix_ms);
+    /* Location arithmetic. Each writes its result and a NUL into out[cap] if it fits, and
+       returns its length without the NUL (emusync calls again with a larger buffer if needed):
+       join: the location of `name` in the directory `dir`;
+       parent: the directory `path` is in, or 0 if there is none the host can reach;
+       name: the last component of `path` ("Mcd001.ps2", "SAVEDATA"). */
+    size_t (*join)(void* user, const char* dir, const char* name, char* out, size_t cap);
+    size_t (*parent)(void* user, const char* path, char* out, size_t cap);
+    size_t (*name)(void* user, const char* path, char* out, size_t cap);
 } es_vfs;
 
 /* ------------------------------------------------------------------------------------------ */
@@ -162,7 +181,10 @@ typedef struct es_config {
                                              data_dir, else the OS host name */
     const char*        emulator_id;       /* e.g. "pcsx2", "armsx2", "emusyncd"; NULL = "emusync" */
     const char*        emulator_version;
-    const es_vfs*      vfs;               /* must be NULL in ABI version 1 (native file system) */
+    const es_vfs*      vfs;               /* NULL = native paths. Else copied: `user` and the
+                                             functions stay valid until es_client_destroy.
+                                             ES_E_INVALID_ARG if a function but set_mtime is
+                                             NULL. */
     es_conflict_policy conflict_policy;
     uint32_t           flags;             /* es_config_flags */
     uint64_t           snapshot_budget_bytes; /* local history store; 0 = default (100 MiB) */
@@ -329,7 +351,7 @@ typedef struct es_container_desc {
                                  folder card, a GameCube card image or Dolphin GCI folder, a PSP
                                  memory stick's SAVEDATA folder by its name, else "raw":
                                  whole-file only). Reserved: "ps1.card", "sram", "dir". */
-    const char* location;     /* native path */
+    const char* location;     /* native path, or with es_config.vfs a location of the host's */
     const char* platform;     /* "ps2", "ps1", "gc", "psp", ... ; NULL = inferred from format/extension */
     const char* card;         /* logical card name, e.g. "Mcd001". NULL = the file or folder stem
                                  (a Dolphin GCI folder GC/USA/Card A: "MemoryCardA.USA", the raw

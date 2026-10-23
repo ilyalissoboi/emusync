@@ -27,6 +27,24 @@ int main(void) {
     F(es_config, log_user);
     F(es_config, log_level);
 
+    S(es_vfs_stat);
+    F(es_vfs_stat, mtime_unix_ms);
+    F(es_vfs_stat, is_dir);
+
+    S(es_vfs);
+    F(es_vfs, user);
+    F(es_vfs, stat);
+    F(es_vfs, list);
+    F(es_vfs, read);
+    F(es_vfs, write);
+    F(es_vfs, mkdir);
+    F(es_vfs, rename);
+    F(es_vfs, remove);
+    F(es_vfs, set_mtime);
+    F(es_vfs, join);
+    F(es_vfs, parent);
+    F(es_vfs, name);
+
     S(es_credentials);
     F(es_credentials, kind);
     F(es_credentials, access_key_id);

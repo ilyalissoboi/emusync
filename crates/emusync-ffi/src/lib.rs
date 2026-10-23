@@ -12,6 +12,7 @@ mod creds;
 mod events;
 #[cfg(test)]
 mod tests;
+mod vfs;
 
 pub use api::*;
 pub use client::Client;

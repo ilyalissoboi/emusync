@@ -284,8 +284,14 @@ fn create_validates_its_arguments() {
         cfg.conflict_policy = 2;
         assert_eq!(es_client_create(&cfg, &mut c), ES_E_INVALID_ARG, "prefer-local is reserved");
         cfg.conflict_policy = ES_POLICY_ASK;
-        cfg.vfs = 8 as *const c_void;
-        assert_eq!(es_client_create(&cfg, &mut c), ES_E_INVALID_ARG, "no VFS yet");
+        let mut vfs = host_vfs(std::ptr::null());
+        vfs.read = None;
+        cfg.vfs = &vfs;
+        assert_eq!(es_client_create(&cfg, &mut c), ES_E_INVALID_ARG, "es_vfs.read is required");
+        let mut vfs = host_vfs(std::ptr::null());
+        vfs.struct_size = 8;
+        cfg.vfs = &vfs;
+        assert_eq!(es_client_create(&cfg, &mut c), ES_E_INVALID_ARG, "too small");
         cfg.vfs = std::ptr::null();
         let bad = [0xC3u8, 0x28, 0];
         cfg.device_name = bad.as_ptr().cast();
@@ -1002,4 +1008,168 @@ fn secrets_round_trip_through_the_c_abi() {
         );
         assert_eq!(es_secret_delete(svc.as_ptr(), name.as_ptr(), fallback.as_ptr()), ES_OK);
     }
+}
+
+// ---- a host VFS (es_vfs) over emusync's in-memory one, as an Android host would wrap SAF ----
+
+mod host {
+    use super::*;
+    use emusync_core::vfs::{MemoryVfs, Stat, Vfs};
+
+    unsafe fn mem<'a>(user: *mut c_void) -> &'a MemoryVfs {
+        &*(user as *const MemoryVfs)
+    }
+
+    unsafe fn s<'a>(p: *const c_char) -> &'a str {
+        CStr::from_ptr(p).to_str().unwrap()
+    }
+
+    fn status(r: std::io::Result<()>) -> c_int {
+        match r {
+            Ok(()) => ES_OK,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => ES_E_NOT_FOUND,
+            Err(_) => ES_E_IO,
+        }
+    }
+
+    fn c_stat(st: &Stat) -> es_vfs_stat {
+        es_vfs_stat { size: st.size, mtime_unix_ms: st.mtime_ns / 1_000_000, is_dir: st.is_dir as u8 }
+    }
+
+    unsafe fn put_str(s: Option<String>, out: *mut c_char, cap: usize) -> usize {
+        let Some(s) = s else { return 0 };
+        if s.len() < cap {
+            std::ptr::copy_nonoverlapping(s.as_ptr().cast(), out, s.len());
+            *out.add(s.len()) = 0;
+        }
+        s.len()
+    }
+
+    pub unsafe extern "C" fn stat(u: *mut c_void, p: *const c_char, out: *mut es_vfs_stat) -> c_int {
+        match mem(u).stat(s(p)) {
+            Ok(st) => {
+                *out = c_stat(&st);
+                ES_OK
+            }
+            Err(e) => status(Err(e)),
+        }
+    }
+
+    pub unsafe extern "C" fn list(u: *mut c_void, p: *const c_char, cb: es_vfs_entry_fn, ctx: *mut c_void) -> c_int {
+        match mem(u).list(s(p)) {
+            Ok(entries) => {
+                for (name, st) in entries {
+                    let name = cstr(&name);
+                    cb.unwrap()(ctx, name.as_ptr(), &c_stat(&st));
+                }
+                ES_OK
+            }
+            Err(e) => status(Err(e)),
+        }
+    }
+
+    /// In pieces, as a host reading a file descriptor would hand them over.
+    pub unsafe extern "C" fn read(u: *mut c_void, p: *const c_char, sink: es_vfs_sink_fn, ctx: *mut c_void) -> c_int {
+        match mem(u).read(s(p)) {
+            Ok(data) => {
+                for piece in data.chunks(1000) {
+                    sink.unwrap()(ctx, piece.as_ptr().cast(), piece.len());
+                }
+                ES_OK
+            }
+            Err(e) => status(Err(e)),
+        }
+    }
+
+    pub unsafe extern "C" fn write(u: *mut c_void, p: *const c_char, data: *const c_void, len: usize) -> c_int {
+        status(mem(u).write(s(p), std::slice::from_raw_parts(data.cast(), len)))
+    }
+
+    pub unsafe extern "C" fn mkdir(u: *mut c_void, p: *const c_char) -> c_int {
+        status(mem(u).create_dir(s(p)))
+    }
+
+    pub unsafe extern "C" fn rename(u: *mut c_void, p: *const c_char, n: *const c_char) -> c_int {
+        status(mem(u).rename(s(p), s(n)))
+    }
+
+    pub unsafe extern "C" fn remove(u: *mut c_void, p: *const c_char) -> c_int {
+        status(mem(u).remove(s(p)))
+    }
+
+    pub unsafe extern "C" fn join(
+        u: *mut c_void,
+        d: *const c_char,
+        n: *const c_char,
+        out: *mut c_char,
+        cap: usize,
+    ) -> usize {
+        put_str(Some(mem(u).join(s(d), s(n))), out, cap)
+    }
+
+    pub unsafe extern "C" fn parent(u: *mut c_void, p: *const c_char, out: *mut c_char, cap: usize) -> usize {
+        put_str(mem(u).parent(s(p)), out, cap)
+    }
+
+    pub unsafe extern "C" fn name(u: *mut c_void, p: *const c_char, out: *mut c_char, cap: usize) -> usize {
+        put_str(mem(u).name(s(p)), out, cap)
+    }
+}
+
+/// An `es_vfs` whose `user` is a `MemoryVfs`; it can't set times (`set_mtime` is NULL).
+fn host_vfs(user: *const emusync_core::vfs::MemoryVfs) -> es_vfs {
+    es_vfs {
+        struct_size: std::mem::size_of::<es_vfs>() as u32,
+        user: user as *mut c_void,
+        stat: Some(host::stat),
+        list: Some(host::list),
+        read: Some(host::read),
+        write: Some(host::write),
+        mkdir: Some(host::mkdir),
+        rename: Some(host::rename),
+        remove: Some(host::remove),
+        set_mtime: None,
+        join: Some(host::join),
+        parent: Some(host::parent),
+        name: Some(host::name),
+    }
+}
+
+#[test]
+fn a_host_vfs_holds_the_cards() {
+    use emusync_core::vfs::{MemoryVfs, Vfs};
+    let remote = memory();
+    let pc = Dev::new("VEGA", Some(remote.clone()), ES_POLICY_ASK);
+    pc.put(GTA, b"gta");
+    pc.sync();
+
+    // The phone keeps its card where only the host can reach it.
+    let mem = Box::new(MemoryVfs::with_root("/tree/memcards"));
+    mem.write("/tree/memcards/Mcd001.ps2", &blank_card(8192, true, T)).unwrap();
+    let vfs = host_vfs(&*mem);
+    let dir = tempfile::tempdir().unwrap();
+    let data = cstr(dir.path().join("data").to_str().unwrap());
+    let mut cfg = config_init();
+    cfg.data_dir = data.as_ptr();
+    cfg.vfs = &vfs;
+    let mut c = std::ptr::null_mut();
+    assert_eq!(unsafe { es_client_create(&cfg, &mut c) }, ES_OK);
+    assert_eq!(attach(c, remote.clone()), ES_OK);
+    let id = add(c, Path::new("/tree/memcards/Mcd001.ps2"), None).unwrap();
+    let phone = Dev { c, card: PathBuf::new(), id, _dir: dir };
+
+    phone.sync();
+    let names = |img: &[u8]| -> Vec<String> { Ps2Card.list(img).unwrap().into_iter().map(|u| u.name).collect() };
+    assert_eq!(names(&mem.read("/tree/memcards/Mcd001.ps2").unwrap()), [GTA]);
+    let scratch: Vec<String> = mem.list("/tree/memcards").unwrap().into_iter().map(|(n, _)| n).collect();
+    assert_eq!(scratch, ["Mcd001.ps2"], "nothing left behind");
+
+    // The emulator saves on the phone; the PC gets it.
+    let img = mem.read("/tree/memcards/Mcd001.ps2").unwrap();
+    mem.write("/tree/memcards/Mcd001.ps2", &Ps2Card.apply(&img, &[ApplyOp::Put(save(RAC, b"rac"))]).unwrap()).unwrap();
+    phone.sync();
+    pc.sync();
+    assert!(pc.saves().contains_key(RAC));
+    drop(phone);
+    drop(mem);
 }
