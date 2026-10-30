@@ -39,9 +39,13 @@ class SyncControllerTest {
         }
         override fun stop() {
             calls += "stop"
-            stopped.countDown()
-            stopError?.let { throw it }
-            running = false
+            // Counted down last, so a test woken by it sees the stop's effect on isRunning.
+            try {
+                stopError?.let { throw it }
+                running = false
+            } finally {
+                stopped.countDown()
+            }
         }
         override val isRunning get() = running
         override fun syncNow() { calls += "syncNow" }
