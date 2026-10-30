@@ -1,8 +1,9 @@
-//! `es_credential_provider` → [`emusync_remote::CallbackCredentials`].
+//! `es_credential_provider` → [`emusync_remote::CallbackCredentials`]: S3 keys, or an OAuth
+//! token for Dropbox (DESIGN §30.5).
 
 use crate::abi::{self, es_credential_provider, es_credentials};
 use crate::callbacks::{Callbacks, HostPtr};
-use emusync_remote::{CallbackCredentials, ExpiringCredentials, RemoteError, S3Credentials};
+use emusync_remote::{CallbackCredentials, Credentials, ExpiringCredentials, RemoteError, S3Credentials};
 use std::ffi::CString;
 use std::sync::Arc;
 
@@ -49,16 +50,31 @@ fn parse(c: &es_credentials) -> Result<ExpiringCredentials, RemoteError> {
                 return Err(RemoteError::Auth("credential provider returned empty S3 keys".into()));
             }
             Ok(ExpiringCredentials {
-                creds: S3Credentials {
+                creds: Credentials::S3(S3Credentials {
                     access_key_id,
                     secret_access_key,
                     session_token: (!token.is_empty()).then_some(token),
-                },
+                }),
                 expires_unix_ms: (c.expires_unix_ms != 0).then_some(c.expires_unix_ms),
             })
         }
-        abi::ES_CRED_NONE => Err(RemoteError::Auth("S3 remotes need ES_CRED_S3 credentials".into())),
-        k => Err(RemoteError::Auth(format!("credential kind {k} is not supported by S3 remotes"))),
+        abi::ES_CRED_BEARER | abi::ES_CRED_OAUTH_REFRESH => {
+            let token = abi::read_buf(&c.bearer_token).ok_or_else(|| bad("bearer_token"))?;
+            if token.is_empty() {
+                return Err(RemoteError::Auth("credential provider returned an empty bearer_token".into()));
+            }
+            Ok(if c.kind == abi::ES_CRED_BEARER {
+                ExpiringCredentials {
+                    creds: Credentials::Bearer(token),
+                    expires_unix_ms: (c.expires_unix_ms != 0).then_some(c.expires_unix_ms),
+                }
+            } else {
+                // The backend exchanges it for access tokens and refreshes those itself.
+                ExpiringCredentials { creds: Credentials::OAuthRefresh(token), expires_unix_ms: None }
+            })
+        }
+        abi::ES_CRED_NONE => Err(RemoteError::Auth("the credential provider returned no credentials".into())),
+        k => Err(RemoteError::Auth(format!("unknown credential kind {k}"))),
     }
 }
 

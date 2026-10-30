@@ -39,6 +39,8 @@ pub const ES_POLICY_NEWEST: i32 = 1;
 
 pub const ES_CRED_NONE: i32 = 0;
 pub const ES_CRED_S3: i32 = 1;
+pub const ES_CRED_BEARER: i32 = 2;
+pub const ES_CRED_OAUTH_REFRESH: i32 = 3;
 
 pub const ES_CF_READ_ONLY: u32 = 1 << 0;
 pub const ES_CF_NO_UPLOAD: u32 = 1 << 1;

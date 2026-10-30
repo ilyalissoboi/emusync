@@ -10,7 +10,8 @@ use crate::status_of;
 use emusync_core::{
     CardMode, ConflictPolicy, ContainerDesc, Engine, EngineOptions, HistoryEntry, KdfParams, Resolution,
 };
-use emusync_remote::{Remote, S3Config, S3Remote};
+use emusync_remote::dropbox::oauth::{self, SignInError};
+use emusync_remote::{Remote, RemoteError};
 use std::ffi::{c_char, c_int, c_void, CStr};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
@@ -256,12 +257,11 @@ pub unsafe extern "C" fn es_remote_add(
         if creds.is_null() || (*creds).get.is_none() {
             return Err(invalid("a credential provider with a get function is required"));
         }
-        if !uri.starts_with("s3://") {
-            return Err(invalid(format!("unsupported remote {uri:?} (this version supports s3:// only)")));
+        if !uri.starts_with("s3://") && !uri.starts_with("dropbox:") {
+            return Err(invalid(format!("unsupported remote {uri:?} (this version supports s3:// and dropbox:)")));
         }
-        let cfg = S3Config::parse(&uri).map_err(invalid)?;
         let provider = crate::creds::provider(*creds, &uri, client.shared.cb.clone());
-        let remote: Arc<dyn Remote> = Arc::new(S3Remote::new(cfg, Box::new(provider)).map_err(invalid)?);
+        let remote: Arc<dyn Remote> = Arc::from(emusync_remote::open(&uri, Box::new(provider)).map_err(invalid)?);
         let uri = remote.describe();
         let reserved = {
             // Reserved first, so a second es_remote_add can't slip in while this one is offline.
@@ -331,7 +331,7 @@ pub unsafe extern "C" fn es_oauth_begin(
     if !out_url.is_null() && cap > 0 {
         *out_url = 0;
     }
-    with_client(c, |_| Err(invalid("no backend in this version uses OAuth")))
+    with_client(c, |_| Err(invalid("es_oauth_begin is superseded by es_oauth_start")))
 }
 
 #[no_mangle]
@@ -340,7 +340,108 @@ pub unsafe extern "C" fn es_oauth_complete(
     _provider: *const c_char,
     _redirect_with_code: *const c_char,
 ) -> c_int {
-    with_client(c, |_| Err(invalid("no backend in this version uses OAuth")))
+    with_client(c, |_| Err(invalid("es_oauth_complete is superseded by es_oauth_finish")))
+}
+
+/// Writes `s` and a NUL into `out` (`cap` bytes), or fails with `ES_E_NO_SPACE`.
+unsafe fn write_out(out: *mut c_char, cap: usize, s: &str, what: &str) -> Result<(), i32> {
+    if out.is_null() {
+        return Err(invalid(format!("{what} is NULL")));
+    }
+    if s.len() + 1 > cap {
+        log::warn!("{what}: {} bytes needed", s.len() + 1);
+        return Err(ES_E_NO_SPACE);
+    }
+    std::ptr::copy_nonoverlapping(s.as_ptr(), out.cast::<u8>(), s.len());
+    *out.add(s.len()) = 0;
+    Ok(())
+}
+
+/// Clears a string output buffer, so it is "" whatever happens next.
+unsafe fn clear_str(out: *mut c_char, cap: usize) {
+    if !out.is_null() && cap > 0 {
+        *out = 0;
+    }
+}
+
+fn sign_in_status(e: SignInError) -> i32 {
+    log::warn!("sign-in: {e}");
+    match e {
+        SignInError::InvalidArg(_) => ES_E_INVALID_ARG,
+        SignInError::PortInUse(_) => ES_E_IO,
+        SignInError::Timeout => ES_TIMEOUT,
+        SignInError::Declined(_) => ES_E_AUTH,
+        SignInError::Remote(RemoteError::Network(_)) => ES_OFFLINE,
+        SignInError::Remote(RemoteError::Auth(_)) => ES_E_AUTH,
+        SignInError::Remote(_) => ES_E_IO,
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn es_oauth_start(
+    remote_uri: *const c_char,
+    redirect_uri: *const c_char,
+    out_url: *mut c_char,
+    url_cap: usize,
+    out_pending: *mut c_char,
+    pending_cap: usize,
+) -> c_int {
+    clear_str(out_url, url_cap);
+    clear_str(out_pending, pending_cap);
+    guarded(|| {
+        let uri = req_str(remote_uri, "remote_uri")?;
+        let redirect = opt_str(redirect_uri, "redirect_uri")?.unwrap_or_default();
+        let s = oauth::start(&uri, &redirect).map_err(sign_in_status)?;
+        write_out(out_url, url_cap, &s.url, "out_url")?;
+        write_out(out_pending, pending_cap, &s.pending, "out_pending").inspect_err(|_| clear_str(out_url, url_cap))?;
+        Ok(ES_OK)
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn es_oauth_wait_redirect(
+    pending: *const c_char,
+    timeout_ms: u32,
+    out_redirect: *mut c_char,
+    cap: usize,
+) -> c_int {
+    clear_str(out_redirect, cap);
+    guarded(|| {
+        let pending = req_str(pending, "pending")?;
+        if out_redirect.is_null() {
+            return Err(invalid("out_redirect is NULL"));
+        }
+        let redirect =
+            oauth::wait_redirect(&pending, Duration::from_millis(timeout_ms.into())).map_err(sign_in_status)?;
+        write_out(out_redirect, cap, &redirect, "out_redirect")?;
+        Ok(ES_OK)
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn es_oauth_finish(
+    pending: *const c_char,
+    redirect_or_code: *const c_char,
+    out_token: *mut c_char,
+    token_cap: usize,
+    out_account: *mut c_char,
+    account_cap: usize,
+) -> c_int {
+    clear_str(out_token, token_cap);
+    clear_str(out_account, account_cap);
+    guarded(|| {
+        let pending = zeroize::Zeroizing::new(req_str(pending, "pending")?);
+        let input = req_str(redirect_or_code, "redirect_or_code")?;
+        if out_token.is_null() || out_account.is_null() {
+            return Err(invalid("out_token and out_account are required"));
+        }
+        let s = oauth::finish(&pending, &input).map_err(sign_in_status)?;
+        let token = zeroize::Zeroizing::new(s.refresh_token);
+        write_out(out_token, token_cap, &token, "out_token")?;
+        write_out(out_account, account_cap, &format!("{}\t{}", s.account_id, s.email), "out_account")
+            .inspect_err(|_| std::ptr::write_bytes(out_token, 0, token_cap))?;
+        Ok(ES_OK)
+    })
 }
 
 // ----------------------------------------------------------------------------------------------

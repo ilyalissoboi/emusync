@@ -1,8 +1,9 @@
-//! `emusync` command-line tool (DESIGN §12): memory card sync through S3, per save for PS2
-//! cards (unit mode) or as whole files.
+//! `emusync` command-line tool (DESIGN §12): memory card sync through S3 or Dropbox, per save
+//! for PS2 cards (unit mode) or as whole files.
 //!
 //! S3 credentials come from `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and optionally
-//! `AWS_SESSION_TOKEN`; they are never written to the data directory.
+//! `AWS_SESSION_TOKEN`; they are never written to the data directory. The Dropbox sign-in's
+//! refresh token is kept in the system's credential store (DESIGN §30.6).
 //!
 //! This is a library only so that two binaries can share it: `emusync`, and `emusyncw`, which
 //! has no console window on Windows and is what `emusync service` starts at login.
@@ -18,12 +19,13 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use zeroize::Zeroizing;
 
+mod dropbox;
 mod logging;
 mod service;
 mod watch;
 
 #[derive(Parser)]
-#[command(name = "emusync", version, about = "Sync emulator memory cards through S3")]
+#[command(name = "emusync", version, about = "Sync emulator memory cards through S3 or Dropbox")]
 struct Cli {
     /// Local state directory [env: EMUSYNC_DATA_DIR] (default: the platform data directory).
     #[arg(long, global = true)]
@@ -87,8 +89,9 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum RemoteCmd {
-    /// Register the remote, e.g. s3://my-saves/emusync/v1?region=eu-west-1 or
-    /// s3://saves/emusync/v1?endpoint=http://nas.local:9000&path_style=1
+    /// Register the remote, e.g. s3://my-saves/emusync/v1?region=eu-west-1,
+    /// s3://saves/emusync/v1?endpoint=http://nas.local:9000&path_style=1, or dropbox (the
+    /// folder dropbox:/saves in Dropbox's Apps/emusync), which signs in first.
     ///
     /// If the repository is encrypted, asks for its passphrase (once per device).
     Add {
@@ -98,7 +101,18 @@ enum RemoteCmd {
         /// stays unencrypted. On an existing encrypted one, the same as unlocking it.
         #[arg(long)]
         encrypt: bool,
+        /// Dropbox: don't open a browser; print the sign-in page and ask for the code it shows.
+        #[arg(long)]
+        no_browser: bool,
     },
+    /// Sign in to Dropbox again, e.g. after disconnecting emusync in Dropbox's settings.
+    Login {
+        /// Don't open a browser; print the sign-in page and ask for the code it shows.
+        #[arg(long)]
+        no_browser: bool,
+    },
+    /// Sign out of Dropbox on this device: the sign-in is revoked and deleted.
+    Logout,
     /// Show the configured remote.
     Show,
     /// Enter the passphrase of the encrypted repository, so this device can sync with it.
@@ -292,11 +306,38 @@ fn open(cli: &Cli) -> AnyResult<Engine> {
     Ok(Engine::open(dir, opts)?)
 }
 
+/// The credentials for `uri`: S3 keys from the environment, or the Dropbox sign-in.
+fn credentials(uri: &str, data_dir: &Path) -> Box<dyn emusync_remote::CredentialProvider> {
+    if dropbox::is_dropbox(uri) {
+        Box::new(dropbox::TokenProvider::new(data_dir))
+    } else {
+        Box::new(emusync_remote::EnvCredentials)
+    }
+}
+
+/// The configured Dropbox remote, for `remote login` and `logout`.
+fn dropbox_remote(engine: &Engine) -> AnyResult<String> {
+    match engine.remote_uri()? {
+        Some(uri) if dropbox::is_dropbox(&uri) => Ok(uri),
+        Some(uri) => Err(format!("the remote is {uri}, not Dropbox").into()),
+        None => Err("no remote configured (run `emusync remote add dropbox`)".into()),
+    }
+}
+
 /// Attaches the configured remote, if any.
-fn attach(engine: &mut Engine) -> AnyResult<bool> {
+fn attach(engine: &mut Engine, cli: &Cli) -> AnyResult<bool> {
     match engine.remote_uri()? {
         Some(uri) => {
-            let remote = emusync_remote::open(&uri, Box::new(emusync_remote::EnvCredentials))?;
+            let remote = emusync_remote::open(&uri, credentials(&uri, &data_dir(cli)))?;
+            // A Dropbox token can reach another account's repository at the same URI
+            // (EMUSYNC_DROPBOX_TOKEN, say): check before anything is pulled or pushed. Offline,
+            // the cycle can't reach it either.
+            if dropbox::is_dropbox(&uri) {
+                match engine.check_repository(&*remote) {
+                    Err(e) if e.is_offline() => log::info!("repository not checked: {e}"),
+                    other => other?,
+                }
+            }
             engine.attach_remote(Arc::from(remote));
             Ok(true)
         }
@@ -379,10 +420,16 @@ fn run(cli: Cli) -> AnyResult<ExitCode> {
     }
     let mut engine = open(&cli)?;
     match &cli.cmd {
-        Cmd::Remote(RemoteCmd::Add { uri, encrypt }) => {
+        Cmd::Remote(RemoteCmd::Add { uri, encrypt, no_browser }) => {
+            let uri = dropbox::expand_uri(uri);
+            let dir = data_dir(&cli);
+            // Parsed first, so a bad URI doesn't send the user through a sign-in.
             let remote: Arc<dyn emusync_remote::Remote> =
-                Arc::from(emusync_remote::open(uri, Box::new(emusync_remote::EnvCredentials))?);
+                Arc::from(emusync_remote::open(&uri, credentials(&uri, &dir))?);
             engine.check_remote(&remote.describe())?;
+            if dropbox::is_dropbox(&uri) && !dropbox::is_signed_in(&dir) {
+                dropbox::login(&uri, &dir, *no_browser, &|r| Ok(engine.check_repository(r)?))?;
+            }
             let conditional = if *encrypt {
                 let new = remote.get("repo.json")?.is_none();
                 let pass = if new {
@@ -416,6 +463,15 @@ fn run(cli: Cli) -> AnyResult<ExitCode> {
                 }
             }
         }
+        Cmd::Remote(RemoteCmd::Login { no_browser }) => {
+            let uri = dropbox_remote(&engine)?;
+            // A sign-in to another account would reach another repository at the same URI.
+            dropbox::login(&uri, &data_dir(&cli), *no_browser, &|r| Ok(engine.check_repository(r)?))?;
+        }
+        Cmd::Remote(RemoteCmd::Logout) => {
+            let uri = dropbox_remote(&engine)?;
+            dropbox::logout(&uri, &data_dir(&cli))?;
+        }
         Cmd::Remote(RemoteCmd::Unlock) => {
             if engine.remote_uri()?.is_none() {
                 return Err("no remote configured (run `emusync remote add <uri>`)".into());
@@ -437,6 +493,14 @@ fn run(cli: Cli) -> AnyResult<ExitCode> {
                         "remote:  {uri} ({})",
                         if engine.conditional_writes() { "conditional writes" } else { "HEAD-before-PUT" }
                     );
+                    if dropbox::is_dropbox(&uri) {
+                        let dir = data_dir(&cli);
+                        match (dropbox::is_signed_in(&dir), dropbox::account_email(&dir)) {
+                            (true, Some(email)) => println!("dropbox: signed in as {email}"),
+                            (true, None) => println!("dropbox: signed in"),
+                            (false, _) => println!("dropbox: not signed in (run `emusync remote login`)"),
+                        }
+                    }
                     println!("encryption: {}", encryption_line(&engine));
                 }
                 None => println!("remote:  none (run `emusync remote add <uri>`)"),
@@ -521,14 +585,14 @@ fn run(cli: Cli) -> AnyResult<ExitCode> {
             };
             engine.set_card_mode(card, mode)?;
             println!("{card} now syncs in {} mode on every device", mode.as_str());
-            if !no_sync && attach(&mut engine)? {
+            if !no_sync && attach(&mut engine, &cli)? {
                 let report = engine.sync()?;
                 print_report(&engine, &report)?;
             }
         }
         Cmd::Card(CardCmd::Inspect { .. }) => unreachable!("handled before opening the engine"),
         Cmd::Sync(args) => {
-            if !attach(&mut engine)? {
+            if !attach(&mut engine, &cli)? {
                 return Err("no remote configured (run `emusync remote add <uri>`)".into());
             }
             engine.set_policy(match args.policy {
@@ -543,7 +607,7 @@ fn run(cli: Cli) -> AnyResult<ExitCode> {
                 let n = watch::control::load_env_file(f)?;
                 log::debug!("{n} variable(s) from {}", f.display());
             }
-            if !attach(&mut engine)? {
+            if !attach(&mut engine, &cli)? {
                 return Err("no remote configured (run `emusync remote add <uri>`)".into());
             }
             if engine.encryption() == Encryption::Locked {
@@ -556,6 +620,7 @@ fn run(cli: Cli) -> AnyResult<ExitCode> {
                 data_dir: std::path::absolute(data_dir(&cli))?,
                 device_name: cli.device_name.clone(),
                 verbose: cli.verbose,
+                dropbox: engine.remote_uri()?.is_some_and(|u| dropbox::is_dropbox(&u)),
             };
             if matches!(cmd, service::ServiceCmd::Install { .. }) && engine.remote_uri()?.is_none() {
                 return Err("no remote configured (run `emusync remote add <uri>` first)".into());
@@ -580,7 +645,7 @@ fn run(cli: Cli) -> AnyResult<ExitCode> {
         Cmd::Restore { target, version, no_sync } => {
             let rec = engine.restore(target, version)?;
             println!("restored {} as new version {}", short_id(&rec.content), short_id(&rec.id));
-            if !no_sync && attach(&mut engine)? {
+            if !no_sync && attach(&mut engine, &cli)? {
                 let report = engine.sync()?;
                 print_report(&engine, &report)?;
             }
@@ -613,7 +678,7 @@ fn run(cli: Cli) -> AnyResult<ExitCode> {
             };
             let rec = engine.resolve(conflict.id, resolution)?;
             println!("resolved with merge version {}", short_id(&rec.id));
-            if attach(&mut engine)? {
+            if attach(&mut engine, &cli)? {
                 let report = engine.sync()?;
                 print_report(&engine, &report)?;
             }

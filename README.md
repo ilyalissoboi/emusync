@@ -20,7 +20,7 @@ Android port does. Repositories can be [end-to-end encrypted](#end-to-end-encryp
 |---|---|
 | `emusync-core` | Data model, version DAG, SQLite state, sync engine |
 | `emusync-formats` | Container format adapters: `ps2.card` (PS2 memory card file system), `ps2.card.folder` (PCSX2 folder cards), `gc.card` (GameCube card images), `gc.gci` (Dolphin GCI folders), `psp.savedata` (PSP memory stick saves), `ps1.card` (PS1 memory cards: raw, `.gme`, `.mem`), `raw` |
-| `emusync-remote` | `Remote` trait, S3 backend (SigV4 + rustls), in-memory remote, conformance suite |
+| `emusync-remote` | `Remote` trait, S3 backend (SigV4 + rustls), Dropbox backend and sign-in (OAuth with PKCE), in-memory remote, conformance suite |
 | `emusync-ffi` | C ABI v1 (`include/emusync.h`): static library, or shared with `cargo rustc -p emusync-ffi --lib --crate-type cdylib` ([desktop](#building-for-windows-macos-and-linux), [Android](#building-for-android)) |
 | `emusyncd` | The `emusync` command-line tool, including the `emusync watch` sidecar; `emusyncw`, the same tool without a console window on Windows |
 
@@ -88,6 +88,26 @@ quick to sync. Folders over 32 MiB are game data that games install from the dis
 they are left alone and never uploaded. Files directly in `SAVEDATA` aren't synced either. A
 missing `SAVEDATA` folder is created when saves arrive, if its `PSP` folder exists. Details:
 [DESIGN §27](docs/DESIGN.md#27-implementation-notes-psp-saves).
+
+## Dropbox (preview)
+
+Instead of an S3 bucket and keys, a repository can live in your Dropbox: sign in once per
+device, and the saves go to a folder in `Apps/emusync`.
+
+```sh
+emusync remote add dropbox                 # dropbox:/saves; opens the browser to sign in
+emusync remote add dropbox --no-browser    # prints the sign-in page, asks for the code
+emusync status                             # dropbox: signed in as you@example.com
+emusync remote login                       # sign in again, e.g. after disconnecting emusync
+emusync remote logout                      # revoke the sign-in and delete it from this device
+```
+
+The sign-in is kept in the system's credential store, never in the data directory;
+`EMUSYNC_DROPBOX_TOKEN` overrides it for scripts. **Preview:** the emusync Dropbox app isn't
+registered yet, so builds have no built-in app key: until then, register your own app (App
+folder access, `files.content.read`/`write`, `files.metadata.read`, redirect URI
+`http://127.0.0.1:53682/dropbox`) and use `dropbox:/saves?app_key=<its key>`, or build with
+`EMUSYNC_DROPBOX_APP_KEY` set. Details: [DESIGN §30](docs/DESIGN.md#30-dropbox-backend).
 
 ## End-to-end encryption
 

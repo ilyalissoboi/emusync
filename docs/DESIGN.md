@@ -2176,9 +2176,10 @@ is moved to meta: a PS1 card keeps no times.
   - `emusync card inspect` lists them with their title keys, PocketStation-style names
     (`BASLUSP00892…`) included.
 
-## 30. Dropbox backend (design draft)
+## 30. Dropbox backend
 
-Status: design, not implemented. The second `Remote`, after S3 (§6.2), and the first that
+Status: the backend, sign-in, C ABI and CLI are implemented (30.10); the Android AAR and the
+host integrations are not yet. The second `Remote`, after S3 (§6.2), and the first that
 signs in with an account instead of keys. With S3 the user has to create a bucket, a policy and
 keys (§15, question 6). With Dropbox they press "Sign in with Dropbox" and approve. Why Dropbox
 before Google Drive or OneDrive:
@@ -2228,8 +2229,8 @@ dropbox:/saves?app_key=<key>          a fork's own Dropbox app
 - **Case.** Dropbox paths are case-insensitive and keep the case they were created with. Every
   key the core writes is lower-case ASCII (hex hashes, UUIDs, fixed names), so no two keys fold
   together. The backend refuses a key with upper-case letters (`RemoteError::Other`), so a
-  future key scheme can't collide silently. Listings use each entry's `name`, never
-  `path_lower`.
+  future key scheme can't collide silently. Listings take each key from the entry's
+  `path_lower` (keys are lower-case already), minus the repository folder.
 - **Which account.** The URI doesn't name the Dropbox account. A data directory bound to one
   account's repository that is later signed in to another sees a different `repo.json` and is
   refused (the binding check of §20). Hosts keep one data directory per URI *and* account: the
@@ -2377,7 +2378,8 @@ emusync remote logout                      # revoke the token and delete it from
 ```
 
 - The refresh token goes into the system's credential store (§24): service `emusync`, name
-  `dropbox-refresh-token`, with the usual fallback file on Linux without a Secret Service. That
+  `dropbox-refresh-token-<hash>` (one per data directory, 30.10), with the usual fallback file
+  on Linux without a Secret Service. That
   is what `emusync watch` running as a service reads. `EMUSYNC_DROPBOX_TOKEN` overrides it for
   scripts and `watch --env-file`, as the `AWS_*` variables do for S3.
 - `emusync status` shows the account: `remote: dropbox:/saves (alice@example.com)`.
@@ -2448,3 +2450,50 @@ opens the URL with the toolkit (`QDesktopServices::openUrl` in Qt). The token is
 4. **Interoperating with a folder backend.** A desktop could sync `~/Dropbox/Apps/emusync/saves`
    through Dropbox's own app with a future `folder://` backend, while a phone uses the API. The
    layout allows it, if the folder backend tolerates files that are still arriving.
+
+### 30.10 Implementation notes
+
+Where the implementation pins down or differs from the design above:
+
+- **Code.** `emusync-remote`: `credentials.rs` (the backend-neutral `Credentials` enum: `S3`,
+  `Bearer`, `OAuthRefresh`; S3 refuses the others with `Auth`), `dropbox/mod.rs` (the remote),
+  `dropbox/oauth.rs` (the token cache, `start`, `wait_redirect`, `finish`, `revoke`),
+  `dropbox/fake.rs` (the fake server, also behind the crate feature `fake-dropbox`).
+  `emusync_remote::open` takes `dropbox:` URIs, and so does `es_remote_add`.
+- **The app key.** The app isn't registered yet. The built-in key is read at build time from
+  `EMUSYNC_DROPBOX_APP_KEY` (`dropbox::BUILT_IN_APP_KEY`); without it a URI needs `?app_key=…`,
+  and sign-in and `es_remote_add` say so (`ES_E_INVALID_ARG`). The CLI's loopback redirect is
+  `http://127.0.0.1:53682/dropbox`, to be registered with the app.
+- **Listing.** `list` lists the prefix's folder recursively, so it returns every key under the
+  prefix as the trait says, not only the folder's own files; `list_dirs` lists one level. Both
+  follow `list_folder/continue` and sort; a missing folder is empty.
+- **Retries.** Any 401 drops the access token and retries once with a new one; a refresh the
+  token endpoint refuses (`invalid_grant`) is `Auth`. 429 and 503 wait for `Retry-After` (at
+  most 60 s), three times, then `Network`; other 5xx and transport errors retry twice, as S3.
+- **The C ABI.** `ES_CRED_BEARER` and `ES_CRED_OAUTH_REFRESH` (3) in `bearer_token`;
+  `es_oauth_start`, `es_oauth_wait_redirect` and `es_oauth_finish` as in 30.5, except that
+  `es_oauth_finish` can block for about 20 s (the exchange and the account lookup, each with the
+  usual timeouts). `es_oauth_begin` and `es_oauth_complete` stay, always `ES_E_INVALID_ARG`.
+- **The CLI.** `emusync remote add dropbox` (or `dropbox:/…`) signs in first when this data
+  directory has no sign-in; `remote login` and `remote logout`; `status` shows the account. The
+  refresh token is the credential store's `emusync`/`dropbox-refresh-token-<hash>`, one per data
+  directory (the hash is of its path), so two data directories can use two accounts; the
+  account's id and email are in `<data_dir>/dropbox-account`, which is not secret. The redirect
+  listener binds first (`oauth::listen`), then the browser is opened, without waiting for it,
+  with `rundll32 url.dll,FileProtocolHandler`, `open` or `xdg-open`; when that fails within 2 s,
+  or the port is taken, or with `--no-browser`, the user pastes the code.
+- **Another account.** A sign-in to another Dropbox account reaches another repository at the
+  same URI, and `attach_remote` (which `sync` and `watch` use) doesn't read `repo.json`.
+  `Engine::check_repository` compares the remote's `repo.json` id with the bound one
+  (`Incompatible` if it differs or is missing). The CLI runs it on a new sign-in before storing
+  its token, and when it attaches a Dropbox remote (skipped when offline, as the cycle would be).
+  C ABI hosts are covered by `es_remote_add`, which binds and checks the same way.
+- **Tests.** The conformance suite runs against the fake at a repository folder and at the app
+  folder's root, with pages of 2 or 3 entries; identical uploads conflict; 401s refresh once and
+  revocation is `Auth`; rate limits, 5xx, a full account, a bad request and an unreachable host;
+  the whole sign-in (state mismatch, declined, a code used twice, a wrong verifier,
+  paste-the-code, revoke); a refresh token used with another app key is refused. The C ABI tests
+  cover the credential kinds and the three functions without a network.
+- **Not done yet:** the AAR's `DropboxSignIn` and settings (30.6), sign-in buttons in the
+  PCSX2, Dolphin and PPSSPP forks, nightly runs against a real account, registering the app and
+  applying for production status (30.1), and everything in 30.7.
