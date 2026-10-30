@@ -44,25 +44,36 @@ interface SyncBackend {
 }
 
 /**
- * What [SyncBackend.start] needs, from [SyncSettings]. [toString] leaves out the secret access key
- * and the passphrase, so a config can be logged.
+ * What [SyncBackend.start] needs, from [SyncSettings]. [toString] leaves out the secret access key,
+ * the Dropbox refresh token and the passphrase, so a config can be logged.
+ *
+ * The host's credential provider answers with the S3 keys (`ES_CRED_S3`), or, for a `dropbox:`
+ * storage ([isDropbox]), with [dropboxRefreshToken] as `ES_CRED_OAUTH_REFRESH` (DESIGN §30.5).
  */
-class SyncConfig(
+class SyncConfig @JvmOverloads constructor(
     /** emusync's data folder for this storage: database, upload queue, repository key. */
     val dataDir: File,
     /** This device's name, as other devices show it. */
     val deviceName: String,
     /** The host app's version, recorded with each save version. */
     val appVersion: String,
-    /** The storage, e.g. `s3://bucket/prefix?region=eu-west-1`. */
+    /** The storage, e.g. `s3://bucket/prefix?region=eu-west-1` or `dropbox:/saves`. */
     val remoteUri: String,
+    /** S3 only; empty for Dropbox. */
     val accessKeyId: String,
+    /** S3 only; empty for Dropbox. */
     val secretAccessKey: String,
     /** The end-to-end encryption passphrase; null when the repository isn't encrypted. */
     val passphrase: String?,
+    /** Dropbox only: the sign-in's refresh token, from [DropboxSignIn]; null for S3. */
+    val dropboxRefreshToken: String? = null,
 ) {
+    /** The storage is Dropbox. */
+    val isDropbox: Boolean get() = SyncSettings.isDropboxUri(remoteUri)
+
     override fun toString(): String =
         "SyncConfig(dataDir=$dataDir, deviceName=$deviceName, appVersion=$appVersion, " +
             "remoteUri=$remoteUri, accessKeyId=$accessKeyId, secretAccessKey=<hidden>, " +
-            "passphrase=${if (passphrase == null) "none" else "<hidden>"})"
+            "passphrase=${if (passphrase == null) "none" else "<hidden>"}, " +
+            "dropboxRefreshToken=${if (dropboxRefreshToken == null) "none" else "<hidden>"})"
 }

@@ -1,2 +1,22 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest />
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <application>
+        <!-- The end of a Dropbox sign-in (DropboxSignIn): one scheme per app, so two emulators
+             with the AAR don't both claim the redirect. -->
+        <activity
+            android:name=".DropboxRedirectActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar">
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="${applicationId}.emusync" android:host="dropbox" />
+            </intent-filter>
+        </activity>
+    </application>
+
+</manifest>

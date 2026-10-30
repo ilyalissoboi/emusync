@@ -20,14 +20,17 @@ import javax.crypto.spec.GCMParameterSpec
  *
  * - The storage address, access key ID, device name and the on/off switch are in
  *   SharedPreferences ([prefsName]).
- * - The secret access key and the optional encryption passphrase are encrypted with an AES key in
- *   the Android Keystore ([keyAlias]), which never leaves the device. Android's backup may copy
- *   the encrypted values to a new phone but not the key, so there they read as "not set" and the
- *   user enters them again.
+ * - The secret access key, the Dropbox sign-in's refresh token and the optional encryption
+ *   passphrase are encrypted with an AES key in the Android Keystore ([keyAlias]), which never
+ *   leaves the device. Android's backup may copy the encrypted values to a new phone but not the
+ *   key, so there they read as "not set" and the user enters them (or signs in) again.
+ * - A `dropbox:` address syncs through Dropbox (DESIGN §30): it needs a sign-in
+ *   ([DropboxSignIn]) instead of keys.
  * - emusync's data for a storage lives in `noBackupFilesDir/emusync-<hash of the address>`
  *   ([dataDir]): it must not be restored onto another device, whose installation would then share
  *   this one's device identity. One folder per address, because emusync binds a data folder to
- *   one storage for good.
+ *   one storage for good; for Dropbox, one per address and account, because the address doesn't
+ *   name the account.
  *
  * The defaults suit a new host; ARMSX2's existing settings are `prefsName = "memcard_sync"`,
  * `keyAlias = "armsx2.memcardSync.secret"`. Thread-safe; the Keystore calls take a few
@@ -50,9 +53,21 @@ class SyncSettings @JvmOverloads constructor(
         val hasPassphrase: Boolean,
         /** The stored name, or [defaultDeviceName] when none is. */
         val deviceName: String,
+        /** A Dropbox sign-in is stored and can be decrypted on this device. */
+        val hasDropboxSignIn: Boolean = false,
+        /** The signed-in Dropbox account's email address, for display; empty if unknown. */
+        val dropboxEmail: String = "",
     ) {
-        /** Switched on, with storage and both keys: what [SyncController] needs to start. */
-        val isComplete: Boolean get() = enabled && remoteUri.isNotBlank() && accessKeyId.isNotBlank() && hasSecret
+        /** The storage is Dropbox: it needs a sign-in, not keys. */
+        val isDropbox: Boolean get() = isDropboxUri(remoteUri)
+
+        /**
+         * Switched on, with storage and its credentials (both keys, or a Dropbox sign-in): what
+         * [SyncController] needs to start.
+         */
+        val isComplete: Boolean
+            get() = enabled && remoteUri.isNotBlank() &&
+                if (isDropbox) hasDropboxSignIn else accessKeyId.isNotBlank() && hasSecret
     }
 
     fun load(): Values {
@@ -64,6 +79,8 @@ class SyncSettings @JvmOverloads constructor(
             hasSecret = unseal(KEY_SECRET) != null,
             hasPassphrase = unseal(KEY_PASSPHRASE) != null,
             deviceName = p.getString(KEY_DEVICE, "").orEmpty().ifBlank { defaultDeviceName() },
+            hasDropboxSignIn = unseal(KEY_DROPBOX_TOKEN) != null,
+            dropboxEmail = p.getString(KEY_DROPBOX_EMAIL, "").orEmpty(),
         )
     }
 
@@ -97,9 +114,43 @@ class SyncSettings @JvmOverloads constructor(
      */
     fun passphrase(): String? = unseal(KEY_PASSPHRASE)
 
-    /** emusync's data folder for [remoteUri], created if needed; see the class comment. */
-    fun dataDir(remoteUri: String): File {
-        val digest = MessageDigest.getInstance("SHA-256").digest(remoteUri.toByteArray(Charsets.UTF_8))
+    /**
+     * Stores a Dropbox sign-in from [DropboxSignIn]: the refresh token encrypted, the account in
+     * plain preferences. Replaces an earlier one.
+     */
+    fun setDropboxSignIn(refreshToken: String, accountId: String, email: String) {
+        require(refreshToken.isNotEmpty()) { "empty refresh token" }
+        seal(KEY_DROPBOX_TOKEN, refreshToken)
+        edit {
+            putString(KEY_DROPBOX_ACCOUNT, accountId)
+            putString(KEY_DROPBOX_EMAIL, email)
+        }
+    }
+
+    /** Forgets the Dropbox sign-in on this device (sign-out). */
+    fun clearDropboxSignIn() {
+        edit {
+            remove(KEY_DROPBOX_TOKEN)
+            remove(KEY_DROPBOX_ACCOUNT)
+            remove(KEY_DROPBOX_EMAIL)
+        }
+    }
+
+    /** The stored Dropbox refresh token, for revoking it at sign-out; null when there is none. */
+    fun dropboxRefreshToken(): String? = unseal(KEY_DROPBOX_TOKEN)
+
+    /** The signed-in Dropbox account's id (`dbid:…`); empty when there is none. */
+    fun dropboxAccountId(): String = prefs().getString(KEY_DROPBOX_ACCOUNT, "").orEmpty()
+
+    /**
+     * emusync's data folder for [remoteUri], created if needed; see the class comment. For a
+     * Dropbox address, [account] (the account id) is part of the name, so another account gets
+     * another folder; S3 folders keep the name they always had.
+     */
+    @JvmOverloads
+    fun dataDir(remoteUri: String, account: String = ""): File {
+        val key = if (account.isEmpty()) remoteUri else "$remoteUri\n$account"
+        val digest = MessageDigest.getInstance("SHA-256").digest(key.toByteArray(Charsets.UTF_8))
         val id = digest.take(8).joinToString("") { "%02x".format(it) }
         return File(app.noBackupFilesDir, "emusync-$id").apply { mkdirs() }
     }
@@ -107,7 +158,21 @@ class SyncSettings @JvmOverloads constructor(
     /** The config to start sync with, or null when sync is off or the settings are incomplete. */
     fun config(appVersion: String): SyncConfig? {
         val v = load()
-        if (!v.enabled || v.remoteUri.isBlank() || v.accessKeyId.isBlank()) return null
+        if (!v.enabled || v.remoteUri.isBlank()) return null
+        if (v.isDropbox) {
+            val token = unseal(KEY_DROPBOX_TOKEN) ?: return null
+            return SyncConfig(
+                dataDir = dataDir(v.remoteUri, dropboxAccountId()),
+                deviceName = v.deviceName,
+                appVersion = appVersion,
+                remoteUri = v.remoteUri,
+                accessKeyId = "",
+                secretAccessKey = "",
+                passphrase = unseal(KEY_PASSPHRASE),
+                dropboxRefreshToken = token,
+            )
+        }
+        if (v.accessKeyId.isBlank()) return null
         val secret = unseal(KEY_SECRET) ?: return null
         return SyncConfig(
             dataDir = dataDir(v.remoteUri),
@@ -122,13 +187,14 @@ class SyncSettings @JvmOverloads constructor(
 
     // ---- storage ---------------------------------------------------------------------------
 
-    private fun prefs(): SharedPreferences = app.getSharedPreferences(prefsName, Context.MODE_PRIVATE)
+    internal fun prefs(): SharedPreferences = app.getSharedPreferences(prefsName, Context.MODE_PRIVATE)
 
-    private inline fun edit(block: SharedPreferences.Editor.() -> Unit) {
+    internal inline fun edit(block: SharedPreferences.Editor.() -> Unit) {
         prefs().edit().apply(block).apply()
     }
 
-    private fun seal(key: String, value: String) {
+    /** Stores [value] encrypted with the Keystore key; an empty value removes it. */
+    internal fun seal(key: String, value: String) {
         if (value.isEmpty()) {
             edit { remove(key) }
             return
@@ -139,7 +205,8 @@ class SyncSettings @JvmOverloads constructor(
         edit { putString(key, Base64.encodeToString(sealed, Base64.NO_WRAP)) }
     }
 
-    private fun unseal(key: String): String? {
+    /** The value [seal] stored, or null when there is none or it can't be decrypted here. */
+    internal fun unseal(key: String): String? {
         val sealed = prefs().getString(key, null) ?: return null
         return runCatching {
             val bytes = Base64.decode(sealed, Base64.NO_WRAP)
@@ -180,11 +247,18 @@ class SyncSettings @JvmOverloads constructor(
         private const val KEY_SECRET = "secretAccessKey.enc"
         private const val KEY_PASSPHRASE = "passphrase.enc"
         private const val KEY_DEVICE = "deviceName"
+        private const val KEY_DROPBOX_TOKEN = "dropboxRefreshToken.enc"
+        private const val KEY_DROPBOX_ACCOUNT = "dropboxAccountId"
+        private const val KEY_DROPBOX_EMAIL = "dropboxEmail"
         private const val KEYSTORE = "AndroidKeyStore"
         private const val TRANSFORMATION = "AES/GCM/NoPadding"
 
         /** Two settings objects creating the same key at once must not make two. */
         private val keyLock = Any()
+
+        /** Whether [remoteUri] is a Dropbox address (`dropbox:/saves`). */
+        @JvmStatic
+        fun isDropboxUri(remoteUri: String): Boolean = remoteUri.trim().startsWith("dropbox:")
 
         /** "Manufacturer Model", e.g. "AYN Thor"; "Android" when the system reports neither. */
         @JvmStatic
