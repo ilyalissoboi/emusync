@@ -1,6 +1,6 @@
 [package]
 name = "emusync-remote"
-description = "Storage backends for emusync: the Remote trait, an in-memory remote, and S3"
+description = "Storage backends for emusync: the Remote trait, an in-memory remote, S3 and Dropbox"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -11,8 +11,16 @@ rust-version.workspace = true
 aws-sigv4.workspace = true
 aws-credential-types.workspace = true
 aws-smithy-runtime-api.workspace = true
+base64.workspace = true
+getrandom.workspace = true
 hex.workspace = true
 log.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 ureq.workspace = true
 uuid.workspace = true
+
+[features]
+# The fake Dropbox server (`dropbox::fake`), for other crates' tests.
+fake-dropbox = []

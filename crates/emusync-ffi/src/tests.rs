@@ -792,6 +792,115 @@ fn remote_add_uses_the_credential_provider() {
     }
 }
 
+/// An ES_CRED_OAUTH_REFRESH answer with an empty token.
+unsafe extern "C" fn empty_refresh_token(_: *mut c_void, _: *const c_char, out: *mut es_credentials) -> c_int {
+    (*out).kind = ES_CRED_OAUTH_REFRESH;
+    0
+}
+
+/// S3 keys, whatever the remote.
+unsafe extern "C" fn any_s3_keys(_: *mut c_void, _: *const c_char, out: *mut es_credentials) -> c_int {
+    let out = &mut *out;
+    out.kind = ES_CRED_S3;
+    copy_str(&mut out.access_key_id, "AKIDEXAMPLE");
+    copy_str(&mut out.secret_access_key, "secret");
+    0
+}
+
+#[test]
+fn dropbox_remotes_take_oauth_credentials() {
+    let dev = Dev::new("pc", None, ES_POLICY_ASK);
+    let uri = cstr("dropbox:/saves?app_key=testkey");
+    unsafe {
+        // S3 keys are refused before any request, and so is an empty token.
+        let s3 = es_credential_provider { user: std::ptr::null_mut(), get: Some(any_s3_keys) };
+        assert_eq!(es_remote_add(dev.c, uri.as_ptr(), &s3), ES_E_AUTH);
+        let empty = es_credential_provider { user: std::ptr::null_mut(), get: Some(empty_refresh_token) };
+        assert_eq!(es_remote_add(dev.c, uri.as_ptr(), &empty), ES_E_AUTH);
+        let needs = es_credential_provider { user: std::ptr::null_mut(), get: Some(needs_sign_in) };
+        assert_eq!(es_remote_add(dev.c, uri.as_ptr(), &needs), ES_E_AUTH);
+        assert_eq!(es_remote_add(dev.c, cstr("dropbox:/a//b?app_key=k").as_ptr(), &needs), ES_E_INVALID_ARG);
+    }
+}
+
+#[test]
+fn oauth_sign_in_without_a_client() {
+    let mut url = [1 as c_char; 2048];
+    let mut pending = [1 as c_char; 2048];
+    let uri = cstr("dropbox:/saves?app_key=testkey");
+    unsafe {
+        assert_eq!(
+            es_oauth_start(
+                uri.as_ptr(),
+                cstr("").as_ptr(),
+                url.as_mut_ptr(),
+                url.len(),
+                pending.as_mut_ptr(),
+                pending.len()
+            ),
+            ES_OK
+        );
+        let url_s = CStr::from_ptr(url.as_ptr()).to_str().unwrap().to_string();
+        assert!(url_s.starts_with("https://www.dropbox.com/oauth2/authorize?client_id=testkey&"), "{url_s}");
+        assert!(CStr::from_ptr(pending.as_ptr()).to_bytes().len() > 40);
+
+        // Buffers too small: both outputs are "".
+        let mut small = [1 as c_char; 8];
+        assert_eq!(
+            es_oauth_start(
+                uri.as_ptr(),
+                std::ptr::null(),
+                url.as_mut_ptr(),
+                url.len(),
+                small.as_mut_ptr(),
+                small.len()
+            ),
+            ES_E_NO_SPACE
+        );
+        assert_eq!((url[0], small[0]), (0, 0));
+        // Not Dropbox, NULL arguments.
+        let mut p2 = [0 as c_char; 2048];
+        let s3 = cstr("s3://b/p");
+        assert_eq!(
+            es_oauth_start(s3.as_ptr(), std::ptr::null(), url.as_mut_ptr(), url.len(), p2.as_mut_ptr(), p2.len()),
+            ES_E_INVALID_ARG
+        );
+        assert_eq!(
+            es_oauth_start(std::ptr::null(), std::ptr::null(), url.as_mut_ptr(), url.len(), p2.as_mut_ptr(), p2.len()),
+            ES_E_INVALID_ARG
+        );
+
+        // A redirect from another sign-in is refused before any request.
+        let mut token = [1 as c_char; 1024];
+        let mut account = [1 as c_char; 1024];
+        let wrong = cstr("http://127.0.0.1:53682/dropbox?code=C&state=not-this-one");
+        let finish = |pending: *const c_char, input: *const c_char, token: &mut [c_char], account: &mut [c_char]| {
+            es_oauth_finish(pending, input, token.as_mut_ptr(), token.len(), account.as_mut_ptr(), account.len())
+        };
+        assert_eq!(finish(pending.as_ptr(), wrong.as_ptr(), &mut token, &mut account), ES_E_AUTH);
+        assert_eq!((token[0], account[0]), (0, 0));
+        let declined = cstr("http://127.0.0.1:53682/dropbox?error=access_denied");
+        assert_eq!(finish(pending.as_ptr(), declined.as_ptr(), &mut token, &mut account), ES_E_AUTH);
+        assert_eq!(finish(cstr("garbage").as_ptr(), wrong.as_ptr(), &mut token, &mut account), ES_E_INVALID_ARG);
+        assert_eq!(finish(pending.as_ptr(), std::ptr::null(), &mut token, &mut account), ES_E_INVALID_ARG);
+
+        // Waiting needs a loopback redirect; nobody comes in time.
+        let mut redirect = [1 as c_char; 1024];
+        assert_eq!(
+            es_oauth_wait_redirect(pending.as_ptr(), 50, redirect.as_mut_ptr(), redirect.len()),
+            ES_E_INVALID_ARG
+        );
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let loopback = cstr(&format!("http://127.0.0.1:{port}/dropbox"));
+        assert_eq!(
+            es_oauth_start(uri.as_ptr(), loopback.as_ptr(), url.as_mut_ptr(), url.len(), p2.as_mut_ptr(), p2.len()),
+            ES_OK
+        );
+        assert_eq!(es_oauth_wait_redirect(p2.as_ptr(), 50, redirect.as_mut_ptr(), redirect.len()), ES_TIMEOUT);
+        assert_eq!(redirect[0], 0);
+    }
+}
+
 #[test]
 fn unimplemented_features_are_refused() {
     let dev = Dev::new("pc", None, ES_POLICY_ASK);

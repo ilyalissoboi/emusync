@@ -212,9 +212,12 @@ ES_API void      es_client_destroy(es_client* c, uint32_t timeout_ms);
 /* ------------------------------------------------------------------------------------------ */
 
 typedef enum es_credential_kind {
-    ES_CRED_NONE = 0,           /* reserved (unsigned requests): rejected by S3 remotes */
-    ES_CRED_S3,                 /* access key + secret, optionally STS session token + expiry */
-    ES_CRED_BEARER              /* reserved (OAuth bearer token, later backends) */
+    ES_CRED_NONE = 0,           /* reserved (unsigned requests): rejected by every remote */
+    ES_CRED_S3,                 /* s3://: access key + secret, optionally STS session token + expiry */
+    ES_CRED_BEARER,             /* dropbox:: an OAuth access token the host refreshes itself, with
+                                   its expiry (expires_unix_ms; 0 = until rejected) */
+    ES_CRED_OAUTH_REFRESH       /* dropbox:: the refresh token from es_oauth_finish. The library
+                                   exchanges it for access tokens, kept in memory only */
 } es_credential_kind;
 
 /* Filled by the host's credential provider. Fixed buffers so no ownership crosses the ABI.
@@ -226,7 +229,7 @@ typedef struct es_credentials {
     char               secret_access_key[128];
     char               session_token[4096];    /* STS temporary credentials only; else "" */
     int64_t            expires_unix_ms;        /* 0 = static keys; else refreshed 5 min before */
-    char               bearer_token[4096];     /* ES_CRED_BEARER only */
+    char               bearer_token[4096];     /* ES_CRED_BEARER, ES_CRED_OAUTH_REFRESH */
 } es_credentials;
 
 /* Supplies credentials for `remote_uri`. Called from a library thread: when the remote is first
@@ -244,8 +247,14 @@ typedef struct es_credential_provider {
      "s3://my-saves/emusync/v1?region=eu-west-1"
      "s3://my-saves/emusync/v1?endpoint=https://<account>.r2.cloudflarestorage.com&region=auto"
      "s3://saves/emusync/v1?endpoint=http://nas.local:9000&path_style=1"
-   Reserved for later backends: "webdav://…", "dropbox:…", "gdrive:…", "onedrive:…",
-   "folder://…", "https://…" (reference server). Returns ES_E_INVALID_ARG for unsupported schemes,
+   Dropbox (docs/DESIGN.md §30): a folder in the emusync app's App folder, /Apps/emusync:
+     "dropbox:/saves"
+     "dropbox:/saves?app_key=<key>"   a fork's own Dropbox app (and so its own App folder)
+   with ES_CRED_OAUTH_REFRESH (or ES_CRED_BEARER) credentials from es_oauth_finish. A data_dir is
+   bound to the URI, not the account: use one data_dir per URI and account (es_oauth_finish
+   reports the account).
+   Reserved for later backends: "webdav://…", "gdrive:…", "onedrive:…", "folder://…",
+   "https://…" (reference server). Returns ES_E_INVALID_ARG for unsupported schemes,
    and for a remote other than the one this data_dir is already bound to.
    Blocks up to 10 s while it validates access with one LIST, probes conditional-write support
    and creates the repository if it is new (unencrypted, unless es_repo_create_encrypted came
@@ -322,9 +331,39 @@ ES_API es_status es_secret_get(const char* service, const char* name, const char
                                char* out, size_t cap, size_t* out_len);
 ES_API es_status es_secret_delete(const char* service, const char* name, const char* fallback_dir);
 
-/* OAuth PKCE helpers for later backends (not used by S3). begin writes an authorization URL
-   for the host to open. Return ES_E_INVALID_ARG until such a backend exists (begin writes "" to
-   out_url if cap > 0). */
+/* Signing in to Dropbox (docs/DESIGN.md §30.4, §30.5): the OAuth code flow with PKCE, no
+   client secret. They need no client, so a settings page can sign in before sync runs. The host
+   opens the URL in a browser (or a Custom Tab), and stores the refresh token es_oauth_finish
+   returns, like an S3 secret (es_secret_set on desktop, the Keystore on Android), to hand it
+   back as ES_CRED_OAUTH_REFRESH. Output buffers are "" on any error; ES_E_NO_SPACE if one is
+   too small (2048 bytes is enough for each). Don't call them on a UI thread: wait_redirect and
+   finish block.
+
+   es_oauth_start: for remote_uri, the URI the host will pass to es_remote_add; its app_key, if
+   any, picks the Dropbox app, else the built-in one (ES_E_INVALID_ARG in a build without one).
+   redirect_uri: a loopback URI registered for the app ("http://127.0.0.1:<port>/dropbox", on
+   desktop), the host's own scheme on Android, or "" to have Dropbox show a code the user pastes.
+   Writes the URL to open, and `pending`: an opaque string (app key, PKCE verifier, state,
+   redirect URI) the host keeps until es_oauth_finish, across a restart if it must. No network.
+
+   es_oauth_wait_redirect: desktop, with a loopback redirect_uri. Listens on its port until the
+   browser arrives or timeout_ms passes, shows "Signed in" there, and writes the redirect URL it
+   received. ES_TIMEOUT; ES_E_IO if the port is in use (start again with redirect_uri "").
+
+   es_oauth_finish: exchanges the redirect (or the code the user pasted) for tokens; blocks up to
+   about 20 s. Writes the refresh token into out_token, and the account into out_account as
+   "<account id>\t<email>" (the id is the same at every sign-in; the email is for display and may
+   be empty). ES_E_AUTH if the user declined, the redirect belongs to another sign-in, or Dropbox
+   refused the code; ES_OFFLINE if Dropbox is unreachable. */
+ES_API es_status es_oauth_start(const char* remote_uri, const char* redirect_uri,
+                                char* out_url, size_t url_cap, char* out_pending, size_t pending_cap);
+ES_API es_status es_oauth_wait_redirect(const char* pending, uint32_t timeout_ms, char* out_redirect, size_t cap);
+ES_API es_status es_oauth_finish(const char* pending, const char* redirect_or_code,
+                                 char* out_token, size_t token_cap, char* out_account, size_t account_cap);
+
+/* Superseded by es_oauth_start and es_oauth_finish, which don't lose a sign-in when the process
+   restarts and return the refresh token. Always ES_E_INVALID_ARG (begin writes "" to out_url if
+   cap > 0). */
 ES_API es_status es_oauth_begin(es_client* c, const char* provider, const char* redirect_uri, char* out_url, size_t cap);
 ES_API es_status es_oauth_complete(es_client* c, const char* provider, const char* redirect_with_code);
 

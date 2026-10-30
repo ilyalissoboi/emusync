@@ -1,4 +1,4 @@
-//! Storage backends for emusync (DESIGN §6.1, §6.2).
+//! Storage backends for emusync (DESIGN §6.1, §6.2, §30).
 //!
 //! A [`Remote`] is a flat key/value object store with create-only writes. Keys are relative to
 //! the repository root (`repo.json`, `blobs/ab/abcd…`, `devices/<id>/log/<seq>.ndjson`); each
@@ -8,14 +8,18 @@
 //! backends only need create-only puts, gets, and ordered listing.
 
 pub mod conformance;
+mod credentials;
+pub mod dropbox;
 mod memory;
 mod s3;
 
-pub use memory::{MemoryRemote, MemoryRemoteOptions};
-pub use s3::{
-    CallbackCredentials, CredentialProvider, EnvCredentials, ExpiringCredentials, S3Config, S3Credentials, S3Remote,
+pub use credentials::{
+    CallbackCredentials, CredentialProvider, Credentials, EnvCredentials, ExpiringCredentials, S3Credentials,
     StaticCredentials,
 };
+pub use dropbox::{DropboxConfig, DropboxRemote};
+pub use memory::{MemoryRemote, MemoryRemoteOptions};
+pub use s3::{S3Config, S3Remote};
 
 #[derive(Debug, thiserror::Error)]
 pub enum RemoteError {
@@ -106,11 +110,13 @@ pub fn probe_conditional_writes(remote: &dyn Remote) -> Result<bool> {
     }
 }
 
-/// Builds a remote from a URI. Only `s3://` is supported in v1.
+/// Builds a remote from a URI: `s3://…` or `dropbox:/…`.
 pub fn open(uri: &str, creds: Box<dyn CredentialProvider>) -> Result<Box<dyn Remote>> {
     if uri.starts_with("s3://") {
         Ok(Box::new(S3Remote::new(S3Config::parse(uri)?, creds)?))
+    } else if uri.starts_with("dropbox:") {
+        Ok(Box::new(DropboxRemote::new(DropboxConfig::parse(uri)?, creds)?))
     } else {
-        Err(RemoteError::InvalidUri(format!("unsupported scheme in {uri:?} (v1 supports s3://)")))
+        Err(RemoteError::InvalidUri(format!("unsupported scheme in {uri:?} (supported: s3://, dropbox:)")))
     }
 }

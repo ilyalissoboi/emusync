@@ -42,6 +42,8 @@ pub struct Context {
     pub data_dir: PathBuf,
     pub device_name: Option<String>,
     pub verbose: u8,
+    /// The remote is Dropbox: its sign-in is in the credential store, not the environment.
+    pub dropbox: bool,
 }
 
 const STOP_TIMEOUT: Duration = Duration::from_secs(defs::STOP_TIMEOUT_SECS);
@@ -63,7 +65,11 @@ pub fn run(cmd: &ServiceCmd, ctx: &Context) -> AnyResult<ExitCode> {
             if !no_start {
                 report_started(dir);
             }
-            credentials_hint(watch);
+            if ctx.dropbox {
+                println!("credentials: the Dropbox sign-in kept in your credential store");
+            } else {
+                credentials_hint(watch);
+            }
         }
         ServiceCmd::Uninstall => {
             let installed = mgr.installed()?;
