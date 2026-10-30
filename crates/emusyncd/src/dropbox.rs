@@ -2,7 +2,9 @@
 //! system's credential store (§24), never in the data directory's database.
 
 use emusync_remote::dropbox::oauth::{self, SignInError};
-use emusync_remote::{CredentialProvider, Credentials, RemoteError};
+use emusync_remote::{
+    CredentialProvider, Credentials, DropboxConfig, DropboxRemote, Remote, RemoteError, StaticCredentials,
+};
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -88,17 +90,26 @@ impl CredentialProvider for TokenProvider {
     }
 }
 
-/// Opens `url` in the default browser.
+/// Opens `url` in the default browser, without waiting for the browser: some launchers only
+/// return when it exits. False if the launcher is missing or fails within 2 s.
 fn open_browser(url: &str) -> bool {
-    let status = if cfg!(windows) {
+    let child = if cfg!(windows) {
         // `start` would split the URL at its `&`s.
-        std::process::Command::new("rundll32").args(["url.dll,FileProtocolHandler", url]).status()
+        std::process::Command::new("rundll32").args(["url.dll,FileProtocolHandler", url]).spawn()
     } else if cfg!(target_os = "macos") {
-        std::process::Command::new("open").arg(url).status()
+        std::process::Command::new("open").arg(url).spawn()
     } else {
-        std::process::Command::new("xdg-open").arg(url).status()
+        std::process::Command::new("xdg-open").arg(url).spawn()
     };
-    status.is_ok_and(|s| s.success())
+    let Ok(mut child) = child else { return false };
+    for _ in 0..20 {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+            Err(_) => return false,
+        }
+    }
+    true
 }
 
 fn read_code() -> Result<String, Box<dyn std::error::Error>> {
@@ -109,10 +120,18 @@ fn read_code() -> Result<String, Box<dyn std::error::Error>> {
     Ok(line.trim().to_string())
 }
 
+/// Checks a remote reached with a new sign-in, before its token is stored.
+pub type Verify<'a> = &'a dyn Fn(&dyn Remote) -> Result<(), Box<dyn std::error::Error>>;
+
 /// Signs in to Dropbox for `uri` and stores the refresh token for this data directory. With
 /// `no_browser`, or when the browser can't be used, the user pastes the code Dropbox shows.
-pub fn login(uri: &str, data_dir: &Path, no_browser: bool) -> Result<(), Box<dyn std::error::Error>> {
+/// `verify` sees the remote as the new sign-in reaches it, and can refuse it (another account's
+/// repository): the token is then not stored, so nothing ever syncs with it.
+pub fn login(uri: &str, data_dir: &Path, no_browser: bool, verify: Verify) -> Result<(), Box<dyn std::error::Error>> {
     let signed = sign_in(uri, no_browser)?;
+    let creds = Credentials::OAuthRefresh(signed.refresh_token.clone());
+    let remote = DropboxRemote::new(DropboxConfig::parse(uri)?, Box::new(StaticCredentials(creds)))?;
+    verify(&remote)?;
     std::fs::create_dir_all(data_dir)?;
     emusync_core::secrets::set(SERVICE, &secret_name(data_dir), &signed.refresh_token, Some(data_dir))?;
     std::fs::write(account_file(data_dir), format!("{}\t{}\n", signed.account_id, signed.email))?;
@@ -124,17 +143,16 @@ pub fn login(uri: &str, data_dir: &Path, no_browser: bool) -> Result<(), Box<dyn
 fn sign_in(uri: &str, no_browser: bool) -> Result<oauth::SignIn, Box<dyn std::error::Error>> {
     if !no_browser {
         let start = oauth::start(uri, REDIRECT_URI)?;
-        if open_browser(&start.url) {
-            eprintln!("Sign in to Dropbox in the browser window that opened. Waiting…");
-            match oauth::wait_redirect(&start.pending, BROWSER_WAIT) {
-                Ok(redirect) => return Ok(oauth::finish(&start.pending, &redirect)?),
-                Err(SignInError::PortInUse(port)) => {
-                    eprintln!("port {port} is in use; sign in with a code instead");
-                }
-                Err(e) => return Err(e.into()),
+        // Listening before the browser opens, so a fast redirect can't find the port closed.
+        match oauth::listen(&start.pending) {
+            Ok(listener) if open_browser(&start.url) => {
+                eprintln!("Sign in to Dropbox in the browser window that opened. Waiting…");
+                let redirect = listener.wait(BROWSER_WAIT)?;
+                return Ok(oauth::finish(&start.pending, &redirect)?);
             }
-        } else {
-            eprintln!("no browser could be opened; sign in with a code instead");
+            Ok(_) => eprintln!("no browser could be opened; sign in with a code instead"),
+            Err(SignInError::PortInUse(port)) => eprintln!("port {port} is in use; sign in with a code instead"),
+            Err(e) => return Err(e.into()),
         }
     }
     if !std::io::stdin().is_terminal() {

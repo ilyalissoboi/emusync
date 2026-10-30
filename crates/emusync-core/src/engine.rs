@@ -512,6 +512,30 @@ impl Engine {
         }
     }
 
+    /// Fails ([`Error::Incompatible`]) if `remote` doesn't hold the repository this data directory
+    /// is bound to: another `repo.json` id, or none. For credentials that can reach another
+    /// repository at the same URI, such as a sign-in to another Dropbox account (DESIGN §30.2),
+    /// before they are used: [`Engine::attach_remote`] doesn't check. Ok if nothing is bound yet.
+    pub fn check_repository(&self, remote: &dyn Remote) -> Result<()> {
+        let Some(bound) = self.store.meta("repo_id")? else { return Ok(()) };
+        let uri = remote.describe();
+        let found = match remote.get("repo.json")? {
+            Some(body) => parse_repo_json(&body)?.0,
+            None => None,
+        };
+        match found {
+            Some(id) if id == bound => Ok(()),
+            Some(id) => Err(Error::Incompatible(format!(
+                "{uri} holds another repository (id {id}) than the one this data directory syncs with ({bound}): \
+                 is this another account? Use a new data directory for it"
+            ))),
+            None => Err(Error::Incompatible(format!(
+                "{uri} has no repository, but this data directory syncs with one ({bound}): is this another \
+                 account? Use a new data directory for it"
+            ))),
+        }
+    }
+
     /// Like [`Engine::add_remote`], with a passphrase: a new repository is created encrypted
     /// (DESIGN §7), an existing encrypted one is unlocked, and an existing unencrypted one is
     /// refused ([`Error::Incompatible`]).

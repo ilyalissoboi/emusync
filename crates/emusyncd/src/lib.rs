@@ -329,6 +329,15 @@ fn attach(engine: &mut Engine, cli: &Cli) -> AnyResult<bool> {
     match engine.remote_uri()? {
         Some(uri) => {
             let remote = emusync_remote::open(&uri, credentials(&uri, &data_dir(cli)))?;
+            // A Dropbox token can reach another account's repository at the same URI
+            // (EMUSYNC_DROPBOX_TOKEN, say): check before anything is pulled or pushed. Offline,
+            // the cycle can't reach it either.
+            if dropbox::is_dropbox(&uri) {
+                match engine.check_repository(&*remote) {
+                    Err(e) if e.is_offline() => log::info!("repository not checked: {e}"),
+                    other => other?,
+                }
+            }
             engine.attach_remote(Arc::from(remote));
             Ok(true)
         }
@@ -419,9 +428,8 @@ fn run(cli: Cli) -> AnyResult<ExitCode> {
                 Arc::from(emusync_remote::open(&uri, credentials(&uri, &dir))?);
             engine.check_remote(&remote.describe())?;
             if dropbox::is_dropbox(&uri) && !dropbox::is_signed_in(&dir) {
-                dropbox::login(&uri, &dir, *no_browser)?;
+                dropbox::login(&uri, &dir, *no_browser, &|r| Ok(engine.check_repository(r)?))?;
             }
-            engine.check_remote(&remote.describe())?;
             let conditional = if *encrypt {
                 let new = remote.get("repo.json")?.is_none();
                 let pass = if new {
@@ -457,7 +465,8 @@ fn run(cli: Cli) -> AnyResult<ExitCode> {
         }
         Cmd::Remote(RemoteCmd::Login { no_browser }) => {
             let uri = dropbox_remote(&engine)?;
-            dropbox::login(&uri, &data_dir(&cli), *no_browser)?;
+            // A sign-in to another account would reach another repository at the same URI.
+            dropbox::login(&uri, &data_dir(&cli), *no_browser, &|r| Ok(engine.check_repository(r)?))?;
         }
         Cmd::Remote(RemoteCmd::Logout) => {
             let uri = dropbox_remote(&engine)?;

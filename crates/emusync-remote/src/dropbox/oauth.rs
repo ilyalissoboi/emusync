@@ -291,10 +291,18 @@ const SIGNED_IN_PAGE: &str = "<!doctype html><meta charset=utf-8><title>emusync<
     <body style=\"font-family:sans-serif;margin:3em\"><h1>Signed in</h1>\
     <p>You can close this tab and go back to emusync.</p></body>";
 
-/// Desktop: listens on the loopback port of the pending sign-in's redirect URI until the
-/// browser arrives with the redirect or `timeout` passes, and returns the redirect URL
-/// (`es_oauth_wait_redirect`). Requests for other paths (a favicon) get a 404.
-pub fn wait_redirect(pending: &str, timeout: Duration) -> std::result::Result<String, SignInError> {
+/// The loopback listener for a pending sign-in's redirect, from [`listen`].
+pub struct RedirectListener {
+    listener: TcpListener,
+    /// The redirect URI's path (`/dropbox`).
+    path: String,
+    /// `http://127.0.0.1:<port>`.
+    origin: String,
+}
+
+/// Desktop: starts listening on the loopback port of the pending sign-in's redirect URI. Call
+/// it before opening the sign-in page, so a quick redirect can't find the port closed.
+pub fn listen(pending: &str) -> std::result::Result<RedirectListener, SignInError> {
     let p = parse_pending(pending)?;
     let port = loopback_port(&p.redirect_uri)
         .ok_or_else(|| SignInError::InvalidArg(format!("{:?} is not a loopback redirect URI", p.redirect_uri)))?;
@@ -304,44 +312,57 @@ pub fn wait_redirect(pending: &str, timeout: Duration) -> std::result::Result<St
         _ => SignInError::Remote(RemoteError::Other(format!("listening on port {port}: {e}"))),
     })?;
     listener.set_nonblocking(true).map_err(|e| SignInError::Remote(RemoteError::Other(e.to_string())))?;
-    let deadline = Instant::now() + timeout;
-    loop {
-        let (mut stream, _) = match listener.accept() {
-            Ok(s) => s,
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                if Instant::now() >= deadline {
-                    return Err(SignInError::Timeout);
+    let origin = p.redirect_uri.splitn(4, '/').take(3).collect::<Vec<_>>().join("/");
+    Ok(RedirectListener { listener, path, origin })
+}
+
+/// [`listen`], then [`RedirectListener::wait`] (`es_oauth_wait_redirect`).
+pub fn wait_redirect(pending: &str, timeout: Duration) -> std::result::Result<String, SignInError> {
+    listen(pending)?.wait(timeout)
+}
+
+impl RedirectListener {
+    /// Waits until the browser arrives with the redirect or `timeout` passes, and returns the
+    /// redirect URL. Requests for other paths (a favicon) get a 404.
+    pub fn wait(self, timeout: Duration) -> std::result::Result<String, SignInError> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let (mut stream, _) = match self.listener.accept() {
+                Ok(s) => s,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        return Err(SignInError::Timeout);
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                    continue;
                 }
-                std::thread::sleep(Duration::from_millis(50));
+                Err(e) => return Err(SignInError::Remote(RemoteError::Other(format!("accepting the redirect: {e}")))),
+            };
+            let _ = stream.set_nonblocking(false);
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+            let mut buf = [0u8; 8192];
+            let mut req = Vec::new();
+            while !req.windows(4).any(|w| w == b"\r\n\r\n") && req.len() < buf.len() {
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => req.extend_from_slice(&buf[..n]),
+                }
+            }
+            let req = String::from_utf8_lossy(&req);
+            let target = req.lines().next().and_then(|l| l.split_whitespace().nth(1)).unwrap_or("");
+            if target.split('?').next() != Some(self.path.as_str()) {
+                let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
                 continue;
             }
-            Err(e) => return Err(SignInError::Remote(RemoteError::Other(format!("accepting the redirect: {e}")))),
-        };
-        let _ = stream.set_nonblocking(false);
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-        let mut buf = [0u8; 8192];
-        let mut req = Vec::new();
-        while !req.windows(4).any(|w| w == b"\r\n\r\n") && req.len() < buf.len() {
-            match stream.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => req.extend_from_slice(&buf[..n]),
-            }
+            let _ = stream.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{SIGNED_IN_PAGE}",
+                    SIGNED_IN_PAGE.len()
+                )
+                .as_bytes(),
+            );
+            return Ok(format!("{}{target}", self.origin));
         }
-        let req = String::from_utf8_lossy(&req);
-        let target = req.lines().next().and_then(|l| l.split_whitespace().nth(1)).unwrap_or("");
-        if target.split('?').next() != Some(path.as_str()) {
-            let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
-            continue;
-        }
-        let _ = stream.write_all(
-            format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{SIGNED_IN_PAGE}",
-                SIGNED_IN_PAGE.len()
-            )
-            .as_bytes(),
-        );
-        let origin = p.redirect_uri.splitn(4, '/').take(3).collect::<Vec<_>>().join("/");
-        return Ok(format!("{origin}{target}"));
     }
 }
 
@@ -505,7 +526,7 @@ mod tests {
         .unwrap();
         let pending = s.pending.clone();
         let waiter = std::thread::spawn(move || wait_redirect(&pending, Duration::from_secs(10)));
-        let get = |path: &str| loop {
+        let get = move |path: &str| loop {
             match std::net::TcpStream::connect(("127.0.0.1", port)) {
                 Ok(mut c) => {
                     c.write_all(format!("GET {path} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes()).unwrap();
@@ -519,6 +540,15 @@ mod tests {
         assert!(get("/favicon.ico").starts_with("HTTP/1.1 404"));
         assert!(get("/dropbox?code=C&state=S").contains("Signed in"));
         assert_eq!(waiter.join().unwrap().unwrap(), format!("http://127.0.0.1:{port}/dropbox?code=C&state=S"));
+        // Listening first, a redirect that arrives before wait() is called still gets through.
+        let listener = listen(&s.pending).unwrap();
+        let browser = std::thread::spawn(move || get("/dropbox?code=E&state=S"));
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            listener.wait(Duration::from_secs(10)).unwrap(),
+            format!("http://127.0.0.1:{port}/dropbox?code=E&state=S")
+        );
+        assert!(browser.join().unwrap().contains("Signed in"));
         // Nobody comes: a timeout.
         assert!(matches!(wait_redirect(&s.pending, Duration::from_millis(100)), Err(SignInError::Timeout)));
         // The port is taken.

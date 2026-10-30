@@ -349,6 +349,14 @@ ES_API es_status es_secret_delete(const char* service, const char* name, const c
    es_oauth_wait_redirect: desktop, with a loopback redirect_uri. Listens on its port until the
    browser arrives or timeout_ms passes, shows "Signed in" there, and writes the redirect URL it
    received. ES_TIMEOUT; ES_E_IO if the port is in use (start again with redirect_uri "").
+   Listening starts when it is called: call it on the background thread first, then open the
+   URL, so a quick redirect can't find the port closed (a browser launcher that waits for the
+   browser to exit must not run on that thread).
+
+   A sign-in to another Dropbox account reaches another repository at the same URI.
+   es_remote_add refuses it for a data_dir bound to the first one (ES_E_INCOMPATIBLE), so a host
+   that adds the remote at every start never syncs the wrong account; better still, use one
+   data_dir per account (see es_remote_add).
 
    es_oauth_finish: exchanges the redirect (or the code the user pasted) for tokens; blocks up to
    about 20 s. Writes the refresh token into out_token, and the account into out_account as

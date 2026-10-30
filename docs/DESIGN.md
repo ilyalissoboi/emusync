@@ -2478,9 +2478,16 @@ Where the implementation pins down or differs from the design above:
   directory has no sign-in; `remote login` and `remote logout`; `status` shows the account. The
   refresh token is the credential store's `emusync`/`dropbox-refresh-token-<hash>`, one per data
   directory (the hash is of its path), so two data directories can use two accounts; the
-  account's id and email are in `<data_dir>/dropbox-account`, which is not secret. The browser is
-  opened with `rundll32 url.dll,FileProtocolHandler`, `open` or `xdg-open`; when that fails, or
-  the port is taken, or with `--no-browser`, the user pastes the code.
+  account's id and email are in `<data_dir>/dropbox-account`, which is not secret. The redirect
+  listener binds first (`oauth::listen`), then the browser is opened, without waiting for it,
+  with `rundll32 url.dll,FileProtocolHandler`, `open` or `xdg-open`; when that fails within 2 s,
+  or the port is taken, or with `--no-browser`, the user pastes the code.
+- **Another account.** A sign-in to another Dropbox account reaches another repository at the
+  same URI, and `attach_remote` (which `sync` and `watch` use) doesn't read `repo.json`.
+  `Engine::check_repository` compares the remote's `repo.json` id with the bound one
+  (`Incompatible` if it differs or is missing). The CLI runs it on a new sign-in before storing
+  its token, and when it attaches a Dropbox remote (skipped when offline, as the cycle would be).
+  C ABI hosts are covered by `es_remote_add`, which binds and checks the same way.
 - **Tests.** The conformance suite runs against the fake at a repository folder and at the app
   folder's root, with pages of 2 or 3 entries; identical uploads conflict; 401s refresh once and
   revocation is `Auth`; rate limits, 5xx, a full account, a bad request and an unreachable host;
