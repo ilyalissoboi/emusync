@@ -137,15 +137,18 @@ class DropboxSignIn internal constructor(
         val pending = settings.unseal(KEY_PENDING)?.let { runCatching { JSONObject(it) }.getOrNull() }
             ?: return Result.Failed("No Dropbox sign-in was started on this device. Try again.")
         val uri = Uri.parse(redirect)
+        // First, whether the redirect is this attempt's, errors included (Dropbox returns the state
+        // with them too): the redirect activity is exported, so a stale redirect or another app
+        // can send one. A redirect that isn't leaves the attempt in place for the real one.
+        if (uri.getQueryParameter("state") != pending.getString("state")) {
+            return Result.Failed("That Dropbox sign-in belongs to another attempt. Try again.")
+        }
         uri.getQueryParameter("error")?.let { error ->
             settings.seal(KEY_PENDING, "")
             return Result.Failed(
                 if (error == "access_denied") "The Dropbox sign-in was cancelled."
                 else "Dropbox didn't sign in: ${uri.getQueryParameter("error_description") ?: error}",
             )
-        }
-        if (uri.getQueryParameter("state") != pending.getString("state")) {
-            return Result.Failed("That Dropbox sign-in belongs to another attempt. Try again.")
         }
         val code = uri.getQueryParameter("code")?.takeIf { it.isNotEmpty() }
             ?: return Result.Failed("Dropbox sent no sign-in code. Try again.")

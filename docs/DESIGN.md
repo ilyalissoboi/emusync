@@ -2503,8 +2503,10 @@ Where the implementation pins down or differs from the design above:
   paste-the-code, revoke); a refresh token used with another app key is refused. The C ABI tests
   cover the credential kinds and the three functions without a network.
 - **The AAR.** `SyncSettings` knows Dropbox by the address (`isDropboxUri`), with no setting of
-  its own: such a storage is complete with a sign-in (`setDropboxSignIn`, the refresh token sealed
-  like the S3 secret, the account id and email in plain preferences), and `dataDir(uri, account)`
+  its own: such a storage is complete with a sign-in (`setDropboxSignIn`: the refresh token and
+  the account id sealed together in one value, so `config` on another thread reads both from the
+  same sign-in, never one account's token with another's data folder; the email, for display, in
+  plain preferences), and `dataDir(uri, account)`
   hashes the address and the account id together, so a second account gets its own folder and
   can never sync into the first one's repository (S3 folders keep their names). `SyncConfig`
   gains `dropboxRefreshToken` and `isDropbox`; the S3 fields are empty for Dropbox.
@@ -2516,7 +2518,9 @@ Where the implementation pins down or differs from the design above:
   - `DropboxRedirectActivity` (translucent, `noHistory`) keeps the redirect and starts that
     activity with `CLEAR_TOP | SINGLE_TOP`, which closes the Custom Tab above it, or the app's
     launcher activity if it isn't known.
-  - `complete()` / `completeAsync` check the state, exchange the code (`HttpURLConnection`,
+  - `complete()` / `completeAsync` check the state first, errors included: the redirect activity is
+    exported, so a redirect with another state (an old one, another app's) fails without touching
+    the attempt in progress. Then they exchange the code (`HttpURLConnection`,
     `org.json`), look up the email (a failure there doesn't fail the sign-in) and store the
     sign-in; each step survives the process being killed while the browser is open.
   - `signOut()` revokes the token and forgets it on this device whatever Dropbox says.

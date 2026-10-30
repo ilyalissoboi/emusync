@@ -14,6 +14,7 @@ import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
+import org.json.JSONObject
 
 /**
  * The sync settings the user enters, kept the way ARMSX2 keeps them (DESIGN §26):
@@ -79,7 +80,7 @@ class SyncSettings @JvmOverloads constructor(
             hasSecret = unseal(KEY_SECRET) != null,
             hasPassphrase = unseal(KEY_PASSPHRASE) != null,
             deviceName = p.getString(KEY_DEVICE, "").orEmpty().ifBlank { defaultDeviceName() },
-            hasDropboxSignIn = unseal(KEY_DROPBOX_TOKEN) != null,
+            hasDropboxSignIn = dropboxSignIn() != null,
             dropboxEmail = p.getString(KEY_DROPBOX_EMAIL, "").orEmpty(),
         )
     }
@@ -115,14 +116,16 @@ class SyncSettings @JvmOverloads constructor(
     fun passphrase(): String? = unseal(KEY_PASSPHRASE)
 
     /**
-     * Stores a Dropbox sign-in from [DropboxSignIn]: the refresh token encrypted, the account in
-     * plain preferences. Replaces an earlier one.
+     * Stores a Dropbox sign-in from [DropboxSignIn], replacing an earlier one: the refresh token
+     * and the account id sealed together in one value, so whoever reads them (a [config] on another
+     * thread) gets both from the same sign-in, never one account's token with another's data
+     * folder. The email address, only for display, is in plain preferences.
      */
     fun setDropboxSignIn(refreshToken: String, accountId: String, email: String) {
         require(refreshToken.isNotEmpty()) { "empty refresh token" }
-        seal(KEY_DROPBOX_TOKEN, refreshToken)
+        val sealed = sealValue(JSONObject().put("refreshToken", refreshToken).put("accountId", accountId).toString())
         edit {
-            putString(KEY_DROPBOX_ACCOUNT, accountId)
+            putString(KEY_DROPBOX_SIGN_IN, sealed)
             putString(KEY_DROPBOX_EMAIL, email)
         }
     }
@@ -130,17 +133,25 @@ class SyncSettings @JvmOverloads constructor(
     /** Forgets the Dropbox sign-in on this device (sign-out). */
     fun clearDropboxSignIn() {
         edit {
-            remove(KEY_DROPBOX_TOKEN)
-            remove(KEY_DROPBOX_ACCOUNT)
+            remove(KEY_DROPBOX_SIGN_IN)
             remove(KEY_DROPBOX_EMAIL)
         }
     }
 
+    /** The stored Dropbox sign-in, read at once; null when there is none or it can't be read. */
+    private fun dropboxSignIn(): DropboxAccount? {
+        val json = unseal(KEY_DROPBOX_SIGN_IN)?.let { runCatching { JSONObject(it) }.getOrNull() } ?: return null
+        val token = json.optString("refreshToken").takeIf { it.isNotEmpty() } ?: return null
+        return DropboxAccount(token, json.optString("accountId"))
+    }
+
+    private class DropboxAccount(val refreshToken: String, val accountId: String)
+
     /** The stored Dropbox refresh token, for revoking it at sign-out; null when there is none. */
-    fun dropboxRefreshToken(): String? = unseal(KEY_DROPBOX_TOKEN)
+    fun dropboxRefreshToken(): String? = dropboxSignIn()?.refreshToken
 
     /** The signed-in Dropbox account's id (`dbid:…`); empty when there is none. */
-    fun dropboxAccountId(): String = prefs().getString(KEY_DROPBOX_ACCOUNT, "").orEmpty()
+    fun dropboxAccountId(): String = dropboxSignIn()?.accountId.orEmpty()
 
     /**
      * emusync's data folder for [remoteUri], created if needed; see the class comment. For a
@@ -160,16 +171,17 @@ class SyncSettings @JvmOverloads constructor(
         val v = load()
         if (!v.enabled || v.remoteUri.isBlank()) return null
         if (v.isDropbox) {
-            val token = unseal(KEY_DROPBOX_TOKEN) ?: return null
+            // Token and account from one read: the same sign-in, whatever changes meanwhile.
+            val signIn = dropboxSignIn() ?: return null
             return SyncConfig(
-                dataDir = dataDir(v.remoteUri, dropboxAccountId()),
+                dataDir = dataDir(v.remoteUri, signIn.accountId),
                 deviceName = v.deviceName,
                 appVersion = appVersion,
                 remoteUri = v.remoteUri,
                 accessKeyId = "",
                 secretAccessKey = "",
                 passphrase = unseal(KEY_PASSPHRASE),
-                dropboxRefreshToken = token,
+                dropboxRefreshToken = signIn.refreshToken,
             )
         }
         if (v.accessKeyId.isBlank()) return null
@@ -199,10 +211,16 @@ class SyncSettings @JvmOverloads constructor(
             edit { remove(key) }
             return
         }
+        val sealed = sealValue(value)
+        edit { putString(key, sealed) }
+    }
+
+    /** [value] encrypted with the Keystore key, as stored. */
+    private fun sealValue(value: String): String {
         val cipher = Cipher.getInstance(TRANSFORMATION)
         cipher.init(Cipher.ENCRYPT_MODE, keystoreKey())
         val sealed = cipher.iv + cipher.doFinal(value.toByteArray(Charsets.UTF_8))
-        edit { putString(key, Base64.encodeToString(sealed, Base64.NO_WRAP)) }
+        return Base64.encodeToString(sealed, Base64.NO_WRAP)
     }
 
     /** The value [seal] stored, or null when there is none or it can't be decrypted here. */
@@ -247,8 +265,8 @@ class SyncSettings @JvmOverloads constructor(
         private const val KEY_SECRET = "secretAccessKey.enc"
         private const val KEY_PASSPHRASE = "passphrase.enc"
         private const val KEY_DEVICE = "deviceName"
-        private const val KEY_DROPBOX_TOKEN = "dropboxRefreshToken.enc"
-        private const val KEY_DROPBOX_ACCOUNT = "dropboxAccountId"
+        /** The refresh token and account id, sealed together (JSON). */
+        private const val KEY_DROPBOX_SIGN_IN = "dropboxSignIn.enc"
         private const val KEY_DROPBOX_EMAIL = "dropboxEmail"
         private const val KEYSTORE = "AndroidKeyStore"
         private const val TRANSFORMATION = "AES/GCM/NoPadding"

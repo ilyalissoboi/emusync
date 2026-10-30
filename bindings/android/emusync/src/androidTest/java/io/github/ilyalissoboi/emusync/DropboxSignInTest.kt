@@ -188,12 +188,41 @@ class DropboxSignInTest {
         val refused = signIn.complete()
         assertTrue(refused is DropboxSignIn.Result.Failed && refused.message.startsWith("Dropbox refused"))
         // The user cancelled.
-        signIn.prepare(uri, null)
-        DropboxSignIn.onRedirect(context, Uri.parse("${signIn.redirectUri}?error=access_denied"))
+        val cancelled = Uri.parse(signIn.prepare(uri, null)).getQueryParameter("state")
+        DropboxSignIn.onRedirect(context, Uri.parse("${signIn.redirectUri}?error=access_denied&state=$cancelled"))
         assertEquals(DropboxSignIn.Result.Failed("The Dropbox sign-in was cancelled."), signIn.complete())
         // Nothing came back at all.
         assertTrue(signIn.complete() is DropboxSignIn.Result.Failed)
         assertNull(settings.dropboxRefreshToken())
+    }
+
+    @Test
+    fun aStrayErrorRedirectLeavesTheAttemptInPlace() {
+        val real = approve(signIn.prepare(uri, null))
+        // Another app, or an old redirect: an error without this attempt's state.
+        DropboxSignIn.onRedirect(context, Uri.parse("${signIn.redirectUri}?error=access_denied"))
+        val stray = signIn.complete()
+        assertTrue(stray is DropboxSignIn.Result.Failed && stray.message.contains("another attempt"))
+        DropboxSignIn.onRedirect(context, Uri.parse("${signIn.redirectUri}?error=access_denied&state=old"))
+        assertTrue(signIn.complete() is DropboxSignIn.Result.Failed)
+        // The real redirect still signs in.
+        DropboxSignIn.onRedirect(context, real)
+        assertTrue(signIn.complete() is DropboxSignIn.Result.SignedIn)
+    }
+
+    @Test
+    fun tokenAndAccountAreReadTogether() {
+        settings.setEnabled(true)
+        settings.setRemoteUri(uri)
+        settings.setDropboxSignIn("token-a", "dbid:a", "a@example.com")
+        settings.setDropboxSignIn("token-b", "dbid:b", "b@example.com")
+        val config = settings.config("1.0")!!
+        assertEquals("token-b", config.dropboxRefreshToken)
+        assertEquals(settings.dataDir(uri, "dbid:b"), config.dataDir)
+        assertEquals("dbid:b", settings.dropboxAccountId())
+        // Neither the token nor the account id is in the preferences in the clear.
+        val stored = context.getSharedPreferences(prefsName, Context.MODE_PRIVATE).all.values.joinToString()
+        assertFalse(stored.contains("token-b") || stored.contains("dbid:b"))
     }
 
     @Test
