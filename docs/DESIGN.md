@@ -2332,10 +2332,12 @@ all additive:
   `ES_E_INVALID_ARG`), and three functions that need no client replace them:
 
 ```c
-/* Starts a sign-in to provider ("dropbox") with redirect_uri ("" for paste-the-code). Writes the
-   URL to open, and `pending`: an opaque string (PKCE verifier, state, redirect URI) the host
+/* Starts a sign-in for remote_uri ("dropbox:/saves"), the URI the host will pass to
+   es_remote_add, with redirect_uri ("" for paste-the-code). The scheme picks the provider and
+   the URI's app_key, if any, the app (else the built-in one). Writes the URL to open, and
+   `pending`: an opaque string (provider, app key, PKCE verifier, state, redirect URI) the host
    keeps until es_oauth_finish, across a process restart if it must. No network. */
-ES_API es_status es_oauth_start(const char* provider, const char* redirect_uri,
+ES_API es_status es_oauth_start(const char* remote_uri, const char* redirect_uri,
                                 char* out_url, size_t url_cap, char* out_pending, size_t pending_cap);
 
 /* Desktop: listens on the loopback address and port of pending's redirect URI until the browser
@@ -2344,12 +2346,19 @@ ES_API es_status es_oauth_start(const char* provider, const char* redirect_uri,
 ES_API es_status es_oauth_wait_redirect(const char* pending, uint32_t timeout_ms,
                                         char* out_redirect, size_t cap);
 
-/* Exchanges the redirect (or the code the user pasted) for tokens; blocks up to 10 s. Writes the
-   refresh token for the host to store, and the account ("dbid:…\talice@example.com").
-   ES_E_AUTH if the user declined or the state doesn't match, ES_OFFLINE. */
-ES_API es_status es_oauth_finish(const char* provider, const char* pending, const char* redirect_or_code,
+/* Exchanges the redirect (or the code the user pasted) for tokens with pending's app key; blocks
+   up to 10 s. Writes the refresh token for the host to store, and the account
+   ("dbid:…\talice@example.com"). ES_E_AUTH if the user declined or the state doesn't match,
+   ES_OFFLINE. */
+ES_API es_status es_oauth_finish(const char* pending, const char* redirect_or_code,
                                  char* out_token, size_t token_cap, char* out_account, size_t account_cap);
 ```
+
+- **The app key follows the URI.** A refresh token works only with the app key it was issued
+  to, so sign-in starts from the remote URI, `pending` carries the app key to the exchange, and
+  the backend refreshes and revokes with the key of the URI it was opened with. A fork's
+  `?app_key=…` thus signs in to the fork's app and its folder, never the built-in one. The AAR's
+  `DropboxSignIn` (30.6) takes the URI the same way.
 
 - **Sign-out** deletes the stored token and calls `auth/token/revoke`. A token the user revoked
   from Dropbox's settings makes the next refresh fail with `invalid_grant`, which reaches the
