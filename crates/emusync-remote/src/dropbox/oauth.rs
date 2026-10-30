@@ -497,7 +497,7 @@ mod tests {
         assert!(!s.url.contains("redirect_uri"));
         // Not Dropbox, no app key (in a build without one), a bad redirect.
         assert!(matches!(start_with(&ep, "s3://b/p", ""), Err(SignInError::InvalidArg(_))));
-        if crate::dropbox::BUILT_IN_APP_KEY.is_none() {
+        if crate::dropbox::BUILT_IN_APP_KEY.map_or(true, str::is_empty) {
             assert!(matches!(start_with(&ep, "dropbox:/saves", ""), Err(SignInError::InvalidArg(_))));
         }
         assert!(matches!(start_with(&ep, "dropbox:/s?app_key=k", "http://x y"), Err(SignInError::InvalidArg(_))));

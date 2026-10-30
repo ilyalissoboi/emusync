@@ -84,11 +84,14 @@ impl DropboxConfig {
 
     /// The Dropbox app this repository belongs to: the URI's, else the built-in one.
     pub fn app_key(&self) -> Result<String> {
-        self.app_key_param.clone().or_else(|| BUILT_IN_APP_KEY.map(str::to_string)).ok_or_else(|| {
-            RemoteError::InvalidUri(
-                "this build has no Dropbox app key: add ?app_key=<your app's key> to the URI (DESIGN §30.1)".into(),
-            )
-        })
+        self.app_key_param
+            .clone()
+            .or_else(|| BUILT_IN_APP_KEY.filter(|k| !k.is_empty()).map(str::to_string))
+            .ok_or_else(|| {
+                RemoteError::InvalidUri(
+                    "this build has no Dropbox app key: add ?app_key=<your app's key> to the URI (DESIGN §30.1)".into(),
+                )
+            })
     }
 
     /// The canonical URI: what `describe()` returns and data directories are bound to.
