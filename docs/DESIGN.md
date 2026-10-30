@@ -867,7 +867,7 @@ dependencies each item needs placed before it:
     emusync companion app syncing its card folder, another PS1 emulator, or none.
 13. **Finishing uploads after the app is closed**, as a library feature: WorkManager through the
     AAR on Android (ARMSX2 moves to the AAR), and a hand-off to a helper process on desktop.
-14. Everything else (leases, retention and garbage collection, per-game cards, other backends,
+14. Everything else (leases, retention and garbage collection, per-game cards, other backends (Dropbox first, §30),
     metered networks, guided S3 setup, conflict and history UI on Android, …), to be
     prioritised later.
 
@@ -2175,3 +2175,267 @@ is moved to meta: a PS1 card keeps no times.
     `NoSpace` when they didn't fit) kept every save.
   - `emusync card inspect` lists them with their title keys, PocketStation-style names
     (`BASLUSP00892…`) included.
+
+## 30. Dropbox backend (design draft)
+
+Status: design, not implemented. The second `Remote`, after S3 (§6.2), and the first that
+signs in with an account instead of keys. With S3 the user has to create a bucket, a policy and
+keys (§15, question 6). With Dropbox they press "Sign in with Dropbox" and approve. Why Dropbox
+before Google Drive or OneDrive:
+
+- **Its API fits the layout.** Files are addressed by path, so keys map onto it one to one.
+  Uploads can be create-only on the server, so the "never overwrite" rule (§6.1) holds without
+  the HEAD-before-PUT fallback. Folders are created implicitly.
+- **Light registration for the developers.** One app in the Dropbox App Console, and a short
+  review for production status (30.1). Google needs brand verification, with a privacy policy
+  and a verified domain. Microsoft needs an Entra tenant.
+- **Free for the user.** Dropbox Basic has 2 GB, far more than saves need. Its three-device limit
+  covers Dropbox's own apps, not apps that use the API (Dropbox staff on its forum, not yet in
+  its documentation).
+
+### 30.1 One Dropbox app for every host
+
+- **The app.** The emusync developers register one Dropbox app, `emusync`, with the
+  **App folder** permission type: it sees only `/Apps/emusync/` in the user's Dropbox, which the
+  user can browse. Scopes: `files.metadata.read`, `files.content.read`, `files.content.write`
+  (Dropbox adds `account_info.read` to every app).
+- **Its app key is in the library**, a constant in `emusync-remote`, not in each host. It is
+  public: sign-in uses PKCE (30.4), so no client secret ships anywhere. Every host (the CLI,
+  PCSX2, ARMSX2, Dolphin, PPSSPP) must use the same key, because a different app has a different
+  app folder and so a different repository. A fork that registers its own app passes
+  `?app_key=…` in the URI (30.2), and gets its own folder.
+- **Production status.** A new app is in development status: up to 500 users can link it, but
+  once 50 have, the developers have two weeks to be approved for production status, or no new
+  user can link it until they are. The application asks how the app uses the API and for an
+  icon, with no identity documents. It is reviewed only after 50 users have linked the app, so
+  apply when the first release with Dropbox ships, and plan for the two-week window.
+- **Redirect URIs** are registered in the App Console: a fixed loopback port for desktop and
+  one custom scheme per Android host (30.4).
+- **The App Console account** belongs to the project, not to one developer's personal Dropbox
+  account: if it is lost, every user's sign-in stops working.
+
+### 30.2 Repository mapping
+
+```
+dropbox:/saves                        → /Apps/emusync/saves/repo.json, …/blobs/…, …/devices/…
+dropbox:/saves-encrypted              a second repository next to it
+dropbox:/                             the app folder itself
+dropbox:/saves?app_key=<key>          a fork's own Dropbox app
+```
+
+- **Keys** are paths under the repository folder, unchanged: `blobs/ab/abcd…` is
+  `/saves/blobs/ab/abcd…` inside the app folder.
+- **Case.** Dropbox paths are case-insensitive and keep the case they were created with. Every
+  key the core writes is lower-case ASCII (hex hashes, UUIDs, fixed names), so no two keys fold
+  together. The backend refuses a key with upper-case letters (`RemoteError::Other`), so a
+  future key scheme can't collide silently. Listings use each entry's `name`, never
+  `path_lower`.
+- **Which account.** The URI doesn't name the Dropbox account. A data directory bound to one
+  account's repository that is later signed in to another sees a different `repo.json` and is
+  refused (the binding check of §20). Hosts keep one data directory per URI *and* account: the
+  Android AAR hashes the account id into the data folder name with the URI (30.6).
+- **`describe()`** returns the URI, so `emusync status` and `es_remote_add`'s binding see
+  `dropbox:/saves`.
+
+### 30.3 Operations
+
+Hand-written over the existing `ureq` agent with rustls and `serde_json`, about the size of the
+S3 backend. The official `dropbox-sdk` crate generates code for every route of the API and
+would be most of the backend's compile time for five calls. RPC calls go to
+`api.dropboxapi.com`, uploads and downloads to `content.dropboxapi.com`, with the arguments as
+JSON in the `Dropbox-API-Arg` header (ASCII only, which keys are).
+
+| `Remote` | Dropbox call |
+|---|---|
+| `put(key, data, if_none_match = true)` | `files/upload` with `mode: add`, `autorename: false`, `strict_conflict: true`, `mute: true`. A `path/conflict` error is `AlreadyExists`. |
+| `put(key, data, false)` (a renamed device's `device.json`) | `files/upload` with `mode: overwrite`. Dropbox keeps the old revision in its own history. |
+| `get(key)` | `files/download`. `path/not_found` is `Ok(None)`. |
+| `head(key)` | `files/get_metadata`. True only for a file; `path/not_found` is false. |
+| `list(prefix, start_after)` | `files/list_folder` on the prefix's folder (non-recursive, `limit: 2000`), then `files/list_folder/continue` while `has_more`. Entries come in no particular order: files are sorted by name and filtered past `start_after`. A missing folder is an empty list. |
+| `list_dirs(prefix)` | The same listing, keeping folder entries. |
+| Garbage collection (§7, later) | `files/delete_batch`. |
+
+- **Create-only writes need `strict_conflict`.** With `mode: add` alone, uploading the same bytes
+  as an existing file is not a conflict: nothing is written and the upload "succeeds". That
+  would defeat the device-id clash check (§6.2): an unencrypted log segment written again with
+  the same bytes is meant to come back `AlreadyExists`, so the engine compares it (`engine.rs`,
+  the segment loop). It would also make `probe_conditional_writes`, which writes the same bytes
+  twice, report no conditional writes. `strict_conflict: true` makes identical contents a
+  conflict too, so the probe finds conditional writes and the engine never falls back to
+  HEAD-before-PUT.
+- **Sizes.** Chunks are at most 256 KB and segments are small, far under the 150 MB a single
+  `files/upload` takes, so upload sessions are needed only for batching (30.7). Empty files are
+  allowed (the conformance suite writes one).
+- **Consistency.** Dropbox lists a file once its upload has returned. The protocol doesn't rely
+  on that anyway (§6.2).
+
+**Errors.** Dropbox answers endpoint errors with HTTP 409 and an `error_summary` such as
+`path/not_found/..`:
+
+| Response | Handled as |
+|---|---|
+| 409 `path/not_found` | `None`, false or an empty list, by operation |
+| 409 `path/conflict` on a create-only upload | `PutOutcome::AlreadyExists` |
+| 409 `path/insufficient_space` | `RemoteError::Other("the Dropbox account is full")`: the outbox keeps the changes, and the next cycle tries again |
+| 401 `expired_access_token` | refresh the token (30.5), retry once |
+| 401 otherwise, or a refresh answered `invalid_grant` (the user disconnected the app) | `RemoteError::Auth`, so the host gets `ES_EV_AUTH_REQUIRED` and asks the user to sign in again |
+| 429 (including `too_many_write_operations`) and 503 | wait for `Retry-After` (at most 60 s) and retry, at most 3 times, then `RemoteError::Network` |
+| other 5xx, timeouts, connection errors | `RemoteError::Network` after the S3 backend's retries |
+| 400 | `RemoteError::Http`: a bug in the request, never retried |
+
+**Cost of a cycle.** Like S3: one listing of `devices/`, one listing of each other device's
+`log/`, one download per new segment, one upload per new blob plus the segment. A request takes
+roughly 0.2 to 0.5 s, more than S3. A card's first upload (a full PS2 card is a few dozen saves)
+takes 10 to 20 s, once; a saved game later is 2 to 4 requests.
+
+### 30.4 Sign-in
+
+OAuth 2 authorization code flow with PKCE (`code_challenge_method=S256`) and
+`token_access_type=offline`. That returns a long-lived refresh token and an access token that
+expires after about 4 hours. Neither the token exchange nor a refresh needs a client secret.
+
+- **Desktop** (the CLI, PCSX2, Dolphin, PPSSPP): the browser is sent to
+  `http://127.0.0.1:<port>/dropbox`, with the port fixed when the app is registered. Dropbox
+  matches redirect URIs exactly, port included, so a random port isn't possible. A small
+  listener receives the redirect and answers with "Signed in, you can close this tab". If the
+  port is taken, or there is no browser (SSH, the Steam Deck in game mode), the flow runs with
+  no redirect URI: Dropbox shows the code and the user pastes it.
+- **Android:** a Custom Tab, with the redirect to a custom scheme. Dropbox allows a non-HTTPS
+  scheme with PKCE. The scheme is per host app, `<applicationId>.emusync://dropbox`, because two
+  emulators that both claimed one shared scheme would make Android ask which app should open the
+  redirect. Each host's scheme is registered in the App Console, so a new Android host asks the
+  developers to add it. A fork that can't wait uses the paste-the-code flow or its own app key.
+- **What sign-in returns:** the refresh token, which the host keeps (30.6), and the account's
+  id and email address, for the settings screen ("Signed in as alice@example.com") and the data
+  folder name.
+
+### 30.5 Credentials and the C ABI
+
+The library still never shows UI or stores secrets (§7). The host stores the refresh token, as
+it stores S3 keys today, and supplies it through the credential provider. Additions to ABI v1,
+all additive:
+
+- **`ES_CRED_OAUTH_REFRESH`**, a new `es_credential_kind`: the host puts the refresh token in
+  `bearer_token`. The library exchanges it for an access token, keeps that in memory only, and
+  exchanges again 5 minutes before expiry or after a 401, the same schedule the provider follows
+  for STS credentials. Most hosts use this kind: they store one string.
+- **`ES_CRED_BEARER`** (reserved since v1) becomes live: an access token in `bearer_token` with
+  its `expires_unix_ms`, for a host that runs OAuth itself. The library asks for a new one 5
+  minutes before expiry or after a 401.
+- **In `emusync-remote`,** `CredentialProvider` stops being S3-specific: it returns a
+  `Credentials` enum (`S3`, `Bearer`, `OAuthRefresh`), and each backend refuses the kinds it
+  can't use, as `creds.rs` already refuses non-S3 kinds. The Dropbox backend wraps the provider
+  in a token cache that does the exchange.
+- **The OAuth helpers.** The `es_oauth_begin` and `es_oauth_complete` reserved in v1 keep the
+  PKCE verifier inside a client, which Android loses if it kills the app while the browser is
+  open, and have no way to hand back the refresh token. They stay as they are (always
+  `ES_E_INVALID_ARG`), and three functions that need no client replace them:
+
+```c
+/* Starts a sign-in to provider ("dropbox") with redirect_uri ("" for paste-the-code). Writes the
+   URL to open, and `pending`: an opaque string (PKCE verifier, state, redirect URI) the host
+   keeps until es_oauth_finish, across a process restart if it must. No network. */
+ES_API es_status es_oauth_start(const char* provider, const char* redirect_uri,
+                                char* out_url, size_t url_cap, char* out_pending, size_t pending_cap);
+
+/* Desktop: listens on the loopback address and port of pending's redirect URI until the browser
+   arrives or timeout_ms passes, and writes the redirect it received. ES_E_IO if the port is
+   taken (then start again with redirect_uri ""), ES_TIMEOUT. */
+ES_API es_status es_oauth_wait_redirect(const char* pending, uint32_t timeout_ms,
+                                        char* out_redirect, size_t cap);
+
+/* Exchanges the redirect (or the code the user pasted) for tokens; blocks up to 10 s. Writes the
+   refresh token for the host to store, and the account ("dbid:…\talice@example.com").
+   ES_E_AUTH if the user declined or the state doesn't match, ES_OFFLINE. */
+ES_API es_status es_oauth_finish(const char* provider, const char* pending, const char* redirect_or_code,
+                                 char* out_token, size_t token_cap, char* out_account, size_t account_cap);
+```
+
+- **Sign-out** deletes the stored token and calls `auth/token/revoke`. A token the user revoked
+  from Dropbox's settings makes the next refresh fail with `invalid_grant`, which reaches the
+  host as `ES_EV_AUTH_REQUIRED` (30.3).
+
+### 30.6 Hosts
+
+**CLI (`emusyncd`):**
+
+```sh
+emusync remote add dropbox                 # dropbox:/saves; opens the browser
+emusync remote add dropbox:/saves-encrypted --encrypt
+emusync remote add dropbox --no-browser    # prints the URL, asks for the code
+emusync remote login                       # sign in again, e.g. after disconnecting the app
+emusync remote logout                      # revoke the token and delete it from this device
+```
+
+- The refresh token goes into the system's credential store (§24): service `emusync`, name
+  `dropbox-refresh-token`, with the usual fallback file on Linux without a Secret Service. That
+  is what `emusync watch` running as a service reads. `EMUSYNC_DROPBOX_TOKEN` overrides it for
+  scripts and `watch --env-file`, as the `AWS_*` variables do for S3.
+- `emusync status` shows the account: `remote: dropbox:/saves (alice@example.com)`.
+
+**Desktop emulators** (the PCSX2, Dolphin and PPSSPP forks): a "Sign in with Dropbox" button on
+the sync settings page that calls the three `es_oauth_*` functions on a background thread and
+opens the URL with the toolkit (`QDesktopServices::openUrl` in Qt). The token is kept with
+`es_secret_set(<host>, "dropbox-refresh-token", …)`. The credential provider returns it as
+`ES_CRED_OAUTH_REFRESH`.
+
+**Android (the AAR, §26):**
+
+- `SyncSettings` gains a storage kind (S3 or Dropbox). For Dropbox it keeps the refresh token
+  sealed with the Keystore key, as it keeps the S3 secret, and the account's email address in
+  plain preferences. `isComplete` asks for a token instead of keys.
+- `DropboxSignIn`, new in the AAR: builds the PKCE request, opens a Custom Tab
+  (`androidx.browser`), receives the redirect in an activity the AAR's manifest declares with
+  the `${applicationId}.emusync` scheme, and exchanges the code. It is written in Kotlin
+  because the AAR has no JNI of its own (§26.1). Calling the C functions would make every host
+  add JNI wrappers, for about a hundred lines of Kotlin. The verifier is saved in preferences
+  while the tab is open, so a process restart doesn't lose the sign-in.
+- `SyncConfig` gains `refreshToken` (hidden in `toString`), and S3's fields become optional.
+  The host's JNI credential provider returns `ES_CRED_OAUTH_REFRESH`.
+- The data folder is named from the URI and the account id (30.2).
+
+### 30.7 Later
+
+- **Batched uploads.** `too_many_write_operations` comes from concurrent writes to one Dropbox
+  namespace, which every device of a user shares. Uploading each blob into an upload session and
+  committing them with one `files/upload_session/finish_batch_v2` (up to 1000 files) takes the
+  namespace lock once instead of once per file. Needs `Remote::put_many`, with a default that
+  loops over `put`, called by the push for a cycle's blobs.
+- **One listing per cycle.** A recursive `files/list_folder` of `devices/` returns a cursor;
+  later, `files/list_folder/continue` returns only what changed since. The backend could refresh
+  an in-memory index of `devices/` in `list_dirs("devices/")`, which starts every pull, and
+  answer that cycle's `list` calls from it. That makes a pull's listing one request, however
+  many devices there are.
+- **Change notifications.** `files/list_folder/longpoll` waits, up to 8 minutes, until something
+  changes under a cursor. `emusync watch`, and an Android app on screen, could pull when another
+  device pushes instead of polling (§6.1's back-off timer). Needs a `Remote::wait_for_change`
+  that backends without it don't implement.
+
+### 30.8 Tests
+
+- **Unit tests:** request building (headers, `Dropbox-API-Arg` escaping), the error table,
+  listing pagination with sorting and `start_after`, the token cache (refresh before expiry,
+  after a 401, a single exchange when threads ask at once), `Retry-After`.
+- **A fake Dropbox:** a small HTTP server in the test crate that implements the six endpoints
+  with `strict_conflict`, case-folding paths and injected 429s, 409s and expired tokens. The
+  conformance suite (§13) runs against it in CI on every change.
+- **Real Dropbox, nightly:** the conformance suite against a test account, its refresh token a
+  CI secret. The suite works in its own random namespace, which is deleted afterwards.
+- **Hosts:** CLI sign-in in both flows, by hand. On Android, an instrumented test of the
+  redirect activity and the token storage, and two-way sync between desktop PCSX2 and ARMSX2 on
+  the AYN Thor, as for S3.
+
+### 30.9 Open questions
+
+1. **App name.** Dropbox app names are global, so `emusync` may be taken. The name is also the
+   folder users see (`/Apps/<name>`).
+2. **Encryption by default.** §7 says encryption is on by default for third-party storage. A
+   passphrase is the one thing a non-technical user can lose, and Dropbox already encrypts at
+   rest. Should a Dropbox repository be encrypted by default, or only offered?
+3. **The visible folder.** Users with the Dropbox desktop app get `/Apps/emusync` synced to
+   their computers: many small files, harmless but noticeable. The docs could suggest excluding
+   it with selective sync. Deleting files in it loses history, and possibly saves; a README file
+   at the app folder's root, outside every repository folder, could say not to edit it.
+4. **Interoperating with a folder backend.** A desktop could sync `~/Dropbox/Apps/emusync/saves`
+   through Dropbox's own app with a future `folder://` backend, while a phone uses the API. The
+   layout allows it, if the folder backend tolerates files that are still arriving.
