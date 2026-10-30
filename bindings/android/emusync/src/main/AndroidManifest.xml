@@ -1,6 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
+    <!-- Sync and the Dropbox sign-in talk to the storage; every host needs it anyway. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
     <application>
         <!-- The end of a Dropbox sign-in (DropboxSignIn): one scheme per app, so two emulators
              with the AAR don't both claim the redirect. -->
