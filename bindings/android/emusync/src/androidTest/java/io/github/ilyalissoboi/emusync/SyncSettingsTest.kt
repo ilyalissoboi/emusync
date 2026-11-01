@@ -128,4 +128,23 @@ class SyncSettingsTest {
         assertEquals(context.noBackupFilesDir, a.parentFile)
         assertTrue(a.name.matches(Regex("emusync-[0-9a-f]{16}")))
     }
+
+    @Test
+    fun dropboxNeedsASignInNotKeys() {
+        settings.setEnabled(true)
+        settings.setRemoteUri("dropbox:/saves")
+        settings.setAccessKeyId("AKIDEXAMPLE")
+        settings.setSecretAccessKey("secret")
+        assertTrue(settings.load().isDropbox)
+        assertFalse(settings.load().isComplete)
+        assertNull(settings.config("1.0"))
+        settings.setDropboxSignIn("refresh-token", "dbid:a", "a@example.com")
+        val v = settings.load()
+        assertTrue(v.isComplete && v.hasDropboxSignIn)
+        assertEquals("a@example.com", v.dropboxEmail)
+        assertEquals("refresh-token", settings.config("1.0")?.dropboxRefreshToken)
+        settings.clearDropboxSignIn()
+        assertFalse(settings.load().isComplete)
+        assertEquals("", settings.dropboxAccountId())
+    }
 }

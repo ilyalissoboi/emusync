@@ -1801,6 +1801,9 @@ weak reference the `getrandom` crate checks, falling back to the system call:
   which must not block: what to do then depends on the emulator (ARMSX2 queues it behind the
   CPU thread's card flush). A host that follows its own activity calls `setAppBackgrounded`
   itself. A backend that reports `isAvailable = false` (a build without sync) is never called.
+- **Dropbox (§30.6):** `SyncSettings` treats a `dropbox:` address as Dropbox: it is complete
+  with a stored sign-in instead of keys, and `config` carries `dropboxRefreshToken` and a data
+  folder named from the address and the account id. `DropboxSignIn` signs in; see §30.10.
 
 ### 26.4 Tests
 
@@ -1810,6 +1813,11 @@ Instrumented, on CI's API 30 x86_64 emulator (`android-emulator` job, after the 
   no secret is in the preferences in the clear, removing values, a value whose key is gone (a
   restored backup) reading as not set and being enterable again, and the data folder per
   storage.
+- `DropboxSignInTest`, against a fake token endpoint on 127.0.0.1 (the test APK allows cleartext
+  traffic): the sign-in page's PKCE parameters, a whole sign-in storing the token and account,
+  redirects of another attempt, a code that doesn't match the verifier, a cancelled sign-in,
+  Dropbox unreachable, the redirect bringing back the activity that began, app keys, and
+  sign-out revoking and forgetting.
 - `SyncControllerTest`, against a fake backend: incomplete settings stop, complete ones start
   with their config, errors come back as sentences, a build without sync is never called, async
   starts run in order and report on the main thread, and lifecycle calls reach the backend on
@@ -2178,8 +2186,8 @@ is moved to meta: a PS1 card keeps no times.
 
 ## 30. Dropbox backend
 
-Status: the backend, sign-in, C ABI and CLI are implemented (30.10); the Android AAR and the
-host integrations are not yet. The second `Remote`, after S3 (§6.2), and the first that
+Status: the backend, sign-in, C ABI, CLI and the Android AAR's sign-in are implemented
+(30.10); the emulator integrations are not yet. The second `Remote`, after S3 (§6.2), and the first that
 signs in with an account instead of keys. With S3 the user has to create a bucket, a policy and
 keys (§15, question 6). With Dropbox they press "Sign in with Dropbox" and approve. Why Dropbox
 before Google Drive or OneDrive:
@@ -2494,6 +2502,31 @@ Where the implementation pins down or differs from the design above:
   the whole sign-in (state mismatch, declined, a code used twice, a wrong verifier,
   paste-the-code, revoke); a refresh token used with another app key is refused. The C ABI tests
   cover the credential kinds and the three functions without a network.
-- **Not done yet:** the AAR's `DropboxSignIn` and settings (30.6), sign-in buttons in the
-  PCSX2, Dolphin and PPSSPP forks, nightly runs against a real account, registering the app and
-  applying for production status (30.1), and everything in 30.7.
+- **The AAR.** `SyncSettings` knows Dropbox by the address (`isDropboxUri`), with no setting of
+  its own: such a storage is complete with a sign-in (`setDropboxSignIn`: the refresh token and
+  the account id sealed together in one value, so `config` on another thread reads both from the
+  same sign-in, never one account's token with another's data folder; the email, for display, in
+  plain preferences), and `dataDir(uri, account)`
+  hashes the address and the account id together, so a second account gets its own folder and
+  can never sync into the first one's repository (S3 folders keep their names). `SyncConfig`
+  gains `dropboxRefreshToken` and `isDropbox`; the S3 fields are empty for Dropbox.
+  `DropboxSignIn`:
+  - `begin(activity, uri)` keeps what the exchange needs (app key, PKCE verifier, state, redirect
+    URI) sealed in the host's `SyncSettings`, and the activity to come back to in the AAR's own
+    preferences (`emusync.dropbox.signin`, no secrets), then opens the page in a Custom Tab
+    (`androidx.browser`).
+  - `DropboxRedirectActivity` (translucent, `noHistory`) keeps the redirect and starts that
+    activity with `CLEAR_TOP | SINGLE_TOP`, which closes the Custom Tab above it, or the app's
+    launcher activity if it isn't known.
+  - `complete()` / `completeAsync` check the state first, errors included: the redirect activity is
+    exported, so a redirect with another state (an old one, another app's) fails without touching
+    the attempt in progress. Then they exchange the code (`HttpURLConnection`,
+    `org.json`), look up the email (a failure there doesn't fail the sign-in) and store the
+    sign-in; each step survives the process being killed while the browser is open.
+  - `signOut()` revokes the token and forgets it on this device whatever Dropbox says.
+  - The app key is the address's `app_key`, else `BuildConfig.DROPBOX_APP_KEY`, from the Gradle
+    property `emusync.dropboxAppKey` or `EMUSYNC_DROPBOX_APP_KEY`; the AAR's build passes the
+    same key to cargo, so the Kotlin sign-in and the library agree.
+- **Not done yet:** sign-in buttons in the ARMSX2, PCSX2, Dolphin and PPSSPP forks (ARMSX2 also
+  has to move to the AAR's settings), nightly runs against a real account, registering the app
+  and applying for production status (30.1), and everything in 30.7.

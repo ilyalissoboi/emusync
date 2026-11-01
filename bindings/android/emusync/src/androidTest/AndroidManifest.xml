@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- DropboxSignInTest talks to a fake Dropbox on 127.0.0.1 over plain HTTP. -->
+    <application android:usesCleartextTraffic="true" />
+</manifest>

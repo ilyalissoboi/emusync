@@ -387,6 +387,23 @@ library, and gives the Kotlin side the rest of an integration:
   sync.startInBackground()        // at app start, and startAsync { error -> ... } after a change
   ```
 
+- `DropboxSignIn`: for a `dropbox:` storage, "Sign in with Dropbox" in a Custom Tab instead of
+  keys. The AAR declares the activity that receives Dropbox's redirect
+  (`<applicationId>.emusync://dropbox`, which must be registered with the Dropbox app); the
+  host's credential provider then answers with `config.dropboxRefreshToken` as
+  `ES_CRED_OAUTH_REFRESH` when `config.isDropbox`:
+
+  ```kotlin
+  val signIn = DropboxSignIn(this, settings)
+  signInButton.setOnClickListener {          // in the settings activity
+      signIn.begin(this, "dropbox:/saves")?.let { error -> showError(error) }
+  }
+  override fun onResume() {                  // the redirect brings this activity back
+      super.onResume()
+      if (signIn.hasPendingRedirect()) signIn.completeAsync { result -> show(result) }
+  }
+  ```
+
 Building it needs Rust with the Android targets and the NDK (r29), like the library alone; on
 Windows the build calls `scripts/build-android.sh` through Git's bash.
 
@@ -402,6 +419,7 @@ downloads a pinned version in its build. It adds the `.aar` and the one library 
 ```kotlin
 implementation(files("libs/emusync-release.aar"))
 implementation("androidx.lifecycle:lifecycle-process:2.11.0")
+implementation("androidx.browser:browser:1.8.0")      // the Dropbox sign-in's Custom Tab
 ```
 
 CI builds it, checks the libraries inside, runs its instrumented tests and a Prefab consumer

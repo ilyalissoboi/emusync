@@ -312,7 +312,9 @@ fn create_validates_its_arguments() {
         assert_eq!(es_client_create(&newer.v1, &mut c), ES_OK);
         let mut second = std::ptr::null_mut();
         assert_eq!(es_client_create(&cfg, &mut second), ES_E_BUSY, "one client per data_dir");
-        es_client_destroy(c, 5000);
+        // Returns as soon as the worker is done; a loaded CI runner can take longer than 5 s, and
+        // past the deadline the worker would still hold the data_dir.
+        es_client_destroy(c, 60_000);
         assert_eq!(es_client_create(&cfg, &mut second), ES_OK, "free again after destroy");
         es_client_destroy(second, 5000);
         es_client_destroy(std::ptr::null_mut(), 0);

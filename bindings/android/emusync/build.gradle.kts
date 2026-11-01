@@ -30,6 +30,15 @@ val rustTargetForAbi = mapOf(
 val minSdkLevel = 24
 val ndkVersionString = "29.0.14206865"
 
+/**
+ * The emusync Dropbox app's key (DESIGN §30.1), for the sign-in ([DropboxSignIn], via BuildConfig)
+ * and the library (cargo reads it at build time). Empty until the app is registered: then a Dropbox
+ * address needs `?app_key=`. Public, like every OAuth client id used with PKCE.
+ */
+val emusyncDropboxAppKey: Provider<String> = providers.gradleProperty("emusync.dropboxAppKey")
+    .orElse(providers.environmentVariable("EMUSYNC_DROPBOX_APP_KEY"))
+    .orElse("")
+
 /** The library version: the workspace's, from Cargo.toml. */
 val emusyncVersion: String = Regex("""(?m)^version\s*=\s*"([^"]+)"""")
     .find(emusyncCheckout.resolve("Cargo.toml").readText())!!.groupValues[1]
@@ -43,6 +52,11 @@ android {
         minSdk = minSdkLevel
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         consumerProguardFiles("consumer-rules.pro")
+        buildConfigField("String", "DROPBOX_APP_KEY", "\"${emusyncDropboxAppKey.get()}\"")
+    }
+
+    buildFeatures {
+        buildConfig = true
     }
 
     compileOptions {
@@ -53,6 +67,7 @@ android {
 
 dependencies {
     implementation(libs.androidx.lifecycle.process)
+    implementation(libs.androidx.browser)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.test.runner)
 }
@@ -70,6 +85,7 @@ abstract class BuildEmusyncLibrary @Inject constructor(private val exec: ExecOpe
     @get:Internal abstract val emusyncRoot: DirectoryProperty
     @get:Internal abstract val ndkDirectory: DirectoryProperty
     @get:Input abstract val bash: Property<String>
+    @get:Input abstract val dropboxAppKey: Property<String>
     @get:OutputDirectory abstract val outDir: DirectoryProperty
 
     init {
@@ -90,6 +106,7 @@ abstract class BuildEmusyncLibrary @Inject constructor(private val exec: ExecOpe
             args(args)
             workingDir = root
             environment("ANDROID_NDK_HOME", ndkDirectory.get().asFile.path)
+            dropboxAppKey.get().takeIf { it.isNotEmpty() }?.let { environment("EMUSYNC_DROPBOX_APP_KEY", it) }
         }
     }
 }
@@ -149,6 +166,7 @@ val buildEmusyncLibrary = tasks.register<BuildEmusyncLibrary>("buildEmusyncLibra
     // On Windows, Git's bash: a plain "bash" there can be WSL's.
     val gitBash = File("C:/Program Files/Git/bin/bash.exe")
     bash.set(providers.gradleProperty("emusync.bash").orElse(if (gitBash.isFile) gitBash.path else "bash"))
+    dropboxAppKey.set(emusyncDropboxAppKey)
     outDir.set(layout.buildDirectory.dir("generated/emusync/jniLibs"))
 }
 
