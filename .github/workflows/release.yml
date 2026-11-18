@@ -2,7 +2,9 @@
 # the libraries hosts download by version and checksum (DESIGN §26.5):
 #   emusync-X.Y.Z.aar                     Android (arm64-v8a, x86_64), the Kotlin API and Prefab
 #   emusync-X.Y.Z-windows-x64.zip         bin/emusync.dll, lib/emusync.lib, include/emusync.h
+#   emusync-X.Y.Z-windows-arm64.zip       the same, for Windows on ARM (from 0.3.1)
 #   emusync-X.Y.Z-linux-x86_64.tar.gz     lib/libemusync.so, include/emusync.h
+#   emusync-X.Y.Z-linux-aarch64.tar.gz    the same, for 64-bit ARM Linux (from 0.3.1)
 #   emusync-X.Y.Z-macos-universal.tar.gz  lib/libemusync.dylib (arm64, x86_64), include/emusync.h
 #   emusync.h, SHA256SUMS
 name: Release
@@ -72,7 +74,9 @@ jobs:
           path: dist/
 
   # The desktop libraries, built and checked as CI's desktop job does (scripts/build-desktop.sh),
-  # for hosts whose build doesn't run cargo (PPSSPP's Visual Studio solution).
+  # for hosts whose build doesn't run cargo (PPSSPP's Visual Studio solution). Each is built
+  # natively on a runner of its architecture; the Linux ones need glibc 2.34 at most
+  # (scripts/check-desktop-lib.sh).
   desktop:
     name: Desktop (${{ matrix.name }})
     needs: version
@@ -81,12 +85,23 @@ jobs:
         include:
           - os: windows-latest
             name: windows-x64
+            arch: x64
+            package_args: ""
+          - os: windows-11-arm
+            name: windows-arm64
+            arch: arm64
             package_args: ""
           - os: ubuntu-latest
             name: linux-x86_64
+            arch: x86_64
+            package_args: ""
+          - os: ubuntu-24.04-arm
+            name: linux-aarch64
+            arch: aarch64
             package_args: ""
           - os: macos-latest
             name: macos-universal
+            arch: arm64 x86_64
             package_args: --target aarch64-apple-darwin --target x86_64-apple-darwin
     runs-on: ${{ matrix.os }}
     steps:
@@ -102,9 +117,9 @@ jobs:
         run: |
           cmp pkg/include/emusync.h include/emusync.h
           case "$RUNNER_OS" in
-            Linux) scripts/check-desktop-lib.sh pkg/lib/libemusync.so ;;
-            macOS) scripts/check-desktop-lib.sh pkg/lib/libemusync.dylib "arm64 x86_64" ;;
-            Windows) test -f pkg/bin/emusync.dll && test -f pkg/lib/emusync.lib ;;
+            Linux) scripts/check-desktop-lib.sh pkg/lib/libemusync.so "${{ matrix.arch }}" ;;
+            macOS) scripts/check-desktop-lib.sh pkg/lib/libemusync.dylib "${{ matrix.arch }}" ;;
+            Windows) test -f pkg/lib/emusync.lib && scripts/check-desktop-lib.sh pkg/bin/emusync.dll "${{ matrix.arch }}" ;;
           esac
       - name: Archive
         shell: bash
@@ -140,4 +155,4 @@ jobs:
           cp include/emusync.h dist/
           (cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS)
           gh release create "$GITHUB_REF_NAME" dist/* --title "emusync $v" --notes \
-            "Android AAR (arm64-v8a, x86_64; minSdk 24): libemusync.so for the host's native code as jniLibs and a Prefab package, and the Kotlin API. Desktop libraries: Windows x64 (emusync.dll and its import library), Linux x86_64 and macOS (universal). See the README and DESIGN §26.5."
+            "Android AAR (arm64-v8a, x86_64; minSdk 24): libemusync.so for the host's native code as jniLibs and a Prefab package, and the Kotlin API. Desktop libraries: Windows x64 and ARM64 (emusync.dll and its import library), Linux x86_64 and aarch64 (glibc 2.34 or newer), and macOS (universal). See the README and DESIGN §26.5."

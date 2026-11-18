@@ -270,21 +270,23 @@ For a build that doesn't use CMake (PCSX2's Visual Studio solution), stage a pac
 ```sh
 scripts/build-desktop.sh                   # this machine's target, release, into target/desktop
 scripts/build-desktop.sh --target aarch64-apple-darwin --target x86_64-apple-darwin   # universal
-scripts/check-desktop-lib.sh target/desktop/lib/libemusync.so                          # Linux, macOS
+scripts/check-desktop-lib.sh target/desktop/lib/libemusync.so x86_64                   # Linux, macOS, Windows
 ```
 
 It holds `include/emusync.h`, and `bin/emusync.dll`, `bin/emusync.pdb` and `lib/emusync.lib` on
 Windows, or `lib/libemusync.dylib` / `lib/libemusync.so`. Windows builds need MSVC or clang-cl
 (the `*-pc-windows-msvc` targets); the DLL depends only on system libraries and the Visual C++
 runtime. [`bindings/cmake/desktop-test`](bindings/cmake/desktop-test/CMakeLists.txt) is a complete
-example; CI builds it on Windows (Visual Studio generator), macOS (universal) and Linux, runs the C
-smoke test against the deployed library, checks it, and uploads each package as a
-`libemusync-desktop-<os>` artifact.
+example; CI builds it on Windows x64 and ARM64 (Visual Studio generator), macOS (universal) and
+Linux x86_64 and aarch64, each on a runner of its architecture, runs the C smoke test against the
+deployed library, checks it (exports, architecture, and on Linux a glibc no newer than 2.34), and
+uploads each package as a `libemusync-desktop-<os>-<arch>` artifact.
 
 Each release (a `vX.Y.Z` tag, from 0.2.0) also publishes these packages, so a build can download
 a pinned one and check its SHA-256 instead of running cargo: `emusync-X.Y.Z-windows-x64.zip`,
-`emusync-X.Y.Z-linux-x86_64.tar.gz` and `emusync-X.Y.Z-macos-universal.tar.gz`, listed in the
-release's `SHA256SUMS`.
+`emusync-X.Y.Z-windows-arm64.zip`, `emusync-X.Y.Z-linux-x86_64.tar.gz`,
+`emusync-X.Y.Z-linux-aarch64.tar.gz` and `emusync-X.Y.Z-macos-universal.tar.gz`, listed in the
+release's `SHA256SUMS`. The ARM64 Windows and aarch64 Linux packages are there from 0.3.1.
 
 ## Keeping an emulator's keys in the system's credential store
 

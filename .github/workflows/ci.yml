@@ -15,7 +15,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        # The ARM runners build natively for the release's windows-arm64 and linux-aarch64 packages.
+        os: [ubuntu-latest, windows-latest, macos-latest, ubuntu-24.04-arm, windows-11-arm]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -49,13 +50,24 @@ jobs:
           - os: windows-latest
             cmake_args: ""
             package_args: ""
+            arch: x64
+          - os: windows-11-arm
+            cmake_args: ""
+            package_args: ""
+            arch: arm64
           # A universal library, which is what macOS apps ship.
           - os: macos-latest
             cmake_args: -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
             package_args: --target aarch64-apple-darwin --target x86_64-apple-darwin
+            arch: arm64 x86_64
           - os: ubuntu-latest
             cmake_args: ""
             package_args: ""
+            arch: x86_64
+          - os: ubuntu-24.04-arm
+            cmake_args: ""
+            package_args: ""
+            arch: aarch64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -77,17 +89,34 @@ jobs:
         run: |
           case "$RUNNER_OS" in
             Linux)
-              scripts/check-desktop-lib.sh dist/lib/libemusync.so
+              scripts/check-desktop-lib.sh dist/lib/libemusync.so "${{ matrix.arch }}"
               smoke=$(find build/desktop -name emusync_smoke -type f | head -1)
               readelf -d "$smoke" | grep -q 'NEEDED.*\[libemusync\.so\]' || { echo "::error::the smoke test does not need libemusync.so by name"; exit 1; }
               ;;
             macOS)
-              scripts/check-desktop-lib.sh dist/lib/libemusync.dylib "arm64 x86_64"
+              scripts/check-desktop-lib.sh dist/lib/libemusync.dylib "${{ matrix.arch }}"
               ;;
             Windows)
-              test -f dist/bin/emusync.dll && test -f dist/lib/emusync.lib && test -f dist/include/emusync.h
+              test -f dist/lib/emusync.lib && test -f dist/include/emusync.h
+              scripts/check-desktop-lib.sh dist/bin/emusync.dll "${{ matrix.arch }}"
               ;;
           esac
+      # The checks themselves: each must reject a library that isn't what the package says it is.
+      - name: The checks reject the wrong architecture and too new a glibc
+        if: runner.os != 'macOS'
+        shell: bash
+        run: |
+          lib=$(ls dist/lib/libemusync.so dist/bin/emusync.dll 2>/dev/null)
+          if scripts/check-desktop-lib.sh "$lib" riscv64 2> wrong-arch.log; then
+            echo "::error::check-desktop-lib.sh accepted $lib as riscv64"; exit 1
+          fi
+          cat wrong-arch.log; grep -q "architecture is" wrong-arch.log
+          if [ "$RUNNER_OS" = Linux ]; then
+            if EMUSYNC_GLIBC_MAX=2.0 scripts/check-desktop-lib.sh "$lib" 2> glibc.log; then
+              echo "::error::check-desktop-lib.sh accepted a library needing glibc newer than 2.0"; exit 1
+            fi
+            cat glibc.log; grep -q "needs glibc" glibc.log
+          fi
       - name: The CMake module switches itself off without the Rust target
         if: runner.os == 'Linux'
         run: |
@@ -95,7 +124,7 @@ jobs:
           grep -q "emusync: Rust target riscv64gc-unknown-linux-gnu not installed -> DISABLED" off.log
       - uses: actions/upload-artifact@v4
         with:
-          name: libemusync-desktop-${{ runner.os }}
+          name: libemusync-desktop-${{ runner.os }}-${{ runner.arch }}
           path: dist/
 
   # libemusync.so for Android, the way ARMSX2 links it (docs/research/armsx2.md §4). The ELF
