@@ -37,10 +37,20 @@ fn static_lib() -> &'static Path {
     })
 }
 
-/// What Rust's standard library needs from the system (`--print native-static-libs`).
+/// What Rust's standard library needs from the system (`--print native-static-libs`). On MSVC,
+/// std's locks call WaitOnAddress from synchronization.lib (Rust 1.100 needs it; 1.99 didn't).
 fn system_libs(msvc: bool) -> Vec<&'static str> {
     if msvc {
-        vec!["bcrypt.lib", "advapi32.lib", "kernel32.lib", "ntdll.lib", "userenv.lib", "ws2_32.lib", "dbghelp.lib"]
+        vec![
+            "bcrypt.lib",
+            "advapi32.lib",
+            "kernel32.lib",
+            "ntdll.lib",
+            "userenv.lib",
+            "ws2_32.lib",
+            "dbghelp.lib",
+            "synchronization.lib",
+        ]
     } else if cfg!(target_os = "macos") {
         vec!["-framework", "CoreFoundation", "-framework", "Security", "-lSystem", "-lc", "-lm"]
     } else {

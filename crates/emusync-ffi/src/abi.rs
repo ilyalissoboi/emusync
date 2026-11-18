@@ -260,7 +260,9 @@ pub fn copy_str(dst: &mut [c_char], s: &str) {
 /// Reads a NUL-terminated UTF-8 string from a fixed buffer; `None` if it has no NUL or isn't
 /// UTF-8.
 pub fn read_buf(src: &[c_char]) -> Option<String> {
-    let bytes: Vec<u8> = src.iter().map(|c| *c as u8).take_while(|b| *b != 0).collect();
+    // c_char is i8 on some targets and u8 on others (aarch64 Linux), so no `as u8`, which
+    // clippy calls unnecessary where it is u8.
+    let bytes: Vec<u8> = src.iter().map(|c| u8::from_ne_bytes(c.to_ne_bytes())).take_while(|b| *b != 0).collect();
     if bytes.len() == src.len() {
         return None;
     }

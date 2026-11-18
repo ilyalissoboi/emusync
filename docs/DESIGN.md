@@ -1835,13 +1835,17 @@ item 13, when ARMSX2 moves to the AAR), and a Kotlin SAF implementation of `es_v
 A tag `vX.Y.Z` that matches the workspace version (`Cargo.toml`) runs `.github/workflows/release.yml`.
 It builds the AAR and checks it as CI does: the libraries, the header, and the Prefab version.
 Since 0.2.0 it also builds the desktop libraries with `scripts/build-desktop.sh` and checks
-them as CI's desktop job does. Then it publishes a GitHub Release with:
+them as CI's desktop job does, each on a runner of its own architecture (since 0.3.1, GitHub's
+ARM runners for Windows ARM64 and Linux aarch64). Then it publishes a GitHub Release with:
 
 - `emusync-X.Y.Z.aar`;
-- `emusync-X.Y.Z-windows-x64.zip`: `bin/emusync.dll` with its `.pdb`, `lib/emusync.lib` (the
-  import library), and `include/emusync.h`;
-- `emusync-X.Y.Z-linux-x86_64.tar.gz` and `emusync-X.Y.Z-macos-universal.tar.gz`: `lib/`
-  and `include/`;
+- `emusync-X.Y.Z-windows-x64.zip` and, since 0.3.1, `emusync-X.Y.Z-windows-arm64.zip`:
+  `bin/emusync.dll` with its `.pdb`, `lib/emusync.lib` (the import library), and
+  `include/emusync.h`;
+- `emusync-X.Y.Z-linux-x86_64.tar.gz`, since 0.3.1 `emusync-X.Y.Z-linux-aarch64.tar.gz`, and
+  `emusync-X.Y.Z-macos-universal.tar.gz`: `lib/` and `include/`. The Linux libraries need glibc
+  2.34 at most (`scripts/check-desktop-lib.sh` fails a newer one), so they load on the same
+  distributions on both architectures;
 - `emusync.h` and `SHA256SUMS`.
 
 A host pins a version and its checksum, and downloads what it needs in its build. That way
