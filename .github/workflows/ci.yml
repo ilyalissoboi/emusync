@@ -106,7 +106,7 @@ jobs:
         if: runner.os != 'macOS'
         shell: bash
         run: |
-          lib=$(ls dist/lib/libemusync.so dist/bin/emusync.dll 2>/dev/null)
+          lib=$([ "$RUNNER_OS" = Windows ] && echo dist/bin/emusync.dll || echo dist/lib/libemusync.so)
           if scripts/check-desktop-lib.sh "$lib" riscv64 2> wrong-arch.log; then
             echo "::error::check-desktop-lib.sh accepted $lib as riscv64"; exit 1
           fi

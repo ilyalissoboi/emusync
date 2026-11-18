@@ -102,7 +102,8 @@ impl HostVfs {
                 return None;
             }
             if n < cap {
-                let bytes: Vec<u8> = buf[..n].iter().map(|&b| b as u8).collect();
+                // Not `as u8`: c_char is u8 on some targets (see abi::read_buf).
+                let bytes: Vec<u8> = buf[..n].iter().map(|b| u8::from_ne_bytes(b.to_ne_bytes())).collect();
                 return Some(String::from_utf8_lossy(&bytes).into_owned());
             }
             cap = n + 1;
